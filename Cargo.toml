@@ -1,0 +1,11 @@
+[package]
+name = "r3"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+allocation_hints = "0.1.0"
+allocator-api2 = "0.4.0"
+bump-scope = { version = "2.3.3", features = ["allocator-api2-04"] }
+mimalloc = "0.1.52"
+rallocator = "0.1.0"
