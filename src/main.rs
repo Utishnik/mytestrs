@@ -7,24 +7,44 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
-    // --- PGO: определяем оптимальный размер чанка ---
-    let mut pgo_res: Vec<_> = Vec::new();
+    // ---------- PGO для полной версии ----------
+    let mut pgo_full_res: Vec<_> = Vec::new();
     for _ in 0..3 {
-        let pgo = profile_bump_chunk_size() as u128;
-        pgo_res.push(pgo);
+        let pgo = profile_bump_chunk_size_full() as u128;
+        pgo_full_res.push(pgo);
     }
+    let pgo_full = median(&pgo_full_res) as usize;
     println!(
-        "PGO recommended bump chunk size: {} MB",
-        median(pgo_res.as_slice()) / (1024 * 1024)
+        "PGO full version recommended chunk size: {} MB",
+        pgo_full / (1024 * 1024)
     );
-    let pgo = median(pgo_res.as_slice()) as usize;
 
-    // Прогрев
+    // ---------- PGO для лайт версии ----------
+    let mut pgo_light_res: Vec<_> = Vec::new();
+    for _ in 0..3 {
+        let pgo = profile_bump_chunk_size_light() as u128;
+        pgo_light_res.push(pgo);
+    }
+    let pgo_light = median(&pgo_light_res) as usize;
+    println!(
+        "PGO light version recommended chunk size: {} MB",
+        pgo_light / (1024 * 1024)
+    );
+
+    // ---------- Прогрев полной версии ----------
     for _ in 0..5 {
         mimm();
-        bump_scope_m(pgo);
+        bump_scope_m(pgo_full);
     }
 
+    // ---------- Прогрев лайт версии ----------
+    for _ in 0..5 {
+        mimm_light();
+        bump_scope_m_light(pgo_light);
+    }
+
+    // ---------- Тест полной версии ----------
+    println!("\n=== FULL VERSION ===");
     for round in 0..3 {
         let mimm_times: Vec<u128> = (0..10)
             .map(|_| {
@@ -38,7 +58,36 @@ fn main() {
         let bump_times: Vec<u128> = (0..10)
             .map(|_| {
                 let start = std::time::Instant::now();
-                bump_scope_m(pgo);
+                bump_scope_m(pgo_full);
+                start.elapsed().as_micros()
+            })
+            .collect();
+        let bump_median = median(&bump_times);
+
+        println!(
+            "Round {}: MIMALOC median = {} µs, Bump median = {} µs",
+            round + 1,
+            mimm_median,
+            bump_median
+        );
+    }
+
+    // ---------- Тест лайт версии ----------
+    println!("\n=== LIGHT VERSION ===");
+    for round in 0..3 {
+        let mimm_times: Vec<u128> = (0..10)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                mimm_light();
+                start.elapsed().as_micros()
+            })
+            .collect();
+        let mimm_median = median(&mimm_times);
+
+        let bump_times: Vec<u128> = (0..10)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                bump_scope_m_light(pgo_light);
                 start.elapsed().as_micros()
             })
             .collect();
@@ -53,19 +102,20 @@ fn main() {
     }
 }
 
+// ==================== Утилиты ====================
+
 fn median(times: &[u128]) -> u128 {
     let mut sorted = times.to_vec();
     sorted.sort_unstable();
     sorted[sorted.len() / 2]
 }
 
-/// Выполняет одну итерацию нагрузки с Bump::new() и возвращает
-/// рекомендуемый размер чанка (реальное использование + 20% запас,
-/// округлённый до мегабайта).
-fn profile_bump_chunk_size() -> usize {
+// ==================== Полная версия ====================
+
+/// PGO для полной версии: одна итерация, замер объёма, запас 20%.
+fn profile_bump_chunk_size_full() -> usize {
     let mut bump = Bump::new();
 
-    // Одна итерация (аналогично телу bump_scope_m, но без reset)
     let capacity = 4 * 100 * 100; // 40 000
     let mut vectr: BumpVec<BumpVec<BumpString>> = BumpVec::with_capacity_in(capacity, &bump);
 
@@ -79,13 +129,10 @@ fn profile_bump_chunk_size() -> usize {
         }
     }
 
-    // Фиксируем использованный объём до сброса
     let used = bump.allocated_bytes();
-    core::hint::black_box(vectr); // предотвращаем оптимизацию
+    core::hint::black_box(vectr);
+    bump.reset();
 
-    bump.reset(); // освобождаем память
-
-    // Добавляем 20% запаса и округляем до 1 МБ
     let recommended = used * 120 / 100;
     let rounded = ((recommended + (1024 * 1024 - 1)) / (1024 * 1024)) * (1024 * 1024);
     rounded
@@ -97,7 +144,6 @@ fn bump_scope_m(chunk_size: usize) {
         for core_id in core_ids.iter() {
             s.spawn(move || {
                 core_affinity::set_for_current(*core_id);
-                // Используем переданный размер чанка
                 let mut bump = Bump::with_capacity(chunk_size);
 
                 for _ in 0..3 {
@@ -133,6 +179,89 @@ fn mimm() {
                     let mut vectr: Vec<Vec<String>> = Vec::with_capacity(40000);
                     for _ in 0..200 {
                         for _ in 0..200 {
+                            let mut vec = Vec::with_capacity(400);
+                            for _ in 0..100 {
+                                vec.push("stroka".to_string());
+                            }
+                            vectr.push(vec);
+                        }
+                    }
+                    core::hint::black_box(vectr);
+                }
+            });
+        }
+    });
+}
+
+// ==================== Лайт версия ====================
+
+/// PGO для лайт версии: циклы 100×100, capacity внешнего вектора 10 000.
+fn profile_bump_chunk_size_light() -> usize {
+    let mut bump = Bump::new();
+
+    let capacity = 100 * 100; // 10 000
+    let mut vectr: BumpVec<BumpVec<BumpString>> = BumpVec::with_capacity_in(capacity, &bump);
+
+    for _ in 0..100 {
+        for _ in 0..100 {
+            let mut vec: BumpVec<BumpString> = BumpVec::with_capacity_in(400, &bump);
+            for _ in 0..100 {
+                vec.push(BumpString::from_str_in("stroka", &bump));
+            }
+            vectr.push(vec);
+        }
+    }
+
+    let used = bump.allocated_bytes();
+    core::hint::black_box(vectr);
+    bump.reset();
+
+    let recommended = used * 120 / 100;
+    let rounded = ((recommended + (1024 * 1024 - 1)) / (1024 * 1024)) * (1024 * 1024);
+    rounded
+}
+
+fn bump_scope_m_light(chunk_size: usize) {
+    let core_ids = core_affinity::get_core_ids().unwrap();
+    std::thread::scope(|s| {
+        for core_id in core_ids.iter() {
+            s.spawn(move || {
+                core_affinity::set_for_current(*core_id);
+                let mut bump = Bump::with_capacity(chunk_size);
+
+                for _ in 0..3 {
+                    let capacity = 100 * 100; // 10 000
+                    let mut vectr: BumpVec<BumpVec<BumpString>> =
+                        BumpVec::with_capacity_in(capacity, &bump);
+
+                    for _ in 0..100 {
+                        for _ in 0..100 {
+                            let mut vec: BumpVec<BumpString> =
+                                BumpVec::with_capacity_in(400, &bump);
+                            for _ in 0..100 {
+                                vec.push(BumpString::from_str_in("stroka", &bump));
+                            }
+                            vectr.push(vec);
+                        }
+                    }
+                    core::hint::black_box(vectr);
+                    bump.reset();
+                }
+            });
+        }
+    });
+}
+
+fn mimm_light() {
+    let core_ids = core_affinity::get_core_ids().unwrap();
+    std::thread::scope(|s| {
+        for core_id in core_ids.iter() {
+            s.spawn(|| {
+                core_affinity::set_for_current(*core_id);
+                for _ in 0..3 {
+                    let mut vectr: Vec<Vec<String>> = Vec::with_capacity(10_000);
+                    for _ in 0..100 {
+                        for _ in 0..100 {
                             let mut vec = Vec::with_capacity(400);
                             for _ in 0..100 {
                                 vec.push("stroka".to_string());
