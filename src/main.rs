@@ -1,63 +1,113 @@
-use core::alloc;
-use std::alloc::alloc;
-
-use allocation_hints::heap::*;
-use allocation_hints::with_hint;
-use allocator_api2::vec::Vec as BumpVec;
-use bump_scope::{Bump, BumpString};
+use bumpalo::Bump;
+use bumpalo::collections::String as BumpString;
+use bumpalo::collections::Vec as BumpVec;
 use mimalloc::MiMalloc;
-use rallocator::*;
 
-//rallocator::rallocator!();
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
+    // --- PGO: определяем оптимальный размер чанка ---
+    let mut pgo_res: Vec<_> = Vec::new();
     for _ in 0..3 {
-        let mut dalay_vec: Vec<_> = Vec::new();
-        for _ in 0..5 {
-            let start = std::time::Instant::now();
-            mimm();
-            let delay = start.elapsed().as_micros();
-            dalay_vec.push(delay);
-        }
-        let avg = dalay_vec.iter().sum::<u128>() / (dalay_vec.len() as u128);
-        let max = dalay_vec.iter().max().unwrap();
-        let min = dalay_vec.iter().min().unwrap();
-        println!("MIMALOC:\navg: {}\nmax: {}\nmin: {}", avg, max, min);
+        let pgo = profile_bump_chunk_size() as u128;
+        pgo_res.push(pgo);
+    }
+    println!(
+        "PGO recommended bump chunk size: {} MB",
+        median(pgo_res.as_slice()) / (1024 * 1024)
+    );
+    let pgo = median(pgo_res.as_slice()) as usize;
 
-        let mut dalay_vec: Vec<_> = Vec::new();
-        for _ in 0..5 {
-            let start = std::time::Instant::now();
-            bump_scope_m();
-            let delay = start.elapsed().as_micros();
-            dalay_vec.push(delay);
-        }
-        let avg = dalay_vec.iter().sum::<u128>() / (dalay_vec.len() as u128);
-        let max = dalay_vec.iter().max().unwrap();
-        let min = dalay_vec.iter().min().unwrap();
-        println!("STR bump:\navg: {}\nmax: {}\nmin: {}", avg, max, min);
-        println!("\n-----------------------------------\n");
+    // Прогрев
+    for _ in 0..5 {
+        mimm();
+        bump_scope_m(pgo);
+    }
+
+    for round in 0..3 {
+        let mimm_times: Vec<u128> = (0..10)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                mimm();
+                start.elapsed().as_micros()
+            })
+            .collect();
+        let mimm_median = median(&mimm_times);
+
+        let bump_times: Vec<u128> = (0..10)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                bump_scope_m(pgo);
+                start.elapsed().as_micros()
+            })
+            .collect();
+        let bump_median = median(&bump_times);
+
+        println!(
+            "Round {}: MIMALOC median = {} µs, Bump median = {} µs",
+            round + 1,
+            mimm_median,
+            bump_median
+        );
     }
 }
 
-fn bump_scope_m() {
+fn median(times: &[u128]) -> u128 {
+    let mut sorted = times.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
+}
+
+/// Выполняет одну итерацию нагрузки с Bump::new() и возвращает
+/// рекомендуемый размер чанка (реальное использование + 20% запас,
+/// округлённый до мегабайта).
+fn profile_bump_chunk_size() -> usize {
+    let mut bump = Bump::new();
+
+    // Одна итерация (аналогично телу bump_scope_m, но без reset)
+    let capacity = 4 * 100 * 100; // 40 000
+    let mut vectr: BumpVec<BumpVec<BumpString>> = BumpVec::with_capacity_in(capacity, &bump);
+
+    for _ in 0..200 {
+        for _ in 0..200 {
+            let mut vec: BumpVec<BumpString> = BumpVec::with_capacity_in(400, &bump);
+            for _ in 0..100 {
+                vec.push(BumpString::from_str_in("stroka", &bump));
+            }
+            vectr.push(vec);
+        }
+    }
+
+    // Фиксируем использованный объём до сброса
+    let used = bump.allocated_bytes();
+    core::hint::black_box(vectr); // предотвращаем оптимизацию
+
+    bump.reset(); // освобождаем память
+
+    // Добавляем 20% запаса и округляем до 1 МБ
+    let recommended = used * 120 / 100;
+    let rounded = ((recommended + (1024 * 1024 - 1)) / (1024 * 1024)) * (1024 * 1024);
+    rounded
+}
+
+fn bump_scope_m(chunk_size: usize) {
+    let core_ids = core_affinity::get_core_ids().unwrap();
     std::thread::scope(|s| {
-        for _ in 0..std::thread::available_parallelism().unwrap().into() {
-            s.spawn(|| {
-                // Каждый поток создаёт свой bump-аллокатор
-                let mut bump = Bump::with_size(1200 * 1024 * 1024);
+        for core_id in core_ids.iter() {
+            s.spawn(move || {
+                core_affinity::set_for_current(*core_id);
+                // Используем переданный размер чанка
+                let mut bump = Bump::with_capacity(chunk_size);
 
                 for _ in 0..3 {
-                    // Вектор векторов – используем &bump как аллокатор
                     let capacity = 4 * 100 * 100; // 40 000
-
-                    let mut vectr: BumpVec<BumpVec<BumpString<&Bump>, &Bump>, &Bump> =
+                    let mut vectr: BumpVec<BumpVec<BumpString>> =
                         BumpVec::with_capacity_in(capacity, &bump);
 
                     for _ in 0..200 {
                         for _ in 0..200 {
-                            let mut vec: BumpVec<BumpString<&Bump>, &Bump> =
+                            let mut vec: BumpVec<BumpString> =
                                 BumpVec::with_capacity_in(400, &bump);
                             for _ in 0..100 {
                                 vec.push(BumpString::from_str_in("stroka", &bump));
@@ -68,49 +118,17 @@ fn bump_scope_m() {
                     core::hint::black_box(vectr);
                     bump.reset();
                 }
-                // По выходу из потока bump освободится автоматически
-            });
-        }
-    });
-}
-
-fn bump_scope_m_heapstr() {
-    std::thread::scope(|s| {
-        for _ in 0..std::thread::available_parallelism().unwrap().into() {
-            s.spawn(|| {
-                // Каждый поток создаёт свой bump-аллокатор
-                let bump = Bump::new();
-
-                for _ in 0..3 {
-                    // Вектор векторов – используем &bump как аллокатор
-                    let capacity = 100 * 100; // 10 000
-
-                    let mut vectr: BumpVec<BumpVec<String, &Bump>, &Bump> =
-                        BumpVec::with_capacity_in(capacity, &bump);
-
-                    for _ in 0..100 {
-                        for _ in 0..100 {
-                            let mut vec: BumpVec<String, &Bump> =
-                                BumpVec::with_capacity_in(100, &bump);
-                            for _ in 0..100 {
-                                vec.push("stroka".to_string());
-                            }
-                            vectr.push(vec);
-                        }
-                    }
-                    core::hint::black_box(vectr);
-                }
-                // По выходу из потока bump освободится автоматически
             });
         }
     });
 }
 
 fn mimm() {
-    //let heap = Heap::
+    let core_ids = core_affinity::get_core_ids().unwrap();
     std::thread::scope(|s| {
-        for _ in 0..std::thread::available_parallelism().unwrap().into() {
+        for core_id in core_ids.iter() {
             s.spawn(|| {
+                core_affinity::set_for_current(*core_id);
                 for _ in 0..3 {
                     let mut vectr: Vec<Vec<String>> = Vec::with_capacity(40000);
                     for _ in 0..200 {
@@ -127,33 +145,4 @@ fn mimm() {
             });
         }
     });
-}
-
-fn r() {
-    rallocator::initialize();
-    //let heap = Heap::
-    let start = std::time::Instant::now();
-    std::thread::scope(|s| {
-        for _ in 0..std::thread::available_parallelism().unwrap().into() {
-            s.spawn(|| {
-                //let heap = Heap::bump(bump::Options::new());
-                let heap = Heap::from_thread_pool(bump::Options::new());
-                for _ in 0..3 {
-                    let mut vectr: Vec<Vec<String>> = with_hint(&heap, || Vec::with_capacity(32));
-                    for _ in 0..100 {
-                        for _ in 0..100 {
-                            let mut vec = with_hint(&heap, || Vec::with_capacity(128));
-                            for _ in 0..100 {
-                                with_hint(&heap, || vec.push("stroka".to_string()));
-                            }
-                            with_hint(&heap, || vectr.push(vec));
-                        }
-                    }
-                    core::hint::black_box(vectr);
-                }
-            });
-        }
-    });
-    let end = start.elapsed().as_micros();
-    println!("\n{}\n", end);
 }

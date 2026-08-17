@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 allocation_hints = "0.1.0"
 allocator-api2 = "0.4.0"
-bump-scope = { version = "2.3.3", features = ["allocator-api2-04"] }
+bumpalo = { version = "3.20", features = ["collections"] }
+core_affinity = "0.8.3"
 mimalloc = "0.1.52"
 rallocator = "0.1.0"
