@@ -2,6 +2,8 @@ use bumpalo::Bump;
 use bumpalo::collections::String as BumpString;
 use bumpalo::collections::Vec as BumpVec;
 use mimalloc::MiMalloc;
+use spin::Mutex as SpinMutex;
+use std::sync::Arc;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -66,6 +68,12 @@ fn run_benchmarks(smt: bool, pgo_full: usize, pgo_light: usize) {
         bump_scope_m_light(pgo_light, smt);
     }
 
+    // ---------- Прогрев shared-версии (bump + spin-mutex) ----------
+    for _ in 0..5 {
+        bump_shared_m(pgo_full, smt);
+        bump_shared_m_light(pgo_light, smt);
+    }
+
     // ---------- Тест полной версии ----------
     println!("=== FULL VERSION ({}) ===", mode_str);
     for round in 0..3 {
@@ -117,12 +125,117 @@ fn run_benchmarks(smt: bool, pgo_full: usize, pgo_light: usize) {
         let bump_median = median(&bump_times);
 
         println!(
-            "Round {}: MIMALOC median = {} µs, Bump median = {} µs",
+            "Round {}: MIMALLOC median = {} µs, Bump median = {} µs",
             round + 1,
             mimm_median,
             bump_median
         );
     }
+
+    // ---------- Тест shared-версии (bump + spin-mutex, единый бамп) ----------
+    println!("\n=== SHARED BUMP+SPINMUTEX ({}) ===", mode_str);
+    for round in 0..3 {
+        let full_times: Vec<u128> = (0..10)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                bump_shared_m(pgo_full, smt);
+                start.elapsed().as_micros()
+            })
+            .collect();
+        let full_median = median(&full_times);
+
+        let light_times: Vec<u128> = (0..10)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                bump_shared_m_light(pgo_light, smt);
+                start.elapsed().as_micros()
+            })
+            .collect();
+        let light_median = median(&light_times);
+
+        println!(
+            "Round {}: Shared FULL median = {} µs, Shared LIGHT median = {} µs",
+            round + 1,
+            full_median,
+            light_median
+        );
+    }
+}
+
+// ==================== Shared Bump (единый бамп + spin-mutex) ====================
+// Используется готовый spin-мьютекс из crate `spin` (спин с экспоненциальной
+// задержкой и yield под капотом).
+
+fn do_work_full(bump: &Bump) {
+    let capacity = 4 * 100 * 100; // 40 000
+    let mut vectr: BumpVec<BumpVec<BumpString>> = BumpVec::with_capacity_in(capacity, bump);
+    for _ in 0..200 {
+        for _ in 0..200 {
+            let mut vec: BumpVec<BumpString> = BumpVec::with_capacity_in(400, bump);
+            for _ in 0..100 {
+                vec.push(BumpString::from_str_in("stroka", bump));
+            }
+            vectr.push(vec);
+        }
+    }
+    core::hint::black_box(vectr);
+}
+
+fn do_work_light(bump: &Bump) {
+    let capacity = 100 * 100; // 10 000
+    let mut vectr: BumpVec<BumpVec<BumpString>> = BumpVec::with_capacity_in(capacity, bump);
+    for _ in 0..100 {
+        for _ in 0..100 {
+            let mut vec: BumpVec<BumpString> = BumpVec::with_capacity_in(400, bump);
+            for _ in 0..100 {
+                vec.push(BumpString::from_str_in("stroka", bump));
+            }
+            vectr.push(vec);
+        }
+    }
+    core::hint::black_box(vectr);
+}
+
+/// Единый Bump выделяется ДО запуска потоков, потоки делят его через spin-mutex.
+fn bump_shared_m(chunk_size: usize, smt: bool) {
+    let core_ids = get_cores(smt);
+    // под один поток нужно chunk_size; все потоки делят один бамп -> с запасом
+    let total = chunk_size * core_ids.len() * 2;
+    let shared = Arc::new(SpinMutex::new(Bump::with_capacity(total)));
+
+    std::thread::scope(|s| {
+        for core_id in core_ids.iter() {
+            let shared = Arc::clone(&shared);
+            s.spawn(move || {
+                core_affinity::set_for_current(*core_id);
+                for _ in 0..3 {
+                    let mut guard = shared.lock();
+                    do_work_full(&guard);
+                    guard.reset();
+                }
+            });
+        }
+    });
+}
+
+fn bump_shared_m_light(chunk_size: usize, smt: bool) {
+    let core_ids = get_cores(smt);
+    let total = chunk_size * core_ids.len() * 2;
+    let shared = Arc::new(SpinMutex::new(Bump::with_capacity(total)));
+
+    std::thread::scope(|s| {
+        for core_id in core_ids.iter() {
+            let shared = Arc::clone(&shared);
+            s.spawn(move || {
+                core_affinity::set_for_current(*core_id);
+                for _ in 0..3 {
+                    let mut guard = shared.lock();
+                    do_work_light(&guard);
+                    guard.reset();
+                }
+            });
+        }
+    });
 }
 
 // ==================== Утилиты ====================
@@ -167,8 +280,7 @@ fn profile_bump_chunk_size_full() -> usize {
     bump.reset();
 
     let recommended = used * 120 / 100;
-    let rounded = ((recommended + (1024 * 1024 - 1)) / (1024 * 1024)) * (1024 * 1024);
-    rounded
+    ((recommended + (1024 * 1024 - 1)).div_ceil(1024 * 1024)) * (1024 * 1024)
 }
 
 fn bump_scope_m(chunk_size: usize, smt: bool) {
@@ -250,8 +362,7 @@ fn profile_bump_chunk_size_light() -> usize {
     bump.reset();
 
     let recommended = used * 120 / 100;
-    let rounded = ((recommended + (1024 * 1024 - 1)) / (1024 * 1024)) * (1024 * 1024);
-    rounded
+    ((recommended + (1024 * 1024 - 1)).div_ceil(1024 * 1024)) * (1024 * 1024)
 }
 
 fn bump_scope_m_light(chunk_size: usize, smt: bool) {
