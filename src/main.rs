@@ -7,6 +7,8 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
+    let core_ids = core_affinity::get_core_ids().unwrap();
+    println!("количество ядер: {}", core_ids.len());
     // ---------- PGO для полной версии ----------
     let mut pgo_full_res: Vec<_> = Vec::new();
     for _ in 0..3 {
