@@ -1,9 +1,12 @@
+use std::time::Duration;
+
 use bumpalo::Bump;
 use bumpalo::collections::String as BumpString;
 use bumpalo::collections::Vec as BumpVec;
 use mimalloc::MiMalloc;
 use spin::Mutex as SpinMutex;
-use std::sync::Arc;
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -72,6 +75,12 @@ fn run_benchmarks(smt: bool, pgo_full: usize, pgo_light: usize) {
     for _ in 0..5 {
         bump_shared_m(pgo_full, smt);
         bump_shared_m_light(pgo_light, smt);
+    }
+
+    // ---------- Прогрев shared-unlock версии (wrapper + guard unlock) ----------
+    for _ in 0..5 {
+        bump_shared_unlock_m(pgo_full, smt);
+        bump_shared_unlock_m_light(pgo_light, smt);
     }
 
     // ---------- Тест полной версии ----------
@@ -160,58 +169,84 @@ fn run_benchmarks(smt: bool, pgo_full: usize, pgo_light: usize) {
             light_median
         );
     }
+
+    // ---------- Тест shared-unlock версии (wrapper + guard unlock + barrier) ----------
+    println!("\n=== SHARED UNLOCK GUARD + BARRIER ({}) ===", mode_str);
+    for round in 0..3 {
+        let full_times: Vec<u128> = (0..10)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                bump_shared_unlock_m(pgo_full, smt);
+                start.elapsed().as_micros()
+            })
+            .collect();
+        let full_median = median(&full_times);
+
+        let light_times: Vec<u128> = (0..10)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                bump_shared_unlock_m_light(pgo_light, smt);
+                start.elapsed().as_micros()
+            })
+            .collect();
+        let light_median = median(&light_times);
+
+        println!(
+            "Round {}: SharedUnlock FULL median = {} µs, SharedUnlock LIGHT median = {} µs",
+            round + 1,
+            full_median,
+            light_median
+        );
+    }
 }
 
 // ==================== Shared Bump (единый бамп + spin-mutex) ====================
 // Используется готовый spin-мьютекс из crate `spin` (спин с экспоненциальной
 // задержкой и yield под капотом).
 
-fn do_work_full(bump: &Bump) {
-    let capacity = 4 * 100 * 100; // 40 000
-    let mut vectr: BumpVec<BumpVec<BumpString>> = BumpVec::with_capacity_in(capacity, bump);
+/// Гранулярный лок: на каждый внутренний вектор (чанк) берём и бросаем лок.
+fn build_full(shared: &SpinMutex<Bump>) {
     for _ in 0..200 {
         for _ in 0..200 {
-            let mut vec: BumpVec<BumpString> = BumpVec::with_capacity_in(400, bump);
+            let guard = shared.lock();
+            let mut vec: BumpVec<BumpString> = BumpVec::with_capacity_in(400, &guard);
             for _ in 0..100 {
-                vec.push(BumpString::from_str_in("stroka", bump));
+                vec.push(BumpString::from_str_in("stroka", &guard));
             }
-            vectr.push(vec);
+            core::hint::black_box(vec); // использовали и сразу бросаем лок
         }
     }
-    core::hint::black_box(vectr);
 }
 
-fn do_work_light(bump: &Bump) {
-    let capacity = 100 * 100; // 10 000
-    let mut vectr: BumpVec<BumpVec<BumpString>> = BumpVec::with_capacity_in(capacity, bump);
+fn build_light(shared: &SpinMutex<Bump>) {
     for _ in 0..100 {
         for _ in 0..100 {
-            let mut vec: BumpVec<BumpString> = BumpVec::with_capacity_in(400, bump);
+            let guard = shared.lock();
+            let mut vec: BumpVec<BumpString> = BumpVec::with_capacity_in(400, &guard);
             for _ in 0..100 {
-                vec.push(BumpString::from_str_in("stroka", bump));
+                vec.push(BumpString::from_str_in("stroka", &guard));
             }
-            vectr.push(vec);
+            core::hint::black_box(vec);
         }
     }
-    core::hint::black_box(vectr);
 }
 
 /// Единый Bump выделяется ДО запуска потоков, потоки делят его через spin-mutex.
+/// Лок берётся/бросается точечно внутри build_* на каждый чанк.
 fn bump_shared_m(chunk_size: usize, smt: bool) {
     let core_ids = get_cores(smt);
     // под один поток нужно chunk_size; все потоки делят один бамп -> с запасом
     let total = chunk_size * core_ids.len() * 2;
-    let shared = Arc::new(SpinMutex::new(Bump::with_capacity(total)));
+    let shared = SpinMutex::new(Bump::with_capacity(total));
+    let shared_borrow = &shared;
 
     std::thread::scope(|s| {
         for core_id in core_ids.iter() {
-            let shared = Arc::clone(&shared);
-            s.spawn(move || {
+            s.spawn(|| {
                 core_affinity::set_for_current(*core_id);
                 for _ in 0..3 {
-                    let mut guard = shared.lock();
-                    do_work_full(&guard);
-                    guard.reset();
+                    build_full(shared_borrow);
+                    shared.lock().reset();
                 }
             });
         }
@@ -221,20 +256,226 @@ fn bump_shared_m(chunk_size: usize, smt: bool) {
 fn bump_shared_m_light(chunk_size: usize, smt: bool) {
     let core_ids = get_cores(smt);
     let total = chunk_size * core_ids.len() * 2;
-    let shared = Arc::new(SpinMutex::new(Bump::with_capacity(total)));
+    let shared = SpinMutex::new(Bump::with_capacity(total));
+    let shared_borrow = &shared;
 
     std::thread::scope(|s| {
         for core_id in core_ids.iter() {
-            let shared = Arc::clone(&shared);
-            s.spawn(move || {
+            s.spawn(|| {
                 core_affinity::set_for_current(*core_id);
                 for _ in 0..3 {
-                    let mut guard = shared.lock();
-                    do_work_light(&guard);
-                    guard.reset();
+                    build_light(shared_borrow);
+                    shared.lock().reset();
                 }
             });
         }
+    });
+}
+
+// ==================== SharedBump wrapper + guard (unlock без дропа guard) ====================
+
+/// Обёртка: Bump + флаг лока. Guard умеет unlock()/lock() без дропа,
+/// поэтому заимствование данных (BumpVec) остаётся валидным после разблокировки.
+struct SharedBump {
+    locked: AtomicBool,
+    data: UnsafeCell<Bump>,
+}
+
+unsafe impl Send for SharedBump {}
+unsafe impl Sync for SharedBump {}
+
+impl SharedBump {
+    fn new(bump: Bump) -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            data: UnsafeCell::new(bump),
+        }
+    }
+
+    fn lock(&self) -> SharedBumpGuard<'_> {
+        let mut backoff: u32 = 1;
+        loop {
+            if self
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+            for _ in 0..backoff {
+                std::hint::spin_loop();
+            }
+            backoff = (backoff * 2).min(4096);
+            std::thread::yield_now();
+        }
+        SharedBumpGuard { shared: self }
+    }
+}
+
+struct SharedBumpGuard<'a> {
+    shared: &'a SharedBump,
+}
+
+impl SharedBumpGuard<'_> {
+    /// Ссылка на Bump живёт столько же, сколько guard (не привязана к lock).
+    fn bump(&self) -> &Bump {
+        unsafe { &*self.shared.data.get() }
+    }
+
+    /// Отпускает lock, НЕ дропая guard: borrow данных остаётся валидным.
+    fn unlock(&self) {
+        self.shared.locked.store(false, Ordering::Release);
+    }
+
+    /// Снова захватывает lock.
+    fn lock(&self) {
+        let mut backoff: u32 = 1;
+        loop {
+            if self
+                .shared
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+            for _ in 0..backoff {
+                std::hint::spin_loop();
+            }
+            backoff = (backoff * 2).min(4096);
+            std::thread::yield_now();
+        }
+    }
+
+    /// Сбрасывает Bump. Должен вызываться под захваченным lock
+    /// и только когда все потоки закончили использовать данные.
+    fn reset(&self) {
+        unsafe { (&mut *self.shared.data.get()).reset() };
+    }
+}
+
+impl Drop for SharedBumpGuard<'_> {
+    fn drop(&mut self) {
+        self.shared.locked.store(false, Ordering::Release);
+    }
+}
+
+/// Единый Bump выделяется до потоков, доступ через wrapper+guard.
+/// Выделяем под локом, затем unlock() (guard не дропаем) и работаем без лока.
+/// После каждой итерации барьер: когда все потоки дошли — лидер сбрасывает bump.
+fn bump_shared_unlock_m(chunk_size: usize, smt: bool) {
+    let core_ids = get_cores(smt);
+    let total = chunk_size * core_ids.len() * 2;
+    let shared = SharedBump::new(Bump::with_capacity(total));
+    let barrier = spin::Barrier::new(core_ids.len());
+    let shared_borrow = &shared;
+    let barrier_borrow = &barrier;
+
+    std::thread::scope(|s| {
+        for core_id in core_ids.iter() {
+            s.spawn(|| {
+                core_affinity::set_for_current(*core_id);
+                let guard = shared_borrow.lock();
+                for _ in 0..3 {
+                    let vectr = {
+                        let bump: &Bump = guard.bump();
+                        let mut vectr: BumpVec<BumpVec<BumpString>> =
+                            BumpVec::with_capacity_in(4 * 100 * 100, bump);
+                        for _ in 0..200 {
+                            for _ in 0..200 {
+                                let mut vec: BumpVec<BumpString> =
+                                    BumpVec::with_capacity_in(400, bump);
+                                for _ in 0..100 {
+                                    vec.push(BumpString::from_str_in("stroka", bump));
+                                }
+                                vectr.push(vec);
+                            }
+                        }
+                        vectr
+                    };
+                    guard.unlock(); // отпустили лок, но заимствование живо
+                    core::hint::black_box(vectr);
+
+                    // все потоки закончили итерацию -> барьер, лидер сбрасывает bump
+                    let result = barrier_borrow.wait();
+                    if result.is_leader() {
+                        guard.lock();
+                        guard.reset();
+                        guard.unlock();
+                    }
+                    // второй барьер: гарантируем, что reset завершён до следующей итерации
+                    barrier_borrow.wait();
+                    guard.lock(); // снова берём лок для следующей итерации
+                }
+            });
+        }
+    });
+}
+
+fn bump_shared_unlock_m_light(chunk_size: usize, smt: bool) {
+    let core_ids = get_cores(smt);
+    let total = chunk_size * core_ids.len() * 2;
+    let shared = SharedBump::new(Bump::with_capacity(total));
+    let barrier = spin::Barrier::new(core_ids.len());
+    let shared_borrow = &shared;
+    let barrier_borrow = &barrier;
+
+    std::thread::scope(|s| {
+        for core_id in core_ids.iter() {
+            s.spawn(|| {
+                core_affinity::set_for_current(*core_id);
+                let guard = shared_borrow.lock();
+                for _ in 0..3 {
+                    let vectr = {
+                        let bump: &Bump = guard.bump();
+                        let mut vectr: BumpVec<BumpVec<BumpString>> =
+                            BumpVec::with_capacity_in(100 * 100, bump);
+                        for _ in 0..100 {
+                            for _ in 0..100 {
+                                let mut vec: BumpVec<BumpString> =
+                                    BumpVec::with_capacity_in(400, bump);
+                                for _ in 0..100 {
+                                    vec.push(BumpString::from_str_in("stroka", bump));
+                                }
+                                vectr.push(vec);
+                            }
+                        }
+                        vectr
+                    };
+                    guard.unlock();
+                    core::hint::black_box(vectr);
+
+                    let result = barrier_borrow.wait();
+                    if result.is_leader() {
+                        guard.lock();
+                        guard.reset();
+                        guard.unlock();
+                    }
+                    // второй барьер: reset завершён до следующей итерации
+                    barrier_borrow.wait();
+                    guard.lock();
+                }
+            });
+        }
+    });
+}
+
+//unsound ???
+// а нет эт я тупой((
+#[test]
+fn test1() {
+    let shared = SpinMutex::new(Bump::new());
+
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            shared.lock().reset();
+        });
+        s.spawn(|| {
+            std::thread::sleep(Duration::from_secs(1));
+            let guard = shared.lock();
+            let str1 = guard.alloc_str("str1");
+            println!("{}", str1);
+        });
     });
 }
 
@@ -279,7 +520,7 @@ fn profile_bump_chunk_size_full() -> usize {
     core::hint::black_box(vectr);
     bump.reset();
 
-    let recommended = used * 120 / 100;
+    let recommended = used * 105 / 100;
     ((recommended + (1024 * 1024 - 1)).div_ceil(1024 * 1024)) * (1024 * 1024)
 }
 
@@ -361,7 +602,7 @@ fn profile_bump_chunk_size_light() -> usize {
     core::hint::black_box(vectr);
     bump.reset();
 
-    let recommended = used * 120 / 100;
+    let recommended = used * 105 / 100;
     ((recommended + (1024 * 1024 - 1)).div_ceil(1024 * 1024)) * (1024 * 1024)
 }
 
