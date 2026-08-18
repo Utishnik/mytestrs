@@ -133,14 +133,13 @@ fn median(times: &[u128]) -> u128 {
     sorted[sorted.len() / 2]
 }
 
-/// Возвращает список ядер в зависимости от режима SMT.
 fn get_cores(smt: bool) -> Vec<core_affinity::CoreId> {
     let all = core_affinity::get_core_ids().unwrap();
     if smt {
         all
     } else {
-        // Предполагаем, что физические ядра идут первыми (чётные индексы)
-        all.into_iter().step_by(2).collect()
+        let physical_count = num_cpus::get_physical();
+        all.into_iter().take(physical_count).collect()
     }
 }
 
