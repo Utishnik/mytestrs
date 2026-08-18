@@ -7,10 +7,15 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
-    let core_ids = core_affinity::get_core_ids().unwrap();
-    println!("количество ядер: {}", core_ids.len());
+    let all_cores = core_affinity::get_core_ids().unwrap();
+    let logical_cores = all_cores.len();
+    let physical_cores = num_cpus::get_physical();
+    println!("Логических ядер: {}", logical_cores);
+    println!("Физических ядер: {}", physical_cores);
+    println!();
+
     // ---------- PGO для полной версии ----------
-    let mut pgo_full_res: Vec<_> = Vec::new();
+    let mut pgo_full_res: Vec<u128> = Vec::new();
     for _ in 0..3 {
         let pgo = profile_bump_chunk_size_full() as u128;
         pgo_full_res.push(pgo);
@@ -22,7 +27,7 @@ fn main() {
     );
 
     // ---------- PGO для лайт версии ----------
-    let mut pgo_light_res: Vec<_> = Vec::new();
+    let mut pgo_light_res: Vec<u128> = Vec::new();
     for _ in 0..3 {
         let pgo = profile_bump_chunk_size_light() as u128;
         pgo_light_res.push(pgo);
@@ -33,25 +38,41 @@ fn main() {
         pgo_light / (1024 * 1024)
     );
 
+    // ========== Запуск с SMT (все логические ядра) ==========
+    run_benchmarks(true, pgo_full, pgo_light);
+
+    // ========== Запуск без SMT (только физические ядра) ==========
+    run_benchmarks(false, pgo_full, pgo_light);
+}
+
+/// Выполняет полный цикл бенчмарков (прогрев + замеры) для заданного режима SMT.
+fn run_benchmarks(smt: bool, pgo_full: usize, pgo_light: usize) {
+    let mode_str = if smt {
+        "SMT (all logical cores)"
+    } else {
+        "NO SMT (physical cores only)"
+    };
+    println!("\n########## Режим: {} ##########\n", mode_str);
+
     // ---------- Прогрев полной версии ----------
     for _ in 0..5 {
-        mimm();
-        bump_scope_m(pgo_full);
+        mimm(smt);
+        bump_scope_m(pgo_full, smt);
     }
 
     // ---------- Прогрев лайт версии ----------
     for _ in 0..5 {
-        mimm_light();
-        bump_scope_m_light(pgo_light);
+        mimm_light(smt);
+        bump_scope_m_light(pgo_light, smt);
     }
 
     // ---------- Тест полной версии ----------
-    println!("\n=== FULL VERSION ===");
+    println!("=== FULL VERSION ({}) ===", mode_str);
     for round in 0..3 {
         let mimm_times: Vec<u128> = (0..10)
             .map(|_| {
                 let start = std::time::Instant::now();
-                mimm();
+                mimm(smt);
                 start.elapsed().as_micros()
             })
             .collect();
@@ -60,7 +81,7 @@ fn main() {
         let bump_times: Vec<u128> = (0..10)
             .map(|_| {
                 let start = std::time::Instant::now();
-                bump_scope_m(pgo_full);
+                bump_scope_m(pgo_full, smt);
                 start.elapsed().as_micros()
             })
             .collect();
@@ -75,12 +96,12 @@ fn main() {
     }
 
     // ---------- Тест лайт версии ----------
-    println!("\n=== LIGHT VERSION ===");
+    println!("\n=== LIGHT VERSION ({}) ===", mode_str);
     for round in 0..3 {
         let mimm_times: Vec<u128> = (0..10)
             .map(|_| {
                 let start = std::time::Instant::now();
-                mimm_light();
+                mimm_light(smt);
                 start.elapsed().as_micros()
             })
             .collect();
@@ -89,7 +110,7 @@ fn main() {
         let bump_times: Vec<u128> = (0..10)
             .map(|_| {
                 let start = std::time::Instant::now();
-                bump_scope_m_light(pgo_light);
+                bump_scope_m_light(pgo_light, smt);
                 start.elapsed().as_micros()
             })
             .collect();
@@ -110,6 +131,17 @@ fn median(times: &[u128]) -> u128 {
     let mut sorted = times.to_vec();
     sorted.sort_unstable();
     sorted[sorted.len() / 2]
+}
+
+/// Возвращает список ядер в зависимости от режима SMT.
+fn get_cores(smt: bool) -> Vec<core_affinity::CoreId> {
+    let all = core_affinity::get_core_ids().unwrap();
+    if smt {
+        all
+    } else {
+        // Предполагаем, что физические ядра идут первыми (чётные индексы)
+        all.into_iter().step_by(2).collect()
+    }
 }
 
 // ==================== Полная версия ====================
@@ -140,8 +172,8 @@ fn profile_bump_chunk_size_full() -> usize {
     rounded
 }
 
-fn bump_scope_m(chunk_size: usize) {
-    let core_ids = core_affinity::get_core_ids().unwrap();
+fn bump_scope_m(chunk_size: usize, smt: bool) {
+    let core_ids = get_cores(smt);
     std::thread::scope(|s| {
         for core_id in core_ids.iter() {
             s.spawn(move || {
@@ -171,11 +203,11 @@ fn bump_scope_m(chunk_size: usize) {
     });
 }
 
-fn mimm() {
-    let core_ids = core_affinity::get_core_ids().unwrap();
+fn mimm(smt: bool) {
+    let core_ids = get_cores(smt);
     std::thread::scope(|s| {
         for core_id in core_ids.iter() {
-            s.spawn(|| {
+            s.spawn(move || {
                 core_affinity::set_for_current(*core_id);
                 for _ in 0..3 {
                     let mut vectr: Vec<Vec<String>> = Vec::with_capacity(40000);
@@ -223,8 +255,8 @@ fn profile_bump_chunk_size_light() -> usize {
     rounded
 }
 
-fn bump_scope_m_light(chunk_size: usize) {
-    let core_ids = core_affinity::get_core_ids().unwrap();
+fn bump_scope_m_light(chunk_size: usize, smt: bool) {
+    let core_ids = get_cores(smt);
     std::thread::scope(|s| {
         for core_id in core_ids.iter() {
             s.spawn(move || {
@@ -254,11 +286,11 @@ fn bump_scope_m_light(chunk_size: usize) {
     });
 }
 
-fn mimm_light() {
-    let core_ids = core_affinity::get_core_ids().unwrap();
+fn mimm_light(smt: bool) {
+    let core_ids = get_cores(smt);
     std::thread::scope(|s| {
         for core_id in core_ids.iter() {
-            s.spawn(|| {
+            s.spawn(move || {
                 core_affinity::set_for_current(*core_id);
                 for _ in 0..3 {
                     let mut vectr: Vec<Vec<String>> = Vec::with_capacity(10_000);

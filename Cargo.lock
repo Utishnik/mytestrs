@@ -96,6 +96,7 @@ dependencies = [
  "bumpalo",
  "core_affinity",
  "mimalloc",
+ "num_cpus",
 ]
 
 [[package]]
