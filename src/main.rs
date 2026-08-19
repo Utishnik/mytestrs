@@ -164,12 +164,14 @@ impl SharedArena {
             }
         }
 
-        // Lock в RAM (best effort)
+        // Lock в RAM (best effort) - закомментировано по желанию
+        /*
         let locked = platform::lock_memory(alloc.ptr, total_capacity);
         println!(
             "  [Arena] mlock/VirtualLock: {}",
             if locked { "OK" } else { "SKIPPED" }
         );
+        */
 
         Self { alloc }
     }
@@ -319,6 +321,14 @@ impl<'a, T> ArenaVec<'a, T> {
         self.ptr = new_ptr;
         self.cap = new_cap;
     }
+
+    /// Возвращает срез элементов (безопасно, если len > 0)
+    fn as_slice(&self) -> &[T] {
+        if self.len == 0 {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
 }
 
 impl<'a, T> Drop for ArenaVec<'a, T> {
@@ -331,29 +341,34 @@ impl<'a, T> Drop for ArenaVec<'a, T> {
     }
 }
 
+// ---------- ArenaString (владеющая строка на базе ArenaVec<u8>) ----------
+
 struct ArenaString<'a> {
-    data: &'a str,
+    vec: ArenaVec<'a, u8>,
 }
 
 impl<'a> ArenaString<'a> {
     #[inline(always)]
     fn from_str_in(s: &str, bump: &'a ThreadBump<'a>) -> Self {
-        Self {
-            data: bump.alloc_str(s),
+        let mut vec = ArenaVec::with_capacity_in(s.len(), bump);
+        for &b in s.as_bytes() {
+            vec.push(b);
         }
+        Self { vec }
     }
 }
 
 impl<'a> Deref for ArenaString<'a> {
     type Target = str;
     fn deref(&self) -> &str {
-        self.data
+        // Безопасно: мы создаём только из &str и не изменяем байты после
+        unsafe { std::str::from_utf8_unchecked(self.vec.as_slice()) }
     }
 }
 
 impl<'a> fmt::Display for ArenaString<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.data)
+        write!(f, "{}", self.deref())
     }
 }
 
@@ -551,6 +566,7 @@ fn bump_shared_m_light(chunk_size: usize, smt: bool) {
 fn arena_full(chunk_size: usize, smt: bool) {
     let core_ids = get_cores(smt);
     let total_capacity = chunk_size * core_ids.len();
+    println!("[TOTAL CAPACITY]:  {}", total_capacity);
     let arena = SharedArena::new(total_capacity);
     let bumps = arena.split(core_ids.len());
 
@@ -583,6 +599,7 @@ fn arena_full(chunk_size: usize, smt: bool) {
 fn arena_light(chunk_size: usize, smt: bool) {
     let core_ids = get_cores(smt);
     let total_capacity = chunk_size * core_ids.len();
+    println!("[TOTAL CAPACITY]:  {}", total_capacity);
     let arena = SharedArena::new(total_capacity);
     let bumps = arena.split(core_ids.len());
 
