@@ -11,3 +11,12 @@ core_affinity = "0.8.3"
 mimalloc = "0.1.52"
 num_cpus = "1.17.0"
 spin = "0.9"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_System_Memory",
+    "Win32_Foundation",
+    "Win32_Security",
+] }
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
