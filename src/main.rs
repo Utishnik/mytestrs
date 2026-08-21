@@ -256,8 +256,9 @@ impl<'a> ThreadBump<'a> {
         if count == 0 {
             return ptr::null_mut();
         }
-        let layout = Layout::array::<T>(count).unwrap();
-        self.alloc_raw(layout.size(), layout.align()) as *mut T
+        let size = count * core::mem::size_of::<T>();
+        let align = core::mem::align_of::<T>();
+        self.alloc_raw(size, align) as *mut T
     }
 
     fn reset(&self) {
