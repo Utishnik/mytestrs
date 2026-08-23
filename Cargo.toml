@@ -29,3 +29,11 @@ divan = "0.1.21"
 [[bench]]
 name = "benche"
 harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[profile.bench]
+lto = true
+codegen-units = 1
