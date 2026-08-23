@@ -221,6 +221,7 @@ struct ThreadBump<'a> {
 }
 
 impl<'a> ThreadBump<'a> {
+    #[hotpath::measure]
     #[inline(always)]
     fn alloc_raw(&self, size: usize, align: usize) -> *mut u8 {
         let current = self.offset.get();
@@ -286,21 +287,21 @@ impl<'a> ThreadBump<'a> {
 //          ARENA VEC / ARENA STRING (ВСЁ ИЗ ОДНОГО БУФЕРА)
 // ============================================================
 
-struct ArenaVec<'a, T> {
+struct ArenaVec<T> {
     ptr: *mut T,
     len: usize,
     cap: usize,
-    bump: &'a ThreadBump<'a>,
 }
 
-impl<'a, T> ArenaVec<'a, T> {
-    fn with_capacity_in(capacity: usize, bump: &'a ThreadBump<'a>) -> Self {
+impl<T> ArenaVec<T> {
+    #[hotpath::measure]
+    #[inline(always)]
+    fn with_capacity_in(capacity: usize, bump: &ThreadBump) -> Self {
         if capacity == 0 {
             return Self {
                 ptr: ptr::null_mut(),
                 len: 0,
                 cap: 0,
-                bump,
             };
         }
         let ptr = bump.alloc_uninit_slice::<T>(capacity);
@@ -308,14 +309,14 @@ impl<'a, T> ArenaVec<'a, T> {
             ptr,
             len: 0,
             cap: capacity,
-            bump,
         }
     }
 
     #[inline(always)]
-    fn push(&mut self, value: T) {
+    #[hotpath::measure]
+    fn push(&mut self, value: T, bump: &ThreadBump) {
         if self.len == self.cap {
-            self.grow();
+            self.grow(bump);
         }
         unsafe {
             self.ptr.add(self.len).write(value);
@@ -323,7 +324,8 @@ impl<'a, T> ArenaVec<'a, T> {
         self.len += 1;
     }
 
-    fn from_slice_in(slice: &[T], bump: &'a ThreadBump<'a>) -> Self
+    #[hotpath::measure]
+    fn from_slice_in(slice: &[T], bump: &ThreadBump) -> Self
     where
         T: Copy,
     {
@@ -332,17 +334,13 @@ impl<'a, T> ArenaVec<'a, T> {
         unsafe {
             ptr::copy_nonoverlapping(slice.as_ptr(), ptr, len);
         }
-        Self {
-            ptr,
-            len,
-            cap: len,
-            bump,
-        }
+        Self { ptr, len, cap: len }
     }
 
-    fn grow(&mut self) {
+    #[hotpath::measure]
+    fn grow(&mut self, bump: &ThreadBump) {
         let new_cap = if self.cap == 0 { 4 } else { self.cap * 2 };
-        let new_ptr = self.bump.alloc_uninit_slice::<T>(new_cap);
+        let new_ptr = bump.alloc_uninit_slice::<T>(new_cap);
         if self.len > 0 {
             unsafe {
                 ptr::copy_nonoverlapping(self.ptr, new_ptr, self.len);
@@ -361,7 +359,7 @@ impl<'a, T> ArenaVec<'a, T> {
     }
 }
 
-impl<'a, T> Drop for ArenaVec<'a, T> {
+impl<T> Drop for ArenaVec<T> {
     fn drop(&mut self) {
         for i in 0..self.len {
             unsafe {
@@ -373,19 +371,20 @@ impl<'a, T> Drop for ArenaVec<'a, T> {
 
 // ---------- ArenaString (владеющая строка на базе ArenaVec<u8>) ----------
 
-struct ArenaString<'a> {
-    vec: ArenaVec<'a, u8>,
+struct ArenaString {
+    vec: ArenaVec<u8>,
 }
 
-impl<'a> ArenaString<'a> {
+impl ArenaString {
     #[inline(always)]
-    fn from_str_in(s: &str, bump: &'a ThreadBump<'a>) -> Self {
+    #[hotpath::measure]
+    fn from_str_in(s: &str, bump: &ThreadBump) -> Self {
         let vec = ArenaVec::from_slice_in(s.as_bytes(), bump);
         Self { vec }
     }
 }
 
-impl<'a> Deref for ArenaString<'a> {
+impl Deref for ArenaString {
     type Target = str;
     fn deref(&self) -> &str {
         // Безопасно: мы создаём только из &str и не изменяем байты после
@@ -393,7 +392,7 @@ impl<'a> Deref for ArenaString<'a> {
     }
 }
 
-impl<'a> fmt::Display for ArenaString<'a> {
+impl fmt::Display for ArenaString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.deref())
     }
@@ -615,9 +614,9 @@ pub fn arena_full(chunk_size: usize, smt: bool) {
                                 let mut vec: ArenaVec<ArenaString> =
                                     ArenaVec::with_capacity_in(400, &bump);
                                 for _ in 0..100 {
-                                    vec.push(ArenaString::from_str_in("stroka", &bump));
+                                    vec.push(ArenaString::from_str_in("stroka", &bump), &bump);
                                 }
-                                vectr.push(vec);
+                                vectr.push(vec, &bump);
                             }
                         }
                         core::hint::black_box(&vectr);
@@ -657,9 +656,9 @@ pub fn arena_light(chunk_size: usize, smt: bool) {
                                 let mut vec: ArenaVec<ArenaString> =
                                     ArenaVec::with_capacity_in(400, &bump);
                                 for _ in 0..100 {
-                                    vec.push(ArenaString::from_str_in("stroka", &bump));
+                                    vec.push(ArenaString::from_str_in("stroka", &bump), &bump);
                                 }
-                                vectr.push(vec);
+                                vectr.push(vec, &bump);
                             }
                         }
                         core::hint::black_box(&vectr);
@@ -728,9 +727,9 @@ pub fn profile_arena_chunk_size_full() -> usize {
         for _ in 0..200 {
             let mut vec: ArenaVec<ArenaString> = ArenaVec::with_capacity_in(400, bump);
             for _ in 0..100 {
-                vec.push(ArenaString::from_str_in("stroka", bump));
+                vec.push(ArenaString::from_str_in("stroka", bump), bump);
             }
-            vectr.push(vec);
+            vectr.push(vec, bump);
         }
     }
     let used = bump.allocated_bytes();
@@ -750,9 +749,9 @@ pub fn profile_arena_chunk_size_light() -> usize {
         for _ in 0..100 {
             let mut vec: ArenaVec<ArenaString> = ArenaVec::with_capacity_in(400, bump);
             for _ in 0..100 {
-                vec.push(ArenaString::from_str_in("stroka", bump));
+                vec.push(ArenaString::from_str_in("stroka", bump), bump);
             }
-            vectr.push(vec);
+            vectr.push(vec, bump);
         }
     }
     let used = bump.allocated_bytes();
