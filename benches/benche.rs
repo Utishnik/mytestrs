@@ -14,6 +14,7 @@ fn pgo() -> (usize, usize, usize, usize) {
     })
 }
 
+#[hotpath::main]
 fn main() {
     divan::main();
 }

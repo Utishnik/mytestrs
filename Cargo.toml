@@ -9,7 +9,7 @@ allocator-api2 = "0.4.0"
 bumpalo = { version = "3.20", features = ["collections"] }
 core_affinity = "0.8.3"
 crossbeam-utils = "0.8.22"
-hotpath = "0.24.0"
+hotpath = { version = "0.24.0", features = ["hotpath"] }
 mimalloc = "0.1.52"
 num_cpus = "1.17.0"
 spin = "0.9"

@@ -150,11 +150,13 @@ impl SharedArena {
         let alloc = platform::try_alloc_huge(total_capacity)
             .unwrap_or_else(|| platform::alloc_normal(total_capacity));
 
-        println!(
-            "  [Arena] Выделено {} MB, huge pages: {}",
-            total_capacity / (1024 * 1024),
-            alloc.is_huge
-        );
+        if verbose_enabled() {
+            println!(
+                "  [Arena] Выделено {} MB, huge pages: {}",
+                total_capacity / (1024 * 1024),
+                alloc.is_huge
+            );
+        }
 
         // Глобальный pre-fault убран: страницы теперь трогает каждый поток
         // самостоятельно (arena_full/arena_light -> bump.prefault_local()),
@@ -591,7 +593,9 @@ pub fn bump_shared_m_light(chunk_size: usize, smt: bool) {
 pub fn arena_full(chunk_size: usize, smt: bool) {
     let core_ids = get_cores(smt);
     let total_capacity = chunk_size * core_ids.len();
-    println!("[TOTAL CAPACITY]:  {}", total_capacity);
+    if verbose_enabled() {
+        println!("[TOTAL CAPACITY]:  {}", total_capacity);
+    }
     let arena = SharedArena::new(total_capacity);
     let bumps = arena.split(core_ids.len());
 
@@ -599,23 +603,29 @@ pub fn arena_full(chunk_size: usize, smt: bool) {
         for (core_id, bump) in core_ids.iter().zip(bumps) {
             s.spawn(move || {
                 core_affinity::set_for_current(*core_id);
-                bump.prefault_local(); // first-touch в локальной NUMA-ноде
+                hotpath::measure_block!("prefault", {
+                    bump.prefault_local(); // first-touch в локальной NUMA-ноде
+                });
                 for _ in 0..3 {
-                    let mut vectr: ArenaVec<ArenaVec<ArenaString>> =
-                        ArenaVec::with_capacity_in(40000, &bump);
-                    for _ in 0..200 {
+                    hotpath::measure_block!("alloc", {
+                        let mut vectr: ArenaVec<ArenaVec<ArenaString>> =
+                            ArenaVec::with_capacity_in(40000, &bump);
                         for _ in 0..200 {
-                            let mut vec: ArenaVec<ArenaString> =
-                                ArenaVec::with_capacity_in(400, &bump);
-                            for _ in 0..100 {
-                                vec.push(ArenaString::from_str_in("stroka", &bump));
+                            for _ in 0..200 {
+                                let mut vec: ArenaVec<ArenaString> =
+                                    ArenaVec::with_capacity_in(400, &bump);
+                                for _ in 0..100 {
+                                    vec.push(ArenaString::from_str_in("stroka", &bump));
+                                }
+                                vectr.push(vec);
                             }
-                            vectr.push(vec);
                         }
-                    }
-                    core::hint::black_box(&vectr);
-                    drop(vectr);
-                    bump.reset();
+                        core::hint::black_box(&vectr);
+                        drop(vectr);
+                    });
+                    hotpath::measure_block!("reset", {
+                        bump.reset();
+                    });
                 }
             });
         }
@@ -625,7 +635,9 @@ pub fn arena_full(chunk_size: usize, smt: bool) {
 pub fn arena_light(chunk_size: usize, smt: bool) {
     let core_ids = get_cores(smt);
     let total_capacity = chunk_size * core_ids.len();
-    println!("[TOTAL CAPACITY]:  {}", total_capacity);
+    if verbose_enabled() {
+        println!("[TOTAL CAPACITY]:  {}", total_capacity);
+    }
     let arena = SharedArena::new(total_capacity);
     let bumps = arena.split(core_ids.len());
 
@@ -633,23 +645,29 @@ pub fn arena_light(chunk_size: usize, smt: bool) {
         for (core_id, bump) in core_ids.iter().zip(bumps.into_iter()) {
             s.spawn(move || {
                 core_affinity::set_for_current(*core_id);
-                bump.prefault_local(); // first-touch в локальной NUMA-ноде
+                hotpath::measure_block!("prefault", {
+                    bump.prefault_local(); // first-touch в локальной NUMA-ноде
+                });
                 for _ in 0..3 {
-                    let mut vectr: ArenaVec<ArenaVec<ArenaString>> =
-                        ArenaVec::with_capacity_in(10000, &bump);
-                    for _ in 0..100 {
+                    hotpath::measure_block!("alloc", {
+                        let mut vectr: ArenaVec<ArenaVec<ArenaString>> =
+                            ArenaVec::with_capacity_in(10000, &bump);
                         for _ in 0..100 {
-                            let mut vec: ArenaVec<ArenaString> =
-                                ArenaVec::with_capacity_in(400, &bump);
                             for _ in 0..100 {
-                                vec.push(ArenaString::from_str_in("stroka", &bump));
+                                let mut vec: ArenaVec<ArenaString> =
+                                    ArenaVec::with_capacity_in(400, &bump);
+                                for _ in 0..100 {
+                                    vec.push(ArenaString::from_str_in("stroka", &bump));
+                                }
+                                vectr.push(vec);
                             }
-                            vectr.push(vec);
                         }
-                    }
-                    core::hint::black_box(&vectr);
-                    drop(vectr);
-                    bump.reset();
+                        core::hint::black_box(&vectr);
+                        drop(vectr);
+                    });
+                    hotpath::measure_block!("reset", {
+                        bump.reset();
+                    });
                 }
             });
         }
@@ -748,6 +766,12 @@ pub fn profile_arena_chunk_size_light() -> usize {
 //                        УТИЛИТЫ
 // ============================================================
 
+/// Отладочные принты арены показываются только при R3_VERBOSE=1,
+/// чтобы не засорять вывод `cargo bench`.
+fn verbose_enabled() -> bool {
+    std::env::var("R3_VERBOSE").is_ok()
+}
+
 fn get_cores(smt: bool) -> Vec<core_affinity::CoreId> {
     let all = core_affinity::get_core_ids().unwrap();
     if smt {
@@ -768,6 +792,7 @@ fn median(times: &[u128]) -> u128 {
 //                          MAIN
 // ============================================================
 
+#[hotpath::main]
 pub fn run() {
     let all_cores = core_affinity::get_core_ids().unwrap();
     println!("Логических ядер: {}", all_cores.len());
