@@ -1,0 +1,8 @@
+ Running benches/benche.rs (target/release/deps/benche-f7aecf253e96388f)
+Timer precision: 100 ns
+benche                         fastest       │ slowest       │ median        │ mean          │ samples │ iters
+├─ arena_full/no-smt           error: bench failed, to rerun pass `--bench benche`
+
+Caused by:
+  process didn't exit successfully: `/mnt/c/Users/utishnik/Desktop/testrs/r3/target/release/deps/benche-f7aecf253e96388f --bench` (signal: 9, SIGKILL: kill)
+  TODO FIX
