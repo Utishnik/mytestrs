@@ -8,6 +8,8 @@ allocation_hints = "0.1.0"
 allocator-api2 = "0.4.0"
 bumpalo = { version = "3.20", features = ["collections"] }
 core_affinity = "0.8.3"
+crossbeam-utils = "0.8.22"
+hotpath = "0.24.0"
 mimalloc = "0.1.52"
 num_cpus = "1.17.0"
 spin = "0.9"
@@ -20,3 +22,10 @@ windows-sys = { version = "0.59", features = [
 ] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+divan = "0.1.21"
+
+[[bench]]
+name = "benche"
+harness = false
