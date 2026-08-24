@@ -9,10 +9,14 @@ allocator-api2 = "0.4.0"
 bumpalo = { version = "3.20", features = ["collections"] }
 core_affinity = "0.8.3"
 crossbeam-utils = "0.8.22"
-hotpath = { version = "0.24.0", features = ["hotpath"] }
+hotpath = { version = "0.24.0" }
 mimalloc = "0.1.52"
 num_cpus = "1.17.0"
 spin = "0.9"
+
+[features]
+hotpath = ["hotpath/hotpath"]
+hotpath-cpu = ["hotpath/hotpath-cpu"]
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -31,11 +35,16 @@ name = "benche"
 harness = false
 
 [profile.release]
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+strip = true
+debug = false
+overflow-checks = false
+incremental = false
 
 [profile.bench]
+inherits = "release"
 lto = true
 codegen-units = 1
-panic = "abort"

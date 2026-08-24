@@ -174,25 +174,22 @@ impl SharedArena {
         Self { alloc }
     }
 
-    fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.alloc.ptr, self.alloc.size) }
-    }
-
-    fn split<'a>(&'a self, num_threads: usize) -> Vec<CachePadded<ThreadBump<'a>>> {
-        let memory = self.as_slice();
-        let chunk_size = memory.len() / num_threads;
+    fn split(&self, num_threads: usize) -> Vec<CachePadded<ThreadBump>> {
+        let base = self.alloc.ptr;
+        let total = self.alloc.size;
+        let chunk_size = total / num_threads;
 
         (0..num_threads)
             .map(|i| {
                 let start = i * chunk_size;
                 let end = if i == num_threads - 1 {
-                    memory.len()
+                    total
                 } else {
                     start + chunk_size
                 };
-
                 CachePadded::new(ThreadBump {
-                    memory: &memory[start..end],
+                    ptr: unsafe { base.add(start) },
+                    len: end - start,
                     offset: Cell::new(0),
                 })
             })
@@ -215,29 +212,33 @@ impl Drop for SharedArena {
 //            THREAD-LOCAL BUMP (БЕЗ СИНХРОНИЗАЦИИ)
 // ============================================================
 
-struct ThreadBump<'a> {
-    memory: &'a [u8],
+struct ThreadBump {
+    ptr: *mut u8,
+    len: usize,
     offset: Cell<usize>,
 }
 
-impl<'a> ThreadBump<'a> {
+// Каждый ThreadBump владеет непересекающимся регионом памяти арены и
+// используется ровно одним потоком, поэтому сырой указатель безопасно
+// объявить Send (как и для любого per-thread arena-аллокатора).
+unsafe impl Send for ThreadBump {}
+
+impl ThreadBump {
     #[inline(always)]
     fn alloc_raw(&self, size: usize, align: usize) -> *mut u8 {
         let current = self.offset.get();
         let aligned = (current + align - 1) & !(align - 1);
         let new_offset = aligned + size;
 
-        if new_offset > self.memory.len() {
+        if new_offset > self.len {
             panic!(
                 "Arena OOM: need {} at offset {}, cap {}",
-                size,
-                aligned,
-                self.memory.len()
+                size, aligned, self.len
             );
         }
 
         self.offset.set(new_offset);
-        unsafe { self.memory.as_ptr().add(aligned) as *mut u8 }
+        unsafe { self.ptr.add(aligned) }
     }
 
     #[inline(always)]
@@ -268,8 +269,8 @@ impl<'a> ThreadBump<'a> {
     /// отмапилась в локальной NUMA-ноде этого потока (после set_for_current).
     fn prefault_local(&self) {
         unsafe {
-            let ptr = self.memory.as_ptr() as *mut u8;
-            let len = self.memory.len();
+            let ptr = self.ptr;
+            let len = self.len;
             for i in (0..len).step_by(4096) {
                 ptr::write_volatile(ptr.add(i), 0u8);
             }
@@ -636,7 +637,7 @@ pub fn arena_light(chunk_size: usize, smt: bool) {
     let bumps = arena.split(core_ids.len());
 
     std::thread::scope(|s| {
-        for (core_id, bump) in core_ids.iter().zip(bumps.into_iter()) {
+        for (core_id, bump) in core_ids.iter().zip(bumps) {
             s.spawn(move || {
                 core_affinity::set_for_current(*core_id);
                 hotpath::measure_block!("prefault", {
