@@ -221,7 +221,6 @@ struct ThreadBump<'a> {
 }
 
 impl<'a> ThreadBump<'a> {
-    #[hotpath::measure]
     #[inline(always)]
     fn alloc_raw(&self, size: usize, align: usize) -> *mut u8 {
         let current = self.offset.get();
@@ -313,7 +312,6 @@ impl<T> ArenaVec<T> {
     }
 
     #[inline(always)]
-    #[hotpath::measure]
     fn push(&mut self, value: T, bump: &ThreadBump) {
         if self.len == self.cap {
             self.grow(bump);
@@ -324,7 +322,6 @@ impl<T> ArenaVec<T> {
         self.len += 1;
     }
 
-    #[hotpath::measure]
     fn from_slice_in(slice: &[T], bump: &ThreadBump) -> Self
     where
         T: Copy,
@@ -337,7 +334,6 @@ impl<T> ArenaVec<T> {
         Self { ptr, len, cap: len }
     }
 
-    #[hotpath::measure]
     fn grow(&mut self, bump: &ThreadBump) {
         let new_cap = if self.cap == 0 { 4 } else { self.cap * 2 };
         let new_ptr = bump.alloc_uninit_slice::<T>(new_cap);
@@ -377,7 +373,6 @@ struct ArenaString {
 
 impl ArenaString {
     #[inline(always)]
-    #[hotpath::measure]
     fn from_str_in(s: &str, bump: &ThreadBump) -> Self {
         let vec = ArenaVec::from_slice_in(s.as_bytes(), bump);
         Self { vec }

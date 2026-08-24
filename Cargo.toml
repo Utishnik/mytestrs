@@ -33,7 +33,9 @@ harness = false
 [profile.release]
 lto = true
 codegen-units = 1
+panic = "abort"
 
 [profile.bench]
 lto = true
 codegen-units = 1
+panic = "abort"

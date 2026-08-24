@@ -16,6 +16,7 @@ fn pgo() -> (usize, usize, usize, usize) {
 
 #[hotpath::main]
 fn main() {
+    pgo(); //прогреваем
     divan::main();
 }
 
