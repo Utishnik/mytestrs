@@ -17,11 +17,74 @@ struct RawAllocation {
 
 #[cfg(windows)]
 mod platform {
-    use super::RawAllocation;
+    use super::{RawAllocation, verbose_enabled};
     use std::ptr;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE, LUID,
+    };
+    use windows_sys::Win32::Security::{
+        AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
     use windows_sys::Win32::System::Memory::*;
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    /// Включаем SeLockMemoryPrivilege ("Lock pages in memory"), если она
+    /// выдана процессу в локальной политике безопасности. Без неё
+    /// VirtualAlloc(MEM_LARGE_PAGES) не работает, и мы молча откатываемся
+    /// на обычные 4KB страницы.
+    fn enable_lock_memory_privilege() {
+        unsafe {
+            let mut token: HANDLE = ptr::null_mut();
+            if OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                &mut token,
+            ) == 0
+            {
+                return;
+            }
+
+            let mut luid: LUID = core::mem::zeroed();
+            let found = LookupPrivilegeValueW(
+                ptr::null(),
+                windows_sys::w!("SeLockMemoryPrivilege"),
+                &mut luid,
+            ) != 0;
+
+            let mut enabled = false;
+            if found {
+                let mut tp: TOKEN_PRIVILEGES = core::mem::zeroed();
+                tp.PrivilegeCount = 1;
+                tp.Privileges[0].Luid = luid;
+                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                let adjusted =
+                    AdjustTokenPrivileges(token, 0, &tp, 0, ptr::null_mut(), ptr::null_mut()) != 0;
+                // AdjustTokenPrivileges может вернуть успех, но не включить
+                // привилегию — тогда GetLastError == ERROR_NOT_ALL_ASSIGNED.
+                enabled = adjusted && GetLastError() != ERROR_NOT_ALL_ASSIGNED;
+            }
+            CloseHandle(token);
+
+            if verbose_enabled() {
+                println!(
+                    "  [Arena] SeLockMemoryPrivilege: {}",
+                    if enabled {
+                        "ENABLED"
+                    } else {
+                        "недоступна (large pages выключены)"
+                    }
+                );
+            }
+        }
+    }
 
     pub fn try_alloc_huge(size: usize) -> Option<RawAllocation> {
+        static PRIV: OnceLock<()> = OnceLock::new();
+        PRIV.get_or_init(enable_lock_memory_privilege);
+
         unsafe {
             let ptr = VirtualAlloc(
                 ptr::null_mut(),
@@ -58,6 +121,7 @@ mod platform {
         }
     }
 
+    #[allow(dead_code)]
     pub fn lock_memory(ptr: *mut u8, size: usize) -> bool {
         unsafe { VirtualLock(ptr as *const _, size) != 0 }
     }
@@ -67,12 +131,58 @@ mod platform {
             VirtualFree(alloc.ptr as *mut _, 0, MEM_RELEASE);
         }
     }
+
+    /// Размер обычной страницы (обычно 4 KB).
+    pub fn page_size() -> usize {
+        static PAGE: OnceLock<usize> = OnceLock::new();
+        *PAGE.get_or_init(|| unsafe {
+            let mut info: SYSTEM_INFO = core::mem::zeroed();
+            GetSystemInfo(&mut info);
+            info.dwPageSize as usize
+        })
+    }
+
+    /// Минимальный размер large page (обычно 2 MB).
+    pub fn huge_page_size() -> usize {
+        static HUGE: OnceLock<usize> = OnceLock::new();
+        *HUGE.get_or_init(|| unsafe { GetLargePageMinimum() })
+    }
+
+    /// На Windows large pages выделяются физически сразу в VirtualAlloc —
+    /// demand paging для них отсутствует, prefault не нужен.
+    pub fn large_pages_precommitted() -> bool {
+        true
+    }
+
+    /// Аналога MADV_POPULATE_WRITE на Windows нет.
+    pub fn populate_write(_ptr: *mut u8, _len: usize) -> bool {
+        false
+    }
+
+    /// Асинхронный prefetch через PrefetchVirtualMemory. По умолчанию
+    /// ВЫКЛЮЧЕН: на практике worker-потоки ядра фолтят страницы в другом
+    /// контексте (конкуренция за working-set lock, чужая NUMA-нода), что
+    /// только замедляет prefault. Включается через R3_ASYNC_PREFETCH=1
+    /// для экспериментов.
+    pub fn prefetch_async(ptr: *mut u8, len: usize) {
+        if len == 0 || std::env::var_os("R3_ASYNC_PREFETCH").is_none() {
+            return;
+        }
+        unsafe {
+            let range = WIN32_MEMORY_RANGE_ENTRY {
+                VirtualAddress: ptr as *mut _,
+                NumberOfBytes: len,
+            };
+            PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
+        }
+    }
 }
 
 #[cfg(unix)]
 mod platform {
     use super::RawAllocation;
     use std::ptr;
+    use std::sync::OnceLock;
 
     pub fn try_alloc_huge(size: usize) -> Option<RawAllocation> {
         #[cfg(target_os = "linux")]
@@ -123,6 +233,7 @@ mod platform {
         }
     }
 
+    #[allow(dead_code)]
     pub fn lock_memory(ptr: *mut u8, size: usize) -> bool {
         unsafe { libc::mlock(ptr as *const libc::c_void, size) == 0 }
     }
@@ -132,6 +243,57 @@ mod platform {
             libc::munmap(alloc.ptr as *mut libc::c_void, alloc.size);
         }
     }
+
+    /// Размер обычной страницы (обычно 4 KB).
+    pub fn page_size() -> usize {
+        static PAGE: OnceLock<usize> = OnceLock::new();
+        *PAGE.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize })
+    }
+
+    /// Реальный размер huge-страницы (Hugepagesize из /proc/meminfo); с такой
+    /// гранулярностью фолтится регион с MAP_HUGETLB.
+    pub fn huge_page_size() -> usize {
+        static HUGE: OnceLock<usize> = OnceLock::new();
+        *HUGE.get_or_init(|| {
+            #[cfg(target_os = "linux")]
+            {
+                if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+                    if let Some(kb) = meminfo.lines().find_map(|line| {
+                        line.strip_prefix("Hugepagesize:")
+                            .and_then(|rest| rest.trim().strip_suffix("kB"))
+                            .and_then(|num| num.trim().parse::<usize>().ok())
+                    }) {
+                        return kb * 1024;
+                    }
+                }
+            }
+            2 * 1024 * 1024
+        })
+    }
+
+    /// На Linux MAP_HUGETLB всё равно demand-fault'ится (по одной huge-странице),
+    /// поэтому prefault нужен.
+    pub fn large_pages_precommitted() -> bool {
+        false
+    }
+
+    /// Быстрый prefault на запись одним syscall (Linux >= 5.14). Страницы
+    /// фолтятся в контексте вызывающего потока, поэтому NUMA first-touch
+    /// сохраняется. На старых ядрах вернёт EINVAL -> false -> fallback.
+    pub fn populate_write(ptr: *mut u8, len: usize) -> bool {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_POPULATE_WRITE) == 0
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (ptr, len);
+            false
+        }
+    }
+
+    /// На Linux асинхронный prefetch не нужен: madvise покрывает всё синхронно.
+    pub fn prefetch_async(_ptr: *mut u8, _len: usize) {}
 }
 
 // ============================================================
@@ -191,6 +353,7 @@ impl SharedArena {
                     ptr: unsafe { base.add(start) },
                     len: end - start,
                     offset: Cell::new(0),
+                    is_huge: self.alloc.is_huge,
                 })
             })
             .collect()
@@ -216,6 +379,7 @@ struct ThreadBump {
     ptr: *mut u8,
     len: usize,
     offset: Cell<usize>,
+    is_huge: bool,
 }
 
 // Каждый ThreadBump владеет непересекающимся регионом памяти арены и
@@ -242,16 +406,6 @@ impl ThreadBump {
     }
 
     #[inline(always)]
-    fn alloc_str(&self, s: &str) -> &str {
-        let bytes = s.as_bytes();
-        let ptr = self.alloc_raw(bytes.len(), 1);
-        unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
-            std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, bytes.len()))
-        }
-    }
-
-    #[inline(always)]
     fn alloc_uninit_slice<T>(&self, count: usize) -> *mut T {
         if count == 0 {
             return ptr::null_mut();
@@ -265,16 +419,40 @@ impl ThreadBump {
         self.offset.set(0);
     }
 
-    /// First-touch: трогаем каждую страницу из текущего потока, чтобы она
-    /// отмапилась в локальной NUMA-ноде этого потока (после set_for_current).
+    /// First-touch: фолтим все страницы региона из текущего потока, чтобы они
+    /// легли в локальную NUMA-ноду (после set_for_current).
+    /// Порядок: OS-фастпуть (madvise на Linux) -> асинхронный prefetch
+    /// (Windows) -> синхронный touch-loop как гарантия и fallback.
     fn prefault_local(&self) {
+        // Windows: large pages уже физически выделены в VirtualAlloc —
+        // demand paging для них отсутствует, касаться бесполезно.
+        if self.is_huge && platform::large_pages_precommitted() {
+            return;
+        }
+
+        // Linux >= 5.14: один madvise(MADV_POPULATE_WRITE) вместо цикла
+        // page faults из userspace.
+        if platform::populate_write(self.ptr, self.len) {
+            return;
+        }
+
+        // Windows: просим ядро параллельно начать fault'ы в фоне.
+        platform::prefetch_async(self.ptr, self.len);
+
+        // Huge-страницы фолтятся целиком — достаточно одного касания на
+        // huge-страницу (вместо 512 касаний при шаге 4 KB).
+        let stride = if self.is_huge {
+            platform::huge_page_size()
+        } else {
+            platform::page_size()
+        };
+
         unsafe {
-            let ptr = self.ptr;
-            let len = self.len;
-            for i in (0..len).step_by(4096) {
-                ptr::write_volatile(ptr.add(i), 0u8);
+            let mut i = 0;
+            while i < self.len {
+                ptr::write_volatile(self.ptr.add(i), 0u8);
+                i += stride;
             }
-            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         }
     }
 
