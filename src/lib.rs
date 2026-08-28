@@ -4,6 +4,7 @@ use std::fmt;
 use std::ops::Deref;
 use std::ptr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ============================================================
 //               ПЛАТФОРМЕННЫЙ СЛОЙ ВЫДЕЛЕНИЯ ПАМЯТИ
@@ -360,11 +361,13 @@ impl SharedArena {
                 CachePadded::new(ThreadBump {
                     ptr: unsafe { base.add(start) },
                     len,
-                    lo: Cell::new(0),
-                    hi: Cell::new(0),
+                    lo: AtomicUsize::new(0),
+                    hi: AtomicUsize::new(0),
                     toggle: Cell::new(false),
                     dir,
                     is_huge: self.alloc.is_huge,
+                    neighbor_idx: None,
+                    array: ptr::null(),
                 })
             })
             .collect()
@@ -395,14 +398,89 @@ impl SharedArena {
                 CachePadded::new(ThreadBump {
                     ptr: unsafe { base.add(start) },
                     len,
-                    lo: Cell::new(0),
-                    hi: Cell::new(0),
+                    lo: AtomicUsize::new(0),
+                    hi: AtomicUsize::new(0),
                     toggle: Cell::new(false),
                     dir,
                     is_huge: self.alloc.is_huge,
+                    neighbor_idx: None,
+                    array: ptr::null(),
                 })
             })
             .collect()
+    }
+
+    /// Объединённый регион ПАРЫ: соседние потоки (2k — `Backward`, 2k+1 —
+    /// `Forward`) делят ОДИН регион размером `2 * chunk_size` и заполняют его
+    /// навстречу друг другу от внешних краёв к середине. Когда одна сторона
+    /// доходит до середины и в своём чанке места больше нет, она «берёт»
+    /// смежную свободную половину соседа (через lock-free CAS по счётчику
+    /// соседа, см. `ThreadBump::try_borrow`). Если соседей нечётное число,
+    /// последний поток получает собственный изолированный чанк без соседа.
+    fn split_paired(&self, num_threads: usize) -> Vec<CachePadded<ThreadBump>> {
+        let base = self.alloc.ptr;
+        let total = self.alloc.size;
+        let chunk_size = total / num_threads;
+        let is_huge = self.alloc.is_huge;
+
+        let bumps: Vec<CachePadded<ThreadBump>> = (0..num_threads)
+            .map(|i| {
+                if i % 2 == 0 {
+                    // Чётный — ведущий чанк пары: общий регион [2k*cs, 2k*cs+2cs).
+                    let pair_start = (i / 2) * 2 * chunk_size;
+                    let combined_len = if i + 1 < num_threads {
+                        2 * chunk_size
+                    } else {
+                        chunk_size
+                    };
+                    CachePadded::new(ThreadBump {
+                        ptr: unsafe { base.add(pair_start) },
+                        len: combined_len,
+                        lo: AtomicUsize::new(0),
+                        hi: AtomicUsize::new(0),
+                        toggle: Cell::new(false),
+                        dir: BumpDir::Backward,
+                        is_huge,
+                        neighbor_idx: None,
+                        array: ptr::null(),
+                    })
+                } else {
+                    // Нечётный — тот же самый объединённый регион пары, что и у
+                    // чётного (i-1), заполняется слева направо.
+                    let pair_start = ((i - 1) / 2) * 2 * chunk_size;
+                    CachePadded::new(ThreadBump {
+                        ptr: unsafe { base.add(pair_start) },
+                        len: 2 * chunk_size,
+                        lo: AtomicUsize::new(0),
+                        hi: AtomicUsize::new(0),
+                        toggle: Cell::new(false),
+                        dir: BumpDir::Forward,
+                        is_huge,
+                        neighbor_idx: None,
+                        array: ptr::null(),
+                    })
+                }
+            })
+            .collect();
+
+        // Проставляем индекс соседа и указатель на массив внутри каждой пары.
+        // Адрес буфера Vec стабилен (не переезжает при move/заимствовании),
+        // поэтому raw-указатель остаётся валидным, пока живут потоки.
+        let array = bumps.as_ptr();
+        let mut k = 0;
+        while k + 1 < num_threads {
+            unsafe {
+                (*(array.add(k) as *const ThreadBump as *mut ThreadBump)).neighbor_idx =
+                    Some(k + 1);
+                (*(array.add(k + 1) as *const ThreadBump as *mut ThreadBump)).neighbor_idx =
+                    Some(k);
+                (*(array.add(k) as *const ThreadBump as *mut ThreadBump)).array = array;
+                (*(array.add(k + 1) as *const ThreadBump as *mut ThreadBump)).array = array;
+            }
+            k += 2;
+        }
+
+        bumps
     }
 }
 
@@ -441,19 +519,37 @@ struct ThreadBump {
     len: usize,
     /// Байт, выделенный с левого края (для Forward — сама граница; для
     /// MiddleOut — величина левой «половины» от середины).
-    lo: Cell<usize>,
+    ///
+    /// Для режима пары (`Neighbors`/`Pair`) эти счётчики читаются и
+    /// модифицируются соседним потоком через `neighbor` (CAS, relaxed),
+    /// поэтому они atomic, а не `Cell`.
+    lo: AtomicUsize,
     /// Байт, выделенный с правого края.
-    hi: Cell<usize>,
+    hi: AtomicUsize,
     /// Для MiddleOut: чётность следующего выделения (false -> влево, true -> вправо).
     toggle: Cell<bool>,
     dir: BumpDir,
     is_huge: bool,
+    /// В режиме объединённого региона пары: индекс соседнего `ThreadBump` той
+    /// же пары (в массиве `array`). Используется для «займа» памяти у соседа
+    /// при переполнении своей стороны. `None` — поток работает в собственном
+    /// изолированном чанке.
+    neighbor_idx: Option<usize>,
+    /// Указатель на первый элемент массива bumps (стабилен: массив живёт всё
+    /// время работы потоков и никогда не переезжает). Нужен, чтобы по
+    /// `neighbor_idx` добраться до счётчиков соседа. `null` для не-пар.
+    array: *const CachePadded<ThreadBump>,
 }
 
 // Каждый ThreadBump владеет непересекающимся регионом памяти арены и
 // используется ровно одним потоком, поэтому сырой указатель безопасно
-// объявить Send (как и для любого per-thread arena-аллокатора).
+// объявить Send (как и для любого per-thread arena-аллокатора). Кроме того,
+// при раздаче пар (`split_paired`) несколько потоков держат `&ThreadBump`
+// одного и того же (никогда не переезжающего) массива и обращаются друг к
+// другу только через atomic-счётчики `lo`/`hi` и неизменяемое `dir`, поэтому
+// структура корректна и как `Sync`.
 unsafe impl Send for ThreadBump {}
+unsafe impl Sync for ThreadBump {}
 
 /// Выравнивание любого типа как ассоциированная константа. Позволяет
 /// передать `align_of::<T>()` в позицию const-generic аргумента (прямой
@@ -468,33 +564,79 @@ impl ThreadBump {
         // см. alloc_uninit_slice), поэтому маска выравнивания считается на этапе
         // компиляции, а не прокидывается через аргумент в рантайме.
         let (off, new_lo, new_hi) = match self.dir {
-            // Forward: растём от начала чанка вверх.
+            // Forward: растём от начала чанка вверх. В режиме пары собственная
+            // половина — нижняя [0, mid); середина региона `mid = len/2`.
+            //
+            // Обновление `lo` делаем через CAS, потому что тот же счётчик
+            // параллельно может расширять сосед (заём памяти), см. `try_borrow`.
             BumpDir::Forward => {
-                let off = (self.lo.get() + ALIGN - 1) & !(ALIGN - 1);
-                let end = off + size;
-                if end > self.len {
-                    panic!(
-                        "Arena OOM: need {} at offset {}, free {} (cap {})",
-                        size,
-                        off,
-                        self.len - self.lo.get(),
-                        self.len
-                    );
+                let mid = if self.neighbor_idx.is_some() {
+                    self.len / 2
+                } else {
+                    self.len
+                };
+                loop {
+                    let cur = self.lo.load(Ordering::Relaxed);
+                    let off = (cur + ALIGN - 1) & !(ALIGN - 1);
+                    let end = off + size;
+                    if end <= mid {
+                        if self
+                            .lo
+                            .compare_exchange_weak(cur, end, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                        {
+                            return unsafe { self.ptr.add(off) };
+                        }
+                    } else if let Some(p) = self.try_borrow::<ALIGN>(size) {
+                        return p;
+                    } else {
+                        panic!(
+                            "Arena OOM: need {} at offset {}, free {} (cap {})",
+                            size,
+                            off,
+                            mid - self.lo.load(Ordering::Relaxed),
+                            self.len
+                        );
+                    }
                 }
-                (off, end, 0)
             }
-            // Backward: растём от конца чанка вниз.
+            // Backward: растём от конца чанка вниз. В режиме пары собственная
+            // половина — верхняя [mid, len). Обновление `hi` — через CAS
+            // (тот же счётчик параллельно может расширять сосед-заёмщик).
             BumpDir::Backward => {
-                if size > self.len - self.hi.get() {
-                    panic!(
-                        "Arena OOM: need {} bytes, only {} free (cap {})",
-                        size,
-                        self.len - self.hi.get(),
-                        self.len
-                    );
+                let mid = if self.neighbor_idx.is_some() {
+                    self.len / 2
+                } else {
+                    0
+                };
+                loop {
+                    let cur = self.hi.load(Ordering::Relaxed);
+                    let off = (self.len - cur - size) & !(ALIGN - 1);
+                    if off >= mid {
+                        let new_hi = self.len - off;
+                        if self
+                            .hi
+                            .compare_exchange_weak(
+                                cur,
+                                new_hi,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            )
+                            .is_ok()
+                        {
+                            return unsafe { self.ptr.add(off) };
+                        }
+                    } else if let Some(p) = self.try_borrow::<ALIGN>(size) {
+                        return p;
+                    } else {
+                        panic!(
+                            "Arena OOM: need {} bytes, only {} free (cap {})",
+                            size,
+                            self.len - cur - mid,
+                            self.len
+                        );
+                    }
                 }
-                let off = (self.len - self.hi.get() - size) & !(ALIGN - 1);
-                (off, 0, self.len - off)
             }
             // MiddleOut: из середины наружу, чередуя стороны.
             BumpDir::MiddleOut => {
@@ -503,21 +645,21 @@ impl ThreadBump {
                 self.toggle.set(!side);
                 if !side {
                     // левая сторона: занята [mid - lo, mid), растёт вниз
-                    let base = mid - self.lo.get();
+                    let base = mid - self.lo.load(Ordering::Relaxed);
                     if size > base {
                         panic!(
                             "Arena OOM: need {} at offset {}, free {} (cap {})",
                             size,
-                            mid - self.lo.get(),
+                            mid - self.lo.load(Ordering::Relaxed),
                             base,
                             self.len
                         );
                     }
                     let off = (base - size) & !(ALIGN - 1);
-                    (off, mid - off, self.hi.get())
+                    (off, mid - off, self.hi.load(Ordering::Relaxed))
                 } else {
                     // правая сторона: занята [mid, mid + hi), растёт вверх
-                    let base = mid + self.hi.get();
+                    let base = mid + self.hi.load(Ordering::Relaxed);
                     let off = (base + ALIGN - 1) & !(ALIGN - 1);
                     let end = off + size;
                     if end > self.len {
@@ -529,14 +671,73 @@ impl ThreadBump {
                             self.len
                         );
                     }
-                    (off, self.lo.get(), off + size - mid)
+                    (off, self.lo.load(Ordering::Relaxed), off + size - mid)
                 }
             }
         };
 
-        self.lo.set(new_lo);
-        self.hi.set(new_hi);
+        self.lo.store(new_lo, Ordering::Relaxed);
+        self.hi.store(new_hi, Ordering::Relaxed);
         unsafe { self.ptr.add(off) }
+    }
+
+    /// Попытка «занять» память у соседа объединённого региона, когда в своей
+    /// половине места больше нет. Возвращает `Some(ptr)` при успехе или `None`,
+    /// если и у соседа недостаточно свободной смежной половины.
+    ///
+    /// Каждый из пары владеет своей половиной региона (`mid = len/2`):
+    /// Forward-сосед — нижней [0, mid), Backward-сосед — верхней [mid, len).
+    /// Когда свою половину мы заполнили и дошли до середины, мы продолжаем
+    /// в смежную свободную половину соседа (ту, что примыкает к середине),
+    /// расширяя его счётчик (`lo` или `hi`) через lock-free CAS. Поскольку
+    /// сосед тоже может одновременно расширять свой счётчик, CAS гарантирует,
+    /// что два потока не займут один и тот же кусок.
+    ///
+    /// TODO (пока заглушка): дальше — поиск по БОЛЕЕ ДАЛЬНИМ соседям, а если и у
+    /// них мало осталось — аллокация нового чанка. Сейчас при неудаче у соседа
+    /// возвращаем `None` (вызывающий паникует с OOM).
+    #[inline(always)]
+    fn try_borrow<const ALIGN: usize>(&self, size: usize) -> Option<*mut u8> {
+        let idx = self.neighbor_idx?;
+        let nb_ref = unsafe { &*self.array.add(idx) };
+        let mid = self.len / 2;
+        if nb_ref.dir == BumpDir::Forward {
+            // Сосед владеет нижней половиной [0, mid); берём у него сверху —
+            // из его свободной части [lo_odd, mid), смежной с нашей серединой.
+            loop {
+                let cur = nb_ref.lo.load(Ordering::Relaxed);
+                let off = (cur + ALIGN - 1) & !(ALIGN - 1);
+                let end = off + size;
+                if end > mid {
+                    return None;
+                }
+                if nb_ref
+                    .lo
+                    .compare_exchange_weak(cur, end, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return Some(unsafe { self.ptr.add(off) });
+                }
+            }
+        } else {
+            // Сосед владеет верхней половиной [mid, len); берём у него снизу —
+            // из его свободной части [mid, len - hi_even), смежной с серединой.
+            loop {
+                let cur = nb_ref.hi.load(Ordering::Relaxed);
+                let off = (self.len - cur - size) & !(ALIGN - 1);
+                if off < mid {
+                    return None;
+                }
+                let new_hi = self.len - off;
+                if nb_ref
+                    .hi
+                    .compare_exchange_weak(cur, new_hi, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return Some(unsafe { self.ptr.add(off) });
+                }
+            }
+        }
     }
 
     #[inline(always)]
@@ -551,8 +752,8 @@ impl ThreadBump {
     }
 
     fn reset(&self) {
-        self.lo.set(0);
-        self.hi.set(0);
+        self.lo.store(0, Ordering::Relaxed);
+        self.hi.store(0, Ordering::Relaxed);
         self.toggle.set(false);
     }
 
@@ -562,7 +763,10 @@ impl ThreadBump {
         if self.is_huge && platform::large_pages_precommitted() {
             return;
         }
-        let (lo, hi) = (self.lo.get(), self.hi.get());
+        let (lo, hi) = (
+            self.lo.load(Ordering::Relaxed),
+            self.hi.load(Ordering::Relaxed),
+        );
         match self.dir {
             BumpDir::Forward => self.prefault_range(0, lo),
             BumpDir::Backward => {
@@ -610,7 +814,7 @@ impl ThreadBump {
 
     fn allocated_bytes(&self) -> usize {
         // Forward: lo; Backward: hi; MiddleOut: lo (левая половина) + hi (правая).
-        self.lo.get() + self.hi.get()
+        self.lo.load(Ordering::Relaxed) + self.hi.load(Ordering::Relaxed)
     }
 }
 
@@ -924,6 +1128,9 @@ enum ArenaLayout {
     /// Чётные — Backward, нечётные — Forward (соседи заполняют общую границу
     /// навстречу друг другу).
     Neighbors,
+    /// Чётные+нечётные соседи делят ОДИН объединённый регион и при нехватке
+    /// места берут память друг у друга (см. `SharedArena::split_paired`).
+    Pair,
 }
 
 /// Единое тело бенчмарка shared-арены. `full` управляет объёмом работы
@@ -938,6 +1145,7 @@ fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
     let bumps = match layout {
         ArenaLayout::Uniform(dir) => arena.split_with(core_ids.len(), dir),
         ArenaLayout::Neighbors => arena.split_alternating(core_ids.len()),
+        ArenaLayout::Pair => arena.split_paired(core_ids.len()),
     };
 
     let (vcap, outer, inner) = if full {
@@ -947,9 +1155,16 @@ fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
     };
 
     std::thread::scope(|s| {
-        for (core_id, bump) in core_ids.iter().zip(bumps) {
+        for (core_id, i) in core_ids.iter().zip(0..bumps.len()) {
+            // `&bumps[i]` — разделяемая ссылка в никогда не переезжающий массив.
+            // `CachePadded<ThreadBump>: Sync` (см. `unsafe impl Sync`), поэтому
+            // сама ссылка `Send` и её можно отдать потоку. Каждый чанк
+            // использует ровно один поток; заём у соседа идёт только через
+            // atomic-счётчики (см. `try_borrow`).
+            let core = *core_id;
+            let bump = &bumps[i];
             s.spawn(move || {
-                core_affinity::set_for_current(*core_id);
+                core_affinity::set_for_current(core);
                 hotpath::measure_block!("prefault", {
                     bump.prefault_local(); // first-touch в локальной NUMA-ноде
                 });
@@ -958,21 +1173,21 @@ fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
                         let mut vectr: ArenaVec<ArenaVec<ArenaString>> =
                             ArenaVec::with_capacity_in::<
                                 { core::mem::align_of::<ArenaVec<ArenaString>>() },
-                            >(vcap, &bump);
+                            >(vcap, bump);
                         for _ in 0..outer {
                             for _ in 0..inner {
                                 let mut vec: ArenaVec<ArenaString> =
                                     ArenaVec::with_capacity_in::<
                                         { core::mem::align_of::<ArenaString>() },
-                                    >(400, &bump);
+                                    >(400, bump);
                                 for _ in 0..100 {
                                     vec.push::<{ core::mem::align_of::<ArenaString>() }>(
-                                        ArenaString::from_str_in("stroka", &bump),
-                                        &bump,
+                                        ArenaString::from_str_in("stroka", bump),
+                                        bump,
                                     );
                                 }
                                 vectr.push::<{ core::mem::align_of::<ArenaVec<ArenaString>>() }>(
-                                    vec, &bump,
+                                    vec, bump,
                                 );
                             }
                         }
@@ -1024,6 +1239,16 @@ pub fn arena_full_neighbors(chunk_size: usize, smt: bool) {
 /// Лёгкая версия: чанки соседей заполняют общую границу навстречу друг другу.
 pub fn arena_light_neighbors(chunk_size: usize, smt: bool) {
     arena_bench(chunk_size, smt, false, ArenaLayout::Neighbors);
+}
+
+/// Полная версия: соседи делят ОДИН регион и берут память друг у друга.
+pub fn arena_full_pair(chunk_size: usize, smt: bool) {
+    arena_bench(chunk_size, smt, true, ArenaLayout::Pair);
+}
+
+/// Лёгкая версия: соседи делят ОДИН регион и берут память друг у друга.
+pub fn arena_light_pair(chunk_size: usize, smt: bool) {
+    arena_bench(chunk_size, smt, false, ArenaLayout::Pair);
 }
 
 // ============================================================
@@ -1209,6 +1434,7 @@ fn run_directional_benchmarks(smt: bool, pgo_full_arena: usize, pgo_light_arena:
         ("Backward", |c, s| arena_full_dir(c, s, BumpDir::Backward)),
         ("MiddleOut", |c, s| arena_full_dir(c, s, BumpDir::MiddleOut)),
         ("Neighbors", |c, s| arena_full_neighbors(c, s)),
+        ("Pair", |c, s| arena_full_pair(c, s)),
     ];
     println!("=== Directional FULL ({}) ===", mode_str);
     for (name, f) in full_variants {
@@ -1229,6 +1455,7 @@ fn run_directional_benchmarks(smt: bool, pgo_full_arena: usize, pgo_light_arena:
             arena_light_dir(c, s, BumpDir::MiddleOut)
         }),
         ("Neighbors", |c, s| arena_light_neighbors(c, s)),
+        ("Pair", |c, s| arena_light_pair(c, s)),
     ];
     println!("=== Directional LIGHT ({}) ===", mode_str);
     for (name, f) in light_variants {
@@ -1399,8 +1626,16 @@ mod tests {
         let (_arena, bump) = make_one(BumpDir::MiddleOut, 4096);
         let base = bump.ptr as usize;
         let mid = bump.len / 2;
-        assert_eq!(bump.lo.get(), 0, "MiddleOut стартует с нуля (lo)");
-        assert_eq!(bump.hi.get(), 0, "MiddleOut стартует с нуля (hi)");
+        assert_eq!(
+            bump.lo.load(Ordering::Relaxed),
+            0,
+            "MiddleOut стартует с нуля (lo)"
+        );
+        assert_eq!(
+            bump.hi.load(Ordering::Relaxed),
+            0,
+            "MiddleOut стартует с нуля (hi)"
+        );
 
         // Сравниваем относительные смещения внутри чанка (адреса абсолютны).
         let rel = |p: usize| p - base;
@@ -1471,8 +1706,8 @@ mod tests {
         let _ = bump.alloc_raw::<1>(16);
         assert!(bump.allocated_bytes() > 0);
         bump.reset();
-        assert_eq!(bump.lo.get(), 0);
-        assert_eq!(bump.hi.get(), 0);
+        assert_eq!(bump.lo.load(Ordering::Relaxed), 0);
+        assert_eq!(bump.hi.load(Ordering::Relaxed), 0);
         assert_eq!(bump.allocated_bytes(), 0);
     }
 
@@ -1575,7 +1810,144 @@ mod tests {
         let arena = SharedArena::new(4096);
         let bumps = arena.split_with(1, BumpDir::MiddleOut);
         let b = &bumps[0];
-        assert_eq!(b.lo.get(), 0);
-        assert_eq!(b.hi.get(), 0);
+        assert_eq!(b.lo.load(Ordering::Relaxed), 0);
+        assert_eq!(b.hi.load(Ordering::Relaxed), 0);
+    }
+
+    // ---- Пара: объединённый регион и заём памяти у соседа ----
+
+    #[test]
+    fn pair_shares_combined_region() {
+        let arena = SharedArena::new(8192);
+        let bumps = arena.split_paired(2);
+        assert_eq!(bumps[0].dir, BumpDir::Backward);
+        assert_eq!(bumps[1].dir, BumpDir::Forward);
+        // Оба указывают на ОДИН объединённый регион в 2*chunk_size.
+        assert_eq!(bumps[0].ptr, bumps[1].ptr, "пара делит один регион");
+        assert_eq!(bumps[0].len, 8192);
+        assert_eq!(bumps[1].len, 8192);
+        assert!(bumps[0].neighbor_idx.is_some());
+        assert!(bumps[1].neighbor_idx.is_some());
+    }
+
+    #[test]
+    fn pair_fills_toward_middle_without_overlap() {
+        let arena = SharedArena::new(8192);
+        let bumps = arena.split_paired(2);
+        let (even, odd) = (&bumps[0], &bumps[1]); // Backward / Forward
+        let base = arena.alloc.ptr as usize;
+
+        // odd растёт в своей нижней половине [0, 4096), even — в верхней [4096, 8192).
+        let o0 = odd.alloc_raw::<1>(1000) as usize;
+        let o1 = odd.alloc_raw::<1>(1000) as usize;
+        assert_eq!(o0, base, "Forward стартует с начала региона");
+        assert_eq!(o1, base + 1000, "Forward растёт вверх");
+
+        let e0 = even.alloc_raw::<1>(1000) as usize;
+        let e1 = even.alloc_raw::<1>(1000) as usize;
+        assert_eq!(e0, base + 8192 - 1000, "Backward стартует с конца региона");
+        assert_eq!(e1, base + 8192 - 2000, "Backward растёт вниз");
+
+        // Собственные половины не пересекаются (середина — граница).
+        assert!(e1 + 1000 <= base + 8192);
+        assert!(
+            o1 + 1000 <= base + 4096,
+            "odd не выходит за середину своей половины"
+        );
+        assert!(
+            e0 >= base + 4096,
+            "even не выходит за середину своей половины"
+        );
+    }
+
+    #[test]
+    fn pair_odd_can_use_evens_half_when_even_idle() {
+        // even почти ничего не берёт, odd забирает свою половину и
+        // продолжает в смежную свободную половину even (заём памяти соседа).
+        let arena = SharedArena::new(8192);
+        let bumps = arena.split_paired(2);
+        let (even, odd) = (&bumps[0], &bumps[1]);
+        let base = arena.alloc.ptr as usize;
+
+        let _ = even.alloc_raw::<1>(16); // even занял кроху сверху: [8176, 8192)
+        let _ = odd.alloc_raw::<1>(4096); // odd заполнил свою половину [0, 4096)
+        // Теперь odd занимает у even свободную половину [4096, 8176).
+        let borrowed = odd.alloc_raw::<1>(4000) as usize;
+        assert_eq!(
+            borrowed,
+            base + 4176,
+            "заём — в половине соседа, смежной к середине"
+        );
+        assert!(borrowed >= base + 4096, "в половине even");
+        assert!(
+            borrowed + 4000 <= base + 8192 - 16,
+            "не задевает 16 байт even"
+        );
+    }
+
+    #[test]
+    fn pair_borrow_extends_neighbor_counter() {
+        // odd занимает низ своей половины, even доходит до середины, затем even
+        // заимствует смежную свободную половину odd через счётчик соседа.
+        let arena = SharedArena::new(8192);
+        let bumps = arena.split_paired(2);
+        let (even, odd) = (&bumps[0], &bumps[1]);
+        let base = arena.alloc.ptr as usize;
+
+        let _ = odd.alloc_raw::<1>(1000); // odd: [0, 1000)
+        let _ = even.alloc_raw::<1>(4096); // even заполнил свою половину [4096, 8192)
+        // even упирается в середину и берёт 100 байт из свободной части odd [1000, 4096).
+        let borrowed = even.alloc_raw::<1>(100) as usize;
+        assert_eq!(
+            borrowed,
+            base + 1000,
+            "заём — в смежной свободной половине соседа"
+        );
+        assert_eq!(
+            odd.lo.load(Ordering::Relaxed),
+            1100,
+            "счётчик соседа расширен займом"
+        );
+        // не пересекается с данными odd [0,1000) и even [4096,8192)
+        assert!(borrowed >= base + 1000);
+        assert!(borrowed + 100 <= base + 4096);
+    }
+
+    #[test]
+    fn pair_concurrent_borrow_no_overlap() {
+        // Два потока одновременно: чётный (even) забирает больше своей половины
+        // и заимствует у нечётного (odd) через lock-free CAS, нечётный — в своей
+        // половине. Проверяем, что ни один не затёр данные другого.
+        let arena = SharedArena::new(2 * 1024 * 1024); // 2 MB: половина = 1 MB
+        let bumps = arena.split_paired(2);
+
+        std::thread::scope(|s| {
+            // even: 200_000 * 8 = 1.6 MB > своей половины (1 MB) -> заимствует 0.6 MB.
+            s.spawn(|| {
+                let bump = &bumps[0];
+                let mut ptrs: Vec<*mut usize> = Vec::with_capacity(200_000);
+                for j in 0..200_000usize {
+                    let p = bump.alloc_raw::<8>(8) as *mut usize;
+                    unsafe { *p = 0xA000 + j };
+                    ptrs.push(p);
+                }
+                for (j, p) in ptrs.iter().enumerate() {
+                    assert_eq!(unsafe { **p }, 0xA000 + j, "even: данные затёрты соседом");
+                }
+            });
+            // odd: 50_000 * 8 = 0.4 MB < своей половины (1 MB), свою не покидает.
+            s.spawn(|| {
+                let bump = &bumps[1];
+                let mut ptrs: Vec<*mut usize> = Vec::with_capacity(50_000);
+                for j in 0..50_000usize {
+                    let p = bump.alloc_raw::<8>(8) as *mut usize;
+                    unsafe { *p = 0xB000 + j };
+                    ptrs.push(p);
+                }
+                for (j, p) in ptrs.iter().enumerate() {
+                    assert_eq!(unsafe { **p }, 0xB000 + j, "odd: данные затёрты соседом");
+                }
+            });
+        });
     }
 }

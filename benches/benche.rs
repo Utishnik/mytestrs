@@ -172,6 +172,19 @@ fn arena_full_neighbors_no_smt() {
     arena_full_neighbors(fa, false);
 }
 
+// Pair — соседи делят ОДИН регион и берут память друг у друга при переполнении.
+#[divan::bench(name = "arena_full/pair/smt", sample_count = RUNS)]
+fn arena_full_pair_smt() {
+    let (_, _, fa, _) = pgo();
+    arena_full_pair(fa, true);
+}
+
+#[divan::bench(name = "arena_full/pair/no-smt", sample_count = RUNS)]
+fn arena_full_pair_no_smt() {
+    let (_, _, fa, _) = pgo();
+    arena_full_pair(fa, false);
+}
+
 // То же самое для LIGHT-версии.
 #[divan::bench(name = "arena_light/forward/smt", sample_count = RUNS)]
 fn arena_light_forward_smt() {
@@ -219,4 +232,16 @@ fn arena_light_neighbors_smt() {
 fn arena_light_neighbors_no_smt() {
     let (_, _, _, la) = pgo();
     arena_light_neighbors(la, false);
+}
+
+#[divan::bench(name = "arena_light/pair/smt", sample_count = RUNS)]
+fn arena_light_pair_smt() {
+    let (_, _, _, la) = pgo();
+    arena_light_pair(la, true);
+}
+
+#[divan::bench(name = "arena_light/pair/no-smt", sample_count = RUNS)]
+fn arena_light_pair_no_smt() {
+    let (_, _, _, la) = pgo();
+    arena_light_pair(la, false);
 }
