@@ -337,6 +337,13 @@ impl SharedArena {
     }
 
     fn split(&self, num_threads: usize) -> Vec<CachePadded<ThreadBump>> {
+        self.split_with(num_threads, BumpDir::Forward)
+    }
+
+    /// Разбить арену на `num_threads` непересекающихся чанков заданного
+    /// направления заполнения. Для `MiddleOut` каждый чанк стартует из своей
+    /// середины.
+    fn split_with(&self, num_threads: usize, dir: BumpDir) -> Vec<CachePadded<ThreadBump>> {
         let base = self.alloc.ptr;
         let total = self.alloc.size;
         let chunk_size = total / num_threads;
@@ -349,10 +356,49 @@ impl SharedArena {
                 } else {
                     start + chunk_size
                 };
+                let len = end - start;
                 CachePadded::new(ThreadBump {
                     ptr: unsafe { base.add(start) },
-                    len: end - start,
-                    offset: Cell::new(0),
+                    len,
+                    lo: Cell::new(0),
+                    hi: Cell::new(0),
+                    toggle: Cell::new(false),
+                    dir,
+                    is_huge: self.alloc.is_huge,
+                })
+            })
+            .collect()
+    }
+
+    /// Чётные потоки заполняют свой чанк справа налево (`Backward`), нечётные —
+    /// слева направо (`Forward`). Так соседние чанки «доходят» до общей границы
+    /// навстречу друг другу (идея совместного использования памяти соседа).
+    fn split_alternating(&self, num_threads: usize) -> Vec<CachePadded<ThreadBump>> {
+        let base = self.alloc.ptr;
+        let total = self.alloc.size;
+        let chunk_size = total / num_threads;
+
+        (0..num_threads)
+            .map(|i| {
+                let dir = if i % 2 == 0 {
+                    BumpDir::Backward
+                } else {
+                    BumpDir::Forward
+                };
+                let start = i * chunk_size;
+                let end = if i == num_threads - 1 {
+                    total
+                } else {
+                    start + chunk_size
+                };
+                let len = end - start;
+                CachePadded::new(ThreadBump {
+                    ptr: unsafe { base.add(start) },
+                    len,
+                    lo: Cell::new(0),
+                    hi: Cell::new(0),
+                    toggle: Cell::new(false),
+                    dir,
                     is_huge: self.alloc.is_huge,
                 })
             })
@@ -375,10 +421,32 @@ impl Drop for SharedArena {
 //            THREAD-LOCAL BUMP (БЕЗ СИНХРОНИЗАЦИИ)
 // ============================================================
 
+/// Направление заполнения thread-local bump-аллокатора.
+///
+/// * `Forward`  — стандарт: слева направо (cursor растёт от 0 вверх).
+/// * `Backward` — справа налево (right-to-left). Соседний поток справа,
+///   заполняющий свой чанк слева направо, «доходит» до той же границы —
+///   отсюда идея, что сосед может дотянуться до чужой памяти.
+/// * `MiddleOut`— старт из середины чанка с чередованием вправо/влево.
+///   Два соседа, встречаясь от середин своих чанков, делят общую границу.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BumpDir {
+    Forward,
+    Backward,
+    MiddleOut,
+}
+
 struct ThreadBump {
     ptr: *mut u8,
     len: usize,
-    offset: Cell<usize>,
+    /// Байт, выделенный с левого края (для Forward — сама граница; для
+    /// MiddleOut — величина левой «половины» от середины).
+    lo: Cell<usize>,
+    /// Байт, выделенный с правого края.
+    hi: Cell<usize>,
+    /// Для MiddleOut: чётность следующего выделения (false -> влево, true -> вправо).
+    toggle: Cell<bool>,
+    dir: BumpDir,
     is_huge: bool,
 }
 
@@ -387,69 +455,153 @@ struct ThreadBump {
 // объявить Send (как и для любого per-thread arena-аллокатора).
 unsafe impl Send for ThreadBump {}
 
+/// Выравнивание любого типа как ассоциированная константа. Позволяет
+/// передать `align_of::<T>()` в позицию const-generic аргумента (прямой
+/// вызов `align_of::<T>()` в аргументе const-generic запрещён компилятором,
+/// а через ассоциированную константу — разрешён).
 impl ThreadBump {
     #[inline(always)]
-    fn alloc_raw(&self, size: usize, align: usize) -> *mut u8 {
-        let current = self.offset.get();
-        let aligned = (current + align - 1) & !(align - 1);
-        let new_offset = aligned + size;
+    fn alloc_raw<const ALIGN: usize>(&self, size: usize) -> *mut u8 {
+        // `lo` — байт выделено с левого края (для Backward/MiddleOut семантика
+        // своя, см. ниже). `hi` — байт выделено с правого края.
+        // ALIGN — константа времени компиляции (задаётся в точке вызова,
+        // см. alloc_uninit_slice), поэтому маска выравнивания считается на этапе
+        // компиляции, а не прокидывается через аргумент в рантайме.
+        let (off, new_lo, new_hi) = match self.dir {
+            // Forward: растём от начала чанка вверх.
+            BumpDir::Forward => {
+                let off = (self.lo.get() + ALIGN - 1) & !(ALIGN - 1);
+                let end = off + size;
+                if end > self.len {
+                    panic!(
+                        "Arena OOM: need {} at offset {}, free {} (cap {})",
+                        size,
+                        off,
+                        self.len - self.lo.get(),
+                        self.len
+                    );
+                }
+                (off, end, 0)
+            }
+            // Backward: растём от конца чанка вниз.
+            BumpDir::Backward => {
+                if size > self.len - self.hi.get() {
+                    panic!(
+                        "Arena OOM: need {} bytes, only {} free (cap {})",
+                        size,
+                        self.len - self.hi.get(),
+                        self.len
+                    );
+                }
+                let off = (self.len - self.hi.get() - size) & !(ALIGN - 1);
+                (off, 0, self.len - off)
+            }
+            // MiddleOut: из середины наружу, чередуя стороны.
+            BumpDir::MiddleOut => {
+                let mid = self.len / 2;
+                let side = self.toggle.get();
+                self.toggle.set(!side);
+                if !side {
+                    // левая сторона: занята [mid - lo, mid), растёт вниз
+                    let base = mid - self.lo.get();
+                    if size > base {
+                        panic!(
+                            "Arena OOM: need {} at offset {}, free {} (cap {})",
+                            size,
+                            mid - self.lo.get(),
+                            base,
+                            self.len
+                        );
+                    }
+                    let off = (base - size) & !(ALIGN - 1);
+                    (off, mid - off, self.hi.get())
+                } else {
+                    // правая сторона: занята [mid, mid + hi), растёт вверх
+                    let base = mid + self.hi.get();
+                    let off = (base + ALIGN - 1) & !(ALIGN - 1);
+                    let end = off + size;
+                    if end > self.len {
+                        panic!(
+                            "Arena OOM: need {} at offset {}, free {} (cap {})",
+                            size,
+                            off,
+                            self.len - end,
+                            self.len
+                        );
+                    }
+                    (off, self.lo.get(), off + size - mid)
+                }
+            }
+        };
 
-        if new_offset > self.len {
-            panic!(
-                "Arena OOM: need {} at offset {}, cap {}",
-                size, aligned, self.len
-            );
-        }
-
-        self.offset.set(new_offset);
-        unsafe { self.ptr.add(aligned) }
+        self.lo.set(new_lo);
+        self.hi.set(new_hi);
+        unsafe { self.ptr.add(off) }
     }
 
     #[inline(always)]
-    fn alloc_uninit_slice<T>(&self, count: usize) -> *mut T {
+    fn alloc_uninit_slice<T, const ALIGN: usize>(&self, count: usize) -> *mut T {
         if count == 0 {
             return ptr::null_mut();
         }
         let size = count * core::mem::size_of::<T>();
-        let align = core::mem::align_of::<T>();
-        self.alloc_raw(size, align) as *mut T
+        // ALIGN прокинут как const generic из точки вызова (см. ArenaVec),
+        // поэтому выравнивание известно на этапе компиляции.
+        self.alloc_raw::<ALIGN>(size) as *mut T
     }
 
     fn reset(&self) {
-        self.offset.set(0);
+        self.lo.set(0);
+        self.hi.set(0);
+        self.toggle.set(false);
     }
 
-    /// First-touch: фолтим все страницы региона из текущего потока, чтобы они
-    /// легли в локальную NUMA-ноду (после set_for_current).
-    /// Порядок: OS-фастпуть (madvise на Linux) -> асинхронный prefetch
-    /// (Windows) -> синхронный touch-loop как гарантия и fallback.
+    /// First-touch: фолтим страницы ИСПОЛЬЗОВАННЫХ областей из текущего
+    /// потока, чтобы они легли в локальную NUMA-ноду.
     fn prefault_local(&self) {
-        // Windows: large pages уже физически выделены в VirtualAlloc —
-        // demand paging для них отсутствует, касаться бесполезно.
         if self.is_huge && platform::large_pages_precommitted() {
             return;
         }
+        let (lo, hi) = (self.lo.get(), self.hi.get());
+        match self.dir {
+            BumpDir::Forward => self.prefault_range(0, lo),
+            BumpDir::Backward => {
+                let start = self.len - hi;
+                if start < self.len {
+                    self.prefault_range(start, self.len);
+                }
+            }
+            BumpDir::MiddleOut => {
+                let mid = self.len / 2;
+                // левая половина [mid - lo, mid) и правая [mid, mid + hi)
+                self.prefault_range(mid - lo, mid);
+                let rend = mid + hi;
+                if rend > mid {
+                    self.prefault_range(mid, rend);
+                }
+            }
+        }
+    }
 
-        // Linux >= 5.14: один madvise(MADV_POPULATE_WRITE) вместо цикла
-        // page faults из userspace.
-        if platform::populate_write(self.ptr, self.len) {
+    /// Фолт поддиапазона [start, end) с OS-оптимизациями и touch-loop fallback.
+    fn prefault_range(&self, start: usize, end: usize) {
+        if start >= end {
             return;
         }
-
-        // Windows: просим ядро параллельно начать fault'ы в фоне.
-        platform::prefetch_async(self.ptr, self.len);
-
-        // Huge-страницы фолтятся целиком — достаточно одного касания на
-        // huge-страницу (вместо 512 касаний при шаге 4 KB).
+        let len = end - start;
+        let ptr = unsafe { self.ptr.add(start) };
+        if platform::populate_write(ptr, len) {
+            return;
+        }
+        platform::prefetch_async(ptr, len);
         let stride = if self.is_huge {
             platform::huge_page_size()
         } else {
             platform::page_size()
         };
-
         unsafe {
-            let mut i = 0;
-            while i < self.len {
+            let mut i = start;
+            while i < end {
                 ptr::write_volatile(self.ptr.add(i), 0u8);
                 i += stride;
             }
@@ -457,7 +609,8 @@ impl ThreadBump {
     }
 
     fn allocated_bytes(&self) -> usize {
-        self.offset.get()
+        // Forward: lo; Backward: hi; MiddleOut: lo (левая половина) + hi (правая).
+        self.lo.get() + self.hi.get()
     }
 }
 
@@ -474,7 +627,7 @@ struct ArenaVec<T> {
 impl<T> ArenaVec<T> {
     #[hotpath::measure]
     #[inline(always)]
-    fn with_capacity_in(capacity: usize, bump: &ThreadBump) -> Self {
+    fn with_capacity_in<const ALIGN: usize>(capacity: usize, bump: &ThreadBump) -> Self {
         if capacity == 0 {
             return Self {
                 ptr: ptr::null_mut(),
@@ -482,7 +635,7 @@ impl<T> ArenaVec<T> {
                 cap: 0,
             };
         }
-        let ptr = bump.alloc_uninit_slice::<T>(capacity);
+        let ptr = bump.alloc_uninit_slice::<T, ALIGN>(capacity);
         Self {
             ptr,
             len: 0,
@@ -491,9 +644,9 @@ impl<T> ArenaVec<T> {
     }
 
     #[inline(always)]
-    fn push(&mut self, value: T, bump: &ThreadBump) {
+    fn push<const ALIGN: usize>(&mut self, value: T, bump: &ThreadBump) {
         if self.len == self.cap {
-            self.grow(bump);
+            self.grow::<ALIGN>(bump);
         }
         unsafe {
             self.ptr.add(self.len).write(value);
@@ -501,21 +654,21 @@ impl<T> ArenaVec<T> {
         self.len += 1;
     }
 
-    fn from_slice_in(slice: &[T], bump: &ThreadBump) -> Self
+    fn from_slice_in<const ALIGN: usize>(slice: &[T], bump: &ThreadBump) -> Self
     where
         T: Copy,
     {
         let len = slice.len();
-        let ptr = bump.alloc_uninit_slice::<T>(len);
+        let ptr = bump.alloc_uninit_slice::<T, ALIGN>(len);
         unsafe {
             ptr::copy_nonoverlapping(slice.as_ptr(), ptr, len);
         }
         Self { ptr, len, cap: len }
     }
 
-    fn grow(&mut self, bump: &ThreadBump) {
+    fn grow<const ALIGN: usize>(&mut self, bump: &ThreadBump) {
         let new_cap = if self.cap == 0 { 4 } else { self.cap * 2 };
-        let new_ptr = bump.alloc_uninit_slice::<T>(new_cap);
+        let new_ptr = bump.alloc_uninit_slice::<T, ALIGN>(new_cap);
         if self.len > 0 {
             unsafe {
                 ptr::copy_nonoverlapping(self.ptr, new_ptr, self.len);
@@ -553,7 +706,8 @@ struct ArenaString {
 impl ArenaString {
     #[inline(always)]
     fn from_str_in(s: &str, bump: &ThreadBump) -> Self {
-        let vec = ArenaVec::from_slice_in(s.as_bytes(), bump);
+        // элемент строки — u8, выравнивание = 1
+        let vec = ArenaVec::from_slice_in::<1>(s.as_bytes(), bump);
         Self { vec }
     }
 }
@@ -763,14 +917,34 @@ pub fn bump_shared_m_light(chunk_size: usize, smt: bool) {
 }
 
 // --- Shared arena (single big buffer) ---
-pub fn arena_full(chunk_size: usize, smt: bool) {
+/// Раскладка чанков арены по потокам.
+enum ArenaLayout {
+    /// Все чанки одного направления.
+    Uniform(BumpDir),
+    /// Чётные — Backward, нечётные — Forward (соседи заполняют общую границу
+    /// навстречу друг другу).
+    Neighbors,
+}
+
+/// Единое тело бенчмарка shared-арены. `full` управляет объёмом работы
+/// (FULL: 200×200×100, LIGHT: 100×100×100), `layout` — направлением заполнения.
+fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
     let core_ids = get_cores(smt);
     let total_capacity = chunk_size * core_ids.len();
     if verbose_enabled() {
         println!("[TOTAL CAPACITY]:  {}", total_capacity);
     }
     let arena = SharedArena::new(total_capacity);
-    let bumps = arena.split(core_ids.len());
+    let bumps = match layout {
+        ArenaLayout::Uniform(dir) => arena.split_with(core_ids.len(), dir),
+        ArenaLayout::Neighbors => arena.split_alternating(core_ids.len()),
+    };
+
+    let (vcap, outer, inner) = if full {
+        (40000, 200, 200)
+    } else {
+        (10000, 100, 100)
+    };
 
     std::thread::scope(|s| {
         for (core_id, bump) in core_ids.iter().zip(bumps) {
@@ -782,15 +956,24 @@ pub fn arena_full(chunk_size: usize, smt: bool) {
                 for _ in 0..3 {
                     hotpath::measure_block!("alloc", {
                         let mut vectr: ArenaVec<ArenaVec<ArenaString>> =
-                            ArenaVec::with_capacity_in(40000, &bump);
-                        for _ in 0..200 {
-                            for _ in 0..200 {
+                            ArenaVec::with_capacity_in::<
+                                { core::mem::align_of::<ArenaVec<ArenaString>>() },
+                            >(vcap, &bump);
+                        for _ in 0..outer {
+                            for _ in 0..inner {
                                 let mut vec: ArenaVec<ArenaString> =
-                                    ArenaVec::with_capacity_in(400, &bump);
+                                    ArenaVec::with_capacity_in::<
+                                        { core::mem::align_of::<ArenaString>() },
+                                    >(400, &bump);
                                 for _ in 0..100 {
-                                    vec.push(ArenaString::from_str_in("stroka", &bump), &bump);
+                                    vec.push::<{ core::mem::align_of::<ArenaString>() }>(
+                                        ArenaString::from_str_in("stroka", &bump),
+                                        &bump,
+                                    );
                                 }
-                                vectr.push(vec, &bump);
+                                vectr.push::<{ core::mem::align_of::<ArenaVec<ArenaString>>() }>(
+                                    vec, &bump,
+                                );
                             }
                         }
                         core::hint::black_box(&vectr);
@@ -805,46 +988,42 @@ pub fn arena_full(chunk_size: usize, smt: bool) {
     });
 }
 
-pub fn arena_light(chunk_size: usize, smt: bool) {
-    let core_ids = get_cores(smt);
-    let total_capacity = chunk_size * core_ids.len();
-    if verbose_enabled() {
-        println!("[TOTAL CAPACITY]:  {}", total_capacity);
-    }
-    let arena = SharedArena::new(total_capacity);
-    let bumps = arena.split(core_ids.len());
+pub fn arena_full(chunk_size: usize, smt: bool) {
+    arena_bench(
+        chunk_size,
+        smt,
+        true,
+        ArenaLayout::Uniform(BumpDir::Forward),
+    );
+}
 
-    std::thread::scope(|s| {
-        for (core_id, bump) in core_ids.iter().zip(bumps) {
-            s.spawn(move || {
-                core_affinity::set_for_current(*core_id);
-                hotpath::measure_block!("prefault", {
-                    bump.prefault_local(); // first-touch в локальной NUMA-ноде
-                });
-                for _ in 0..3 {
-                    hotpath::measure_block!("alloc", {
-                        let mut vectr: ArenaVec<ArenaVec<ArenaString>> =
-                            ArenaVec::with_capacity_in(10000, &bump);
-                        for _ in 0..100 {
-                            for _ in 0..100 {
-                                let mut vec: ArenaVec<ArenaString> =
-                                    ArenaVec::with_capacity_in(400, &bump);
-                                for _ in 0..100 {
-                                    vec.push(ArenaString::from_str_in("stroka", &bump), &bump);
-                                }
-                                vectr.push(vec, &bump);
-                            }
-                        }
-                        core::hint::black_box(&vectr);
-                        drop(vectr);
-                    });
-                    hotpath::measure_block!("reset", {
-                        bump.reset();
-                    });
-                }
-            });
-        }
-    });
+pub fn arena_light(chunk_size: usize, smt: bool) {
+    arena_bench(
+        chunk_size,
+        smt,
+        false,
+        ArenaLayout::Uniform(BumpDir::Forward),
+    );
+}
+
+/// Версия `arena_full` с заданным направлением заполнения.
+pub fn arena_full_dir(chunk_size: usize, smt: bool, dir: BumpDir) {
+    arena_bench(chunk_size, smt, true, ArenaLayout::Uniform(dir));
+}
+
+/// Версия `arena_light` с заданным направлением заполнения.
+pub fn arena_light_dir(chunk_size: usize, smt: bool, dir: BumpDir) {
+    arena_bench(chunk_size, smt, false, ArenaLayout::Uniform(dir));
+}
+
+/// Полная версия: чанки соседей заполняют общую границу навстречу друг другу.
+pub fn arena_full_neighbors(chunk_size: usize, smt: bool) {
+    arena_bench(chunk_size, smt, true, ArenaLayout::Neighbors);
+}
+
+/// Лёгкая версия: чанки соседей заполняют общую границу навстречу друг другу.
+pub fn arena_light_neighbors(chunk_size: usize, smt: bool) {
+    arena_bench(chunk_size, smt, false, ArenaLayout::Neighbors);
 }
 
 // ============================================================
@@ -896,14 +1075,20 @@ pub fn profile_arena_chunk_size_full() -> usize {
     let bumps = arena.split(1);
     let bump = &bumps[0];
 
-    let mut vectr: ArenaVec<ArenaVec<ArenaString>> = ArenaVec::with_capacity_in(40000, bump);
+    let mut vectr: ArenaVec<ArenaVec<ArenaString>> = ArenaVec::with_capacity_in::<
+        { core::mem::align_of::<ArenaVec<ArenaString>>() },
+    >(40000, bump);
     for _ in 0..200 {
         for _ in 0..200 {
-            let mut vec: ArenaVec<ArenaString> = ArenaVec::with_capacity_in(400, bump);
+            let mut vec: ArenaVec<ArenaString> =
+                ArenaVec::with_capacity_in::<{ core::mem::align_of::<ArenaString>() }>(400, bump);
             for _ in 0..100 {
-                vec.push(ArenaString::from_str_in("stroka", bump), bump);
+                vec.push::<{ core::mem::align_of::<ArenaString>() }>(
+                    ArenaString::from_str_in("stroka", bump),
+                    bump,
+                );
             }
-            vectr.push(vec, bump);
+            vectr.push::<{ core::mem::align_of::<ArenaVec<ArenaString>>() }>(vec, bump);
         }
     }
     let used = bump.allocated_bytes();
@@ -918,14 +1103,20 @@ pub fn profile_arena_chunk_size_light() -> usize {
     let bumps = arena.split(1);
     let bump = &bumps[0];
 
-    let mut vectr: ArenaVec<ArenaVec<ArenaString>> = ArenaVec::with_capacity_in(10000, bump);
+    let mut vectr: ArenaVec<ArenaVec<ArenaString>> = ArenaVec::with_capacity_in::<
+        { core::mem::align_of::<ArenaVec<ArenaString>>() },
+    >(10000, bump);
     for _ in 0..100 {
         for _ in 0..100 {
-            let mut vec: ArenaVec<ArenaString> = ArenaVec::with_capacity_in(400, bump);
+            let mut vec: ArenaVec<ArenaString> =
+                ArenaVec::with_capacity_in::<{ core::mem::align_of::<ArenaString>() }>(400, bump);
             for _ in 0..100 {
-                vec.push(ArenaString::from_str_in("stroka", bump), bump);
+                vec.push::<{ core::mem::align_of::<ArenaString>() }>(
+                    ArenaString::from_str_in("stroka", bump),
+                    bump,
+                );
             }
-            vectr.push(vec, bump);
+            vectr.push::<{ core::mem::align_of::<ArenaVec<ArenaString>>() }>(vec, bump);
         }
     }
     let used = bump.allocated_bytes();
@@ -1000,6 +1191,56 @@ pub fn run() {
         pgo_full_arena,
         pgo_light_arena,
     );
+
+    run_directional_benchmarks(true, pgo_full_arena, pgo_light_arena);
+    run_directional_benchmarks(false, pgo_full_arena, pgo_light_arena);
+}
+
+fn run_directional_benchmarks(smt: bool, pgo_full_arena: usize, pgo_light_arena: usize) {
+    let mode_str = if smt {
+        "SMT (all logical cores)"
+    } else {
+        "NO SMT (physical cores only)"
+    };
+    println!("\n########## Directional Arena: {} ##########\n", mode_str);
+
+    let full_variants: &[(&str, fn(usize, bool))] = &[
+        ("Forward", |c, s| arena_full_dir(c, s, BumpDir::Forward)),
+        ("Backward", |c, s| arena_full_dir(c, s, BumpDir::Backward)),
+        ("MiddleOut", |c, s| arena_full_dir(c, s, BumpDir::MiddleOut)),
+        ("Neighbors", |c, s| arena_full_neighbors(c, s)),
+    ];
+    println!("=== Directional FULL ({}) ===", mode_str);
+    for (name, f) in full_variants {
+        let t: Vec<u128> = (0..10)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                f(pgo_full_arena, smt);
+                start.elapsed().as_micros()
+            })
+            .collect();
+        println!("  {:<10}: {} µs", name, median(&t));
+    }
+
+    let light_variants: &[(&str, fn(usize, bool))] = &[
+        ("Forward", |c, s| arena_light_dir(c, s, BumpDir::Forward)),
+        ("Backward", |c, s| arena_light_dir(c, s, BumpDir::Backward)),
+        ("MiddleOut", |c, s| {
+            arena_light_dir(c, s, BumpDir::MiddleOut)
+        }),
+        ("Neighbors", |c, s| arena_light_neighbors(c, s)),
+    ];
+    println!("=== Directional LIGHT ({}) ===", mode_str);
+    for (name, f) in light_variants {
+        let t: Vec<u128> = (0..10)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                f(pgo_light_arena, smt);
+                start.elapsed().as_micros()
+            })
+            .collect();
+        println!("  {:<10}: {} µs", name, median(&t));
+    }
 }
 
 fn run_benchmarks(
@@ -1108,5 +1349,233 @@ fn run_benchmarks(
             median(&shared_times),
             median(&arena_times)
         );
+    }
+}
+
+// ============================================================
+//                        ТЕСТЫ
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic;
+
+    /// Один bump заданного направления на `cap` байт.
+    /// Возвращает также арену — она должна жить всё время жизни bump'а
+    /// (иначе память освободится, а указатель в ThreadBump станет висячим).
+    fn make_one(dir: BumpDir, cap: usize) -> (SharedArena, CachePadded<ThreadBump>) {
+        let arena = SharedArena::new(cap);
+        let mut v = arena.split_with(1, dir);
+        (arena, v.pop().unwrap())
+    }
+
+    #[test]
+    fn forward_fills_low_to_high() {
+        let (_arena, bump) = make_one(BumpDir::Forward, 4096);
+        let p0 = bump.alloc_raw::<1>(16) as usize;
+        let p1 = bump.alloc_raw::<1>(16) as usize;
+        assert!(p1 > p0, "forward должен расти вверх");
+        assert!(p0 >= bump.ptr as usize);
+        assert!(p1 + 16 <= bump.ptr as usize + bump.len);
+        assert_eq!(bump.allocated_bytes(), 32);
+    }
+
+    #[test]
+    fn backward_fills_high_to_low() {
+        let (_arena, bump) = make_one(BumpDir::Backward, 4096);
+        let p0 = bump.alloc_raw::<1>(16) as usize;
+        let p1 = bump.alloc_raw::<1>(16) as usize;
+        assert!(p1 < p0, "backward должен расти вниз");
+        let end = bump.ptr as usize + bump.len;
+        assert!(p0 + 16 <= end);
+        assert!(p0 >= end - 32, "backward стартует с конца чанка");
+        assert!(p1 >= end - 64);
+        assert_eq!(bump.allocated_bytes(), 32);
+    }
+
+    #[test]
+    fn middleout_alternates_sides() {
+        let (_arena, bump) = make_one(BumpDir::MiddleOut, 4096);
+        let base = bump.ptr as usize;
+        let mid = bump.len / 2;
+        assert_eq!(bump.lo.get(), 0, "MiddleOut стартует с нуля (lo)");
+        assert_eq!(bump.hi.get(), 0, "MiddleOut стартует с нуля (hi)");
+
+        // Сравниваем относительные смещения внутри чанка (адреса абсолютны).
+        let rel = |p: usize| p - base;
+
+        // 1-я аллокация — левая сторона (ниже середины), 2-я — правая (выше).
+        let p0 = rel(bump.alloc_raw::<1>(16) as usize);
+        let p1 = rel(bump.alloc_raw::<1>(16) as usize);
+        assert!(p0 < mid, "1-я (левая) ниже середины");
+        assert!(p1 >= mid, "2-я (правая) выше середины");
+        assert!(p0 < p1, "стороны не должны пересекаться");
+        assert_eq!(bump.allocated_bytes(), 32);
+
+        // после ещё двух аллокаций регионы остаются непересекающимися
+        let p2 = rel(bump.alloc_raw::<1>(16) as usize);
+        let p3 = rel(bump.alloc_raw::<1>(16) as usize);
+        assert!(p2 < p0, "3-я (левая) ещё ниже 1-й");
+        assert!(p3 > p1, "4-я (правая) ещё выше 2-й");
+        assert_eq!(bump.allocated_bytes(), 64);
+    }
+
+    #[test]
+    fn forward_oom_panics() {
+        let (_arena, bump) = make_one(BumpDir::Forward, 64);
+        let _ = bump.alloc_raw::<1>(64); // ровно заполняет
+        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            bump.alloc_raw::<1>(1);
+        }));
+        assert!(res.is_err(), "ожидался OOM-panic");
+    }
+
+    #[test]
+    fn backward_oom_panics() {
+        let (_arena, bump) = make_one(BumpDir::Backward, 64);
+        let _ = bump.alloc_raw::<1>(64);
+        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            bump.alloc_raw::<1>(1);
+        }));
+        assert!(res.is_err(), "ожидался OOM-panic");
+    }
+
+    #[test]
+    fn middleout_oom_panics() {
+        let (_arena, bump) = make_one(BumpDir::MiddleOut, 64);
+        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            bump.alloc_raw::<1>(64);
+        }));
+        assert!(
+            res.is_err(),
+            "ожидался OOM-panic (середина даёт 0 свободных)"
+        );
+    }
+
+    #[test]
+    fn reset_reuses_memory_forward() {
+        let (_arena, bump) = make_one(BumpDir::Forward, 4096);
+        let p0 = bump.alloc_raw::<1>(16);
+        assert_eq!(bump.allocated_bytes(), 16);
+        bump.reset();
+        assert_eq!(bump.allocated_bytes(), 0);
+        let p1 = bump.alloc_raw::<1>(16);
+        assert_eq!(p0, p1, "после reset первая аллокация по тому же адресу");
+    }
+
+    #[test]
+    fn reset_returns_middleout_to_middle() {
+        let (_arena, bump) = make_one(BumpDir::MiddleOut, 4096);
+        let _ = bump.alloc_raw::<1>(16);
+        let _ = bump.alloc_raw::<1>(16);
+        assert!(bump.allocated_bytes() > 0);
+        bump.reset();
+        assert_eq!(bump.lo.get(), 0);
+        assert_eq!(bump.hi.get(), 0);
+        assert_eq!(bump.allocated_bytes(), 0);
+    }
+
+    #[test]
+    fn allocated_bytes_grows_monotonically() {
+        let (_arena, bump) = make_one(BumpDir::Forward, 8192);
+        let mut prev = 0;
+        for _ in 0..10 {
+            let _ = bump.alloc_raw::<8>(100);
+            let now = bump.allocated_bytes();
+            assert!(now > prev, "allocated_bytes должен расти");
+            prev = now;
+        }
+    }
+
+    #[test]
+    fn prefault_does_not_crash_all_modes() {
+        for dir in [BumpDir::Forward, BumpDir::Backward, BumpDir::MiddleOut] {
+            let (_arena, bump) = make_one(dir, 1 << 16);
+            let _ = bump.alloc_raw::<8>(1024);
+            bump.prefault_local(); // на заполненном регионе
+            bump.reset();
+            bump.prefault_local(); // и на пустом
+        }
+    }
+
+    /// Проверяем, что данные корректны вне зависимости от направления.
+    fn data_integrity(dir: BumpDir) {
+        let (_arena, bump) = make_one(dir, 1 << 20);
+        let mut v: ArenaVec<ArenaString> =
+            ArenaVec::with_capacity_in::<{ core::mem::align_of::<ArenaString>() }>(8, &bump);
+        v.push::<{ core::mem::align_of::<ArenaString>() }>(
+            ArenaString::from_str_in("hello", &bump),
+            &bump,
+        );
+        v.push::<{ core::mem::align_of::<ArenaString>() }>(
+            ArenaString::from_str_in("world", &bump),
+            &bump,
+        );
+        v.push::<{ core::mem::align_of::<ArenaString>() }>(
+            ArenaString::from_str_in("строка", &bump),
+            &bump,
+        );
+        let slice = v.as_slice();
+        assert_eq!(slice.len(), 3);
+        assert_eq!(slice[0].deref(), "hello");
+        assert_eq!(slice[1].deref(), "world");
+        assert_eq!(slice[2].deref(), "строка");
+    }
+
+    #[test]
+    fn data_integrity_forward() {
+        data_integrity(BumpDir::Forward);
+    }
+
+    #[test]
+    fn data_integrity_backward() {
+        data_integrity(BumpDir::Backward);
+    }
+
+    #[test]
+    fn data_integrity_middleout() {
+        data_integrity(BumpDir::MiddleOut);
+    }
+
+    #[test]
+    fn neighbors_alternate_directions() {
+        let arena = SharedArena::new(4096 * 4);
+        let bumps = arena.split_alternating(4);
+        assert_eq!(bumps[0].dir, BumpDir::Backward);
+        assert_eq!(bumps[1].dir, BumpDir::Forward);
+        assert_eq!(bumps[2].dir, BumpDir::Backward);
+        assert_eq!(bumps[3].dir, BumpDir::Forward);
+        // чанки идут подряд и не пересекаются
+        for i in 0..3 {
+            let end = bumps[i].ptr as usize + bumps[i].len;
+            assert_eq!(end, bumps[i + 1].ptr as usize);
+        }
+    }
+
+    #[test]
+    fn neighbors_meet_at_boundary() {
+        let arena = SharedArena::new(8192);
+        let bumps = arena.split_alternating(2);
+        let (b0, b1) = (&bumps[0], &bumps[1]);
+        let boundary = b0.ptr as usize + b0.len;
+        assert_eq!(boundary, b1.ptr as usize);
+
+        // b0 — Backward: первая аллокация упирается в правый край чанка (к границе).
+        let p0 = b0.alloc_raw::<1>(64) as usize;
+        assert_eq!(p0, boundary - 64, "Backward стартует у границы");
+
+        // b1 — Forward: первая аллокация — само начало чанка (у той же границы).
+        let p1 = b1.alloc_raw::<1>(64) as usize;
+        assert_eq!(p1, boundary, "Forward стартует ровно у границы");
+    }
+
+    #[test]
+    fn split_with_middleout_starts_at_middle() {
+        let arena = SharedArena::new(4096);
+        let bumps = arena.split_with(1, BumpDir::MiddleOut);
+        let b = &bumps[0];
+        assert_eq!(b.lo.get(), 0);
+        assert_eq!(b.hi.get(), 0);
     }
 }
