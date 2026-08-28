@@ -185,6 +185,19 @@ fn arena_full_pair_no_smt() {
     arena_full_pair(fa, false);
 }
 
+// Donors — помеченные доноры отдают память с другой стороны, иначе новый чанк.
+#[divan::bench(name = "arena_full/donors/smt", sample_count = RUNS)]
+fn arena_full_donors_smt() {
+    let (_, _, fa, _) = pgo();
+    arena_full_donors(fa, true);
+}
+
+#[divan::bench(name = "arena_full/donors/no-smt", sample_count = RUNS)]
+fn arena_full_donors_no_smt() {
+    let (_, _, fa, _) = pgo();
+    arena_full_donors(fa, false);
+}
+
 // То же самое для LIGHT-версии.
 #[divan::bench(name = "arena_light/forward/smt", sample_count = RUNS)]
 fn arena_light_forward_smt() {
@@ -244,4 +257,16 @@ fn arena_light_pair_smt() {
 fn arena_light_pair_no_smt() {
     let (_, _, _, la) = pgo();
     arena_light_pair(la, false);
+}
+
+#[divan::bench(name = "arena_light/donors/smt", sample_count = RUNS)]
+fn arena_light_donors_smt() {
+    let (_, _, _, la) = pgo();
+    arena_light_donors(la, true);
+}
+
+#[divan::bench(name = "arena_light/donors/no-smt", sample_count = RUNS)]
+fn arena_light_donors_no_smt() {
+    let (_, _, _, la) = pgo();
+    arena_light_donors(la, false);
 }

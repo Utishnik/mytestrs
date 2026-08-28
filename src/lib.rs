@@ -16,6 +16,15 @@ struct RawAllocation {
     is_huge: bool,
 }
 
+/// Список дополнительных чанков, выделенных «где-то в памяти» в режиме доноров,
+/// плюс курсор заполнения последнего чанка (чтобы не делать по VirtualAlloc на
+/// каждый блок). Все чанки освобождаются в `Drop` `ThreadBump`.
+struct FallbackChunks {
+    chunks: Vec<RawAllocation>,
+    /// Байт занято в последнем чанке (`chunks.last()`).
+    used: usize,
+}
+
 #[cfg(windows)]
 mod platform {
     use super::{RawAllocation, verbose_enabled};
@@ -368,6 +377,15 @@ impl SharedArena {
                     is_huge: self.alloc.is_huge,
                     neighbor_idx: None,
                     array: ptr::null(),
+                    can_give: false,
+                    self_index: 0,
+                    donor_array: ptr::null(),
+                    donor_count: 0,
+                    base_chunk: 0,
+                    fallback: SpinMutex::new(FallbackChunks {
+                        chunks: Vec::new(),
+                        used: 0,
+                    }),
                 })
             })
             .collect()
@@ -405,6 +423,15 @@ impl SharedArena {
                     is_huge: self.alloc.is_huge,
                     neighbor_idx: None,
                     array: ptr::null(),
+                    can_give: false,
+                    self_index: 0,
+                    donor_array: ptr::null(),
+                    donor_count: 0,
+                    base_chunk: 0,
+                    fallback: SpinMutex::new(FallbackChunks {
+                        chunks: Vec::new(),
+                        used: 0,
+                    }),
                 })
             })
             .collect()
@@ -443,6 +470,15 @@ impl SharedArena {
                         is_huge,
                         neighbor_idx: None,
                         array: ptr::null(),
+                        can_give: false,
+                        self_index: 0,
+                        donor_array: ptr::null(),
+                        donor_count: 0,
+                        base_chunk: 0,
+                        fallback: SpinMutex::new(FallbackChunks {
+                            chunks: Vec::new(),
+                            used: 0,
+                        }),
                     })
                 } else {
                     // Нечётный — тот же самый объединённый регион пары, что и у
@@ -458,6 +494,15 @@ impl SharedArena {
                         is_huge,
                         neighbor_idx: None,
                         array: ptr::null(),
+                        can_give: false,
+                        self_index: 0,
+                        donor_array: ptr::null(),
+                        donor_count: 0,
+                        base_chunk: 0,
+                        fallback: SpinMutex::new(FallbackChunks {
+                            chunks: Vec::new(),
+                            used: 0,
+                        }),
                     })
                 }
             })
@@ -478,6 +523,60 @@ impl SharedArena {
                 (*(array.add(k + 1) as *const ThreadBump as *mut ThreadBump)).array = array;
             }
             k += 2;
+        }
+
+        bumps
+    }
+
+    /// Режим «доноры» (отдельная версия): каждый поток получает свой чанк
+    /// (`Forward`), а некоторые чанки помечаются как способные отдавать память
+    /// (`can_give`). Когда у потока в своём чанке кончается место, он проходит
+    /// по списку доноров и берёт блок с «другой стороны» региона донора; если и
+    /// у доноров нет свободного — выделяет новый чанк «где-то в памяти»
+    /// (см. `ThreadBump::try_take_from_donors` / `grow_fallback`).
+    ///
+    /// `donor_every` — каждый `donor_every`-й чанк (начиная с 0) помечается
+    /// донором.
+    fn split_donors(&self, num_threads: usize, donor_every: usize) -> Vec<CachePadded<ThreadBump>> {
+        let base = self.alloc.ptr;
+        let total = self.alloc.size;
+        let chunk_size = total / num_threads;
+        let is_huge = self.alloc.is_huge;
+
+        let bumps: Vec<CachePadded<ThreadBump>> = (0..num_threads)
+            .map(|i| {
+                let can_give = donor_every > 0 && i % donor_every == 0;
+                CachePadded::new(ThreadBump {
+                    ptr: unsafe { base.add(i * chunk_size) },
+                    len: chunk_size,
+                    lo: AtomicUsize::new(0),
+                    hi: AtomicUsize::new(0),
+                    toggle: Cell::new(false),
+                    dir: BumpDir::Forward,
+                    is_huge,
+                    neighbor_idx: None,
+                    array: ptr::null(),
+                    can_give,
+                    self_index: i,
+                    donor_array: ptr::null(), // заполним ниже
+                    donor_count: 0,
+                    base_chunk: chunk_size,
+                    fallback: SpinMutex::new(FallbackChunks {
+                        chunks: Vec::new(),
+                        used: 0,
+                    }),
+                })
+            })
+            .collect();
+
+        // Проставляем указатель на массив и число элементов — буфер Vec
+        // стабилен, поэтому raw-указатель валиден, пока живут потоки.
+        let array = bumps.as_ptr();
+        for i in 0..num_threads {
+            unsafe {
+                (*(array.add(i) as *const ThreadBump as *mut ThreadBump)).donor_array = array;
+                (*(array.add(i) as *const ThreadBump as *mut ThreadBump)).donor_count = num_threads;
+            }
         }
 
         bumps
@@ -539,6 +638,21 @@ struct ThreadBump {
     /// время работы потоков и никогда не переезжает). Нужен, чтобы по
     /// `neighbor_idx` добраться до счётчиков соседа. `null` для не-пар.
     array: *const CachePadded<ThreadBump>,
+    // ===== Поля режима «доноры» (отдельная версия) =====
+    /// Помечен ли этот bump как способный отдавать память («донор»).
+    can_give: bool,
+    /// Собственный индекс в массиве bumps (чтобы не брать у самого себя).
+    self_index: usize,
+    /// Указатель на массив bumps для обхода доноров (`null` вне режима доноров).
+    donor_array: *const CachePadded<ThreadBump>,
+    /// Число элементов в массиве bumps.
+    donor_count: usize,
+    /// Размер первичного чанка (для размера fallback-чанков).
+    base_chunk: usize,
+    /// Дополнительные чанки, выделенные «где-то в памяти» при нехватке у
+    /// доноров. Освобождаются в `Drop`.
+    fallback: SpinMutex<FallbackChunks>,
+    // (������ ���������� ���������� fallback-����� �������� ������ FallbackChunks)
 }
 
 // Каждый ThreadBump владеет непересекающимся регионом памяти арены и
@@ -550,6 +664,17 @@ struct ThreadBump {
 // структура корректна и как `Sync`.
 unsafe impl Send for ThreadBump {}
 unsafe impl Sync for ThreadBump {}
+
+impl Drop for ThreadBump {
+    fn drop(&mut self) {
+        // Первичный регион арены освобождает `SharedArena`; здесь — только
+        // дополнительные fallback-чанки, выделенные «где-то в памяти».
+        let mut fb = self.fallback.lock();
+        for a in fb.chunks.drain(..) {
+            platform::free(a);
+        }
+    }
+}
 
 /// Выравнивание любого типа как ассоциированная константа. Позволяет
 /// передать `align_of::<T>()` в позицию const-generic аргумента (прямой
@@ -589,6 +714,14 @@ impl ThreadBump {
                         }
                     } else if let Some(p) = self.try_borrow::<ALIGN>(size) {
                         return p;
+                    } else if self.donor_array != ptr::null() {
+                        // Режим доноров: сначала пробуем взять чанк у помеченных
+                        // доноров (с другой стороны их региона), иначе — новый
+                        // чанк «где-то в памяти».
+                        if let Some(p) = self.try_take_from_donors::<ALIGN>(size) {
+                            return p;
+                        }
+                        return self.grow_fallback::<ALIGN>(size);
                     } else {
                         panic!(
                             "Arena OOM: need {} at offset {}, free {} (cap {})",
@@ -628,6 +761,11 @@ impl ThreadBump {
                         }
                     } else if let Some(p) = self.try_borrow::<ALIGN>(size) {
                         return p;
+                    } else if self.donor_array != ptr::null() {
+                        if let Some(p) = self.try_take_from_donors::<ALIGN>(size) {
+                            return p;
+                        }
+                        return self.grow_fallback::<ALIGN>(size);
                     } else {
                         panic!(
                             "Arena OOM: need {} bytes, only {} free (cap {})",
@@ -738,6 +876,101 @@ impl ThreadBump {
                 }
             }
         }
+    }
+
+    // ===== Режим «доноры»: заём чанка у помеченных доноров, иначе новый чанк =====
+
+    /// Обойти все помеченные доноры и попытаться взять у одного из них блок
+    /// `size` с «другой стороны» его региона (противоположной его заполнению).
+    /// Возвращает `Some(ptr)` при успехе или `None`, если ни у одного донора
+    /// нет свободной смежной половины.
+    #[inline(always)]
+    fn try_take_from_donors<const ALIGN: usize>(&self, size: usize) -> Option<*mut u8> {
+        if self.donor_array == ptr::null() {
+            return None;
+        }
+        let arr = self.donor_array;
+        for i in 0..self.donor_count {
+            if i == self.self_index {
+                continue;
+            }
+            let d = unsafe { &*arr.add(i) };
+            if !d.can_give {
+                continue;
+            }
+            if let Some(p) = self.take_from_donor::<ALIGN>(d, size) {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    /// Взять блок `size` из региона донора `d` с противоположной его заполнению
+    /// стороны, расширяя соответствующий счётчик донора через lock-free CAS.
+    #[inline(always)]
+    fn take_from_donor<const ALIGN: usize>(&self, d: &ThreadBump, size: usize) -> Option<*mut u8> {
+        if d.dir == BumpDir::Forward {
+            // Донор заполняет низ [0, lo); отдаём с высокой стороны [len - hi, len).
+            loop {
+                let cur = d.hi.load(Ordering::Relaxed);
+                let off = (d.len - cur - size) & !(ALIGN - 1);
+                if off < d.lo.load(Ordering::Relaxed) {
+                    return None; // упёрлись бы в собственные данные донора
+                }
+                let new_hi = d.len - off;
+                if d.hi
+                    .compare_exchange_weak(cur, new_hi, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return Some(unsafe { d.ptr.add(off) });
+                }
+            }
+        } else {
+            // Донор заполняет высокую [len - hi, len); отдаём с низкой [0, lo).
+            loop {
+                let cur = d.lo.load(Ordering::Relaxed);
+                let off = (cur + ALIGN - 1) & !(ALIGN - 1);
+                let end = off + size;
+                if end > d.len - d.hi.load(Ordering::Relaxed) {
+                    return None;
+                }
+                if d.lo
+                    .compare_exchange_weak(cur, end, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return Some(unsafe { d.ptr.add(off) });
+                }
+            }
+        }
+    }
+
+    /// Выделить совершенно новый чанк «где-то в памяти» (через платформенный
+    /// аллокатор) и вернуть в нём указатель на блок `size`. Чанк сохраняется в
+    /// `fallback` и освобождается в `Drop`. Адрес возвращается вызывающему — его
+    /// собственный регион при этом не трогается.
+    #[inline(always)]
+    fn grow_fallback<const ALIGN: usize>(&self, size: usize) -> *mut u8 {
+        let page = platform::page_size();
+        // Размер чанка — хотя бы базовый чанк, выровнен по странице; блок `size`
+        // выровнен внутри.
+        let need = (size + ALIGN - 1) & !(ALIGN - 1);
+        let mut fb = self.fallback.lock();
+        // Если в текущем последнем чанке не хватает места — выделяем новый.
+        let full = match fb.chunks.last() {
+            Some(c) => fb.used + need > c.size,
+            None => true,
+        };
+        if full {
+            let alloc_size = need.max(self.base_chunk).next_multiple_of(page);
+            let alloc = platform::alloc_normal(alloc_size);
+            fb.chunks.push(alloc);
+            fb.used = 0;
+        }
+        let chunk = fb.chunks.last().unwrap();
+        let off = (fb.used + ALIGN - 1) & !(ALIGN - 1);
+        let ptr = unsafe { chunk.ptr.add(off) };
+        fb.used = off + size;
+        ptr
     }
 
     #[inline(always)]
@@ -1131,6 +1364,10 @@ enum ArenaLayout {
     /// Чётные+нечётные соседи делят ОДИН объединённый регион и при нехватке
     /// места берут память друг у друга (см. `SharedArena::split_paired`).
     Pair,
+    /// Некоторые чанки помечены как доноры: при нехватке места у соседей берём
+    /// блок с другой стороны их региона, иначе — новый чанк в памяти
+    /// (см. `SharedArena::split_donors`).
+    Donors,
 }
 
 /// Единое тело бенчмарка shared-арены. `full` управляет объёмом работы
@@ -1146,6 +1383,7 @@ fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
         ArenaLayout::Uniform(dir) => arena.split_with(core_ids.len(), dir),
         ArenaLayout::Neighbors => arena.split_alternating(core_ids.len()),
         ArenaLayout::Pair => arena.split_paired(core_ids.len()),
+        ArenaLayout::Donors => arena.split_donors(core_ids.len(), 4),
     };
 
     let (vcap, outer, inner) = if full {
@@ -1249,6 +1487,16 @@ pub fn arena_full_pair(chunk_size: usize, smt: bool) {
 /// Лёгкая версия: соседи делят ОДИН регион и берут память друг у друга.
 pub fn arena_light_pair(chunk_size: usize, smt: bool) {
     arena_bench(chunk_size, smt, false, ArenaLayout::Pair);
+}
+
+/// Полная версия: доноры отдают память с другой стороны, иначе новый чанк.
+pub fn arena_full_donors(chunk_size: usize, smt: bool) {
+    arena_bench(chunk_size, smt, true, ArenaLayout::Donors);
+}
+
+/// Лёгкая версия: доноры отдают память с другой стороны, иначе новый чанк.
+pub fn arena_light_donors(chunk_size: usize, smt: bool) {
+    arena_bench(chunk_size, smt, false, ArenaLayout::Donors);
 }
 
 // ============================================================
@@ -1435,6 +1683,7 @@ fn run_directional_benchmarks(smt: bool, pgo_full_arena: usize, pgo_light_arena:
         ("MiddleOut", |c, s| arena_full_dir(c, s, BumpDir::MiddleOut)),
         ("Neighbors", |c, s| arena_full_neighbors(c, s)),
         ("Pair", |c, s| arena_full_pair(c, s)),
+        ("Donors", |c, s| arena_full_donors(c, s)),
     ];
     println!("=== Directional FULL ({}) ===", mode_str);
     for (name, f) in full_variants {
@@ -1456,6 +1705,7 @@ fn run_directional_benchmarks(smt: bool, pgo_full_arena: usize, pgo_light_arena:
         }),
         ("Neighbors", |c, s| arena_light_neighbors(c, s)),
         ("Pair", |c, s| arena_light_pair(c, s)),
+        ("Donors", |c, s| arena_light_donors(c, s)),
     ];
     println!("=== Directional LIGHT ({}) ===", mode_str);
     for (name, f) in light_variants {
@@ -1949,5 +2199,71 @@ mod tests {
                 }
             });
         });
+    }
+
+    // ---- Доноры: заём с «другой стороны» и fallback-чанк ----
+
+    #[test]
+    fn donors_take_from_donor_other_side() {
+        // 2 потока, индекс 0 — донор (0 % 2 == 0). Донор остаётся пустым, а
+        // поток 1 переполняет свой чанк и должен забрать блок с высокой стороны
+        // региона донора (противоположной заполнению Forward-донора низом).
+        let arena = SharedArena::new(2 * 1024 * 1024); // 1 MB на потока
+        let bumps = arena.split_donors(2, 2);
+        let (donor, needy) = (&bumps[0], &bumps[1]);
+        assert!(donor.can_give);
+        assert!(!needy.can_give);
+
+        // Поток 1: 200_000 * 8 = 1.6 MB > своего чанка (1 MB) -> берёт у донора.
+        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(200_000);
+        for j in 0..200_000usize {
+            let p = needy.alloc_raw::<8>(8) as *mut usize;
+            unsafe { *p = 0xC000 + j };
+            ptrs.push(p);
+        }
+        // Последние блоки должны лежать в регионе донора (отданы с высокой стороны).
+        let d_start = donor.ptr as usize;
+        let d_end = d_start + donor.len;
+        let last = *ptrs.last().unwrap() as usize;
+        assert!(last >= d_start && last < d_end, "блок взят не у донора");
+        // Счётчик донора расширился с высокой стороны.
+        assert!(donor.hi.load(Ordering::Relaxed) > 0);
+        // Данные не затёрты.
+        for (j, p) in ptrs.iter().enumerate() {
+            assert_eq!(unsafe { **p }, 0xC000 + j, "данные затёрты донором/соседом");
+        }
+        // У донора своя память свободна (lo не трогали).
+        assert_eq!(donor.lo.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn donors_fallback_when_no_donor_free() {
+        // Ни один донор не помечен (donor_every = 1000): при нехватке места
+        // выделяется новый чанк «где-то в памяти» (grow_fallback). Проверяем, что
+        // он находится ВНЕ основной арены и данные живы; Drop освобождает его.
+        let arena = SharedArena::new(1 << 20);
+        let bumps = arena.split_donors(4, 0);
+        let needy = &bumps[1];
+        assert!(!bumps.iter().any(|b| b.can_give));
+
+        let arena_start = arena.alloc.ptr as usize;
+        let arena_end = arena_start + arena.alloc.size;
+
+        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(300_000);
+        for j in 0..300_000usize {
+            let p = needy.alloc_raw::<8>(8) as *mut usize;
+            unsafe { *p = 0xD000 + j };
+            ptrs.push(p);
+        }
+        // Хотя бы часть блоков должна уйти в fallback (вне арены).
+        let outside = ptrs
+            .iter()
+            .any(|&p| (p as usize) < arena_start || (p as usize) >= arena_end);
+        assert!(outside, "ожидался fallback-чанк вне арены");
+        for (j, p) in ptrs.iter().enumerate() {
+            assert_eq!(unsafe { **p }, 0xD000 + j);
+        }
+        // fallback непуст (Drop позже освободит).
+        assert!(!needy.fallback.lock().chunks.is_empty());
     }
 }
