@@ -1,4 +1,6 @@
 use boxcar::Vec as BoxcarVec;
+#[cfg(not(miri))]
+use branches::prefetch_write_data;
 use crossbeam_utils::CachePadded;
 use orx_concurrent_vec::ConcurrentVec as OrxVec;
 use std::cell::Cell;
@@ -7,6 +9,18 @@ use std::ops::Deref;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use triomphe::Arc;
+
+/// Подсказка префетчеру: блок по `addr` будет сразу записан вызывающим.
+/// LOCALITY=0 — греем L1, т.к. пишем в выделенный блок почти мгновенно.
+/// Под Miri префетч отключён (там не нужен и может быть не поддержан).
+#[inline(always)]
+#[cfg(not(miri))]
+fn prefetch_write(addr: *const u8) {
+    prefetch_write_data::<u8, 0>(addr);
+}
+#[inline(always)]
+#[cfg(miri)]
+fn prefetch_write(_addr: *const u8) {}
 
 // ============================================================
 //               ПЛАТФОРМЕННЫЙ СЛОЙ ВЫДЕЛЕНИЯ ПАМЯТИ
@@ -963,7 +977,7 @@ impl ThreadBump {
         // ALIGN — константа времени компиляции (задаётся в точке вызова,
         // см. alloc_uninit_slice), поэтому маска выравнивания считается на этапе
         // компиляции, а не прокидывается через аргумент в рантайме.
-        let (off, new_lo, new_hi) = match self.dir {
+        let (off, new_lo, new_hi, pf) = match self.dir {
             // Forward: растём от начала чанка вверх. В режиме пары собственная
             // половина — нижняя [0, mid); середина региона `mid = len/2`.
             //
@@ -985,7 +999,11 @@ impl ThreadBump {
                             .compare_exchange_weak(cur, end, Ordering::Relaxed, Ordering::Relaxed)
                             .is_ok()
                         {
-                            return unsafe { self.ptr.add(off) };
+                            // Forward-заполнение идёт вверх: префетчим следующий блок,
+                            // в который будем писать при следующем выделении.
+                            let p = unsafe { self.ptr.add(off) };
+                            prefetch_write(unsafe { self.ptr.add(off + size) });
+                            return p;
                         }
                     } else if let Some(p) = self.try_borrow::<ALIGN>(size) {
                         return p;
@@ -1069,7 +1087,11 @@ impl ThreadBump {
                         );
                     }
                     let off = (base - size) & !(ALIGN - 1);
-                    (off, mid - off, self.hi.load(Ordering::Relaxed))
+                    let new_lo = mid - off;
+                    let new_hi = self.hi.load(Ordering::Relaxed);
+                    // следующая аллокация пойдёт в правую половину
+                    let pf = unsafe { self.ptr.add(mid + new_hi + size) };
+                    (off, new_lo, new_hi, pf)
                 } else {
                     // правая сторона: занята [mid, mid + hi), растёт вверх
                     let base = mid + self.hi.load(Ordering::Relaxed);
@@ -1084,14 +1106,23 @@ impl ThreadBump {
                             self.len
                         );
                     }
-                    (off, self.lo.load(Ordering::Relaxed), off + size - mid)
+                    let new_lo = self.lo.load(Ordering::Relaxed);
+                    let new_hi = off + size - mid;
+                    // следующая аллокация пойдёт в левую половину
+                    let pf = unsafe { self.ptr.add(mid.wrapping_sub(new_lo + size)) };
+                    (off, new_lo, new_hi, pf)
                 }
             }
         };
 
         self.lo.store(new_lo, Ordering::Relaxed);
         self.hi.store(new_hi, Ordering::Relaxed);
-        unsafe { self.ptr.add(off) }
+        let p = unsafe { self.ptr.add(off) };
+        // MiddleOut чередует стороны (то вправо, то влево) — аппаратный
+        // предсказчик шага не выведет чередование, поэтому сами префетчим
+        // фронтир противоположной стороны (туда пойдёт следующая аллокация).
+        prefetch_write(pf);
+        p
     }
 
     /// Попытка «занять» память у соседа объединённого региона, когда в своей
@@ -1129,7 +1160,11 @@ impl ThreadBump {
                     .compare_exchange_weak(cur, end, Ordering::Relaxed, Ordering::Relaxed)
                     .is_ok()
                 {
-                    return Some(unsafe { self.ptr.add(off) });
+                    // Сосед-Forward отдаёт с низкой стороны (растёт вверх):
+                    // следующий заём — по большему адресу.
+                    let p = unsafe { self.ptr.add(off) };
+                    prefetch_write(unsafe { self.ptr.add(off + size) });
+                    return Some(p);
                 }
             }
         } else {
@@ -1147,7 +1182,11 @@ impl ThreadBump {
                     .compare_exchange_weak(cur, new_hi, Ordering::Relaxed, Ordering::Relaxed)
                     .is_ok()
                 {
-                    return Some(unsafe { self.ptr.add(off) });
+                    // Сосед-Backward отдаёт с высокой стороны (растёт вниз):
+                    // следующий заём — по меньшему адресу.
+                    let p = unsafe { self.ptr.add(off) };
+                    prefetch_write(unsafe { self.ptr.add(off.wrapping_sub(size)) });
+                    return Some(p);
                 }
             }
         }
@@ -1263,7 +1302,10 @@ impl ThreadBump {
                     .compare_exchange_weak(cur, new_hi, Ordering::Relaxed, Ordering::Relaxed)
                     .is_ok()
                 {
-                    return Some(unsafe { d.ptr.add(off) });
+                    // Донор-Forward растёт вниз: следующий кусок — по меньшему адресу.
+                    let p = unsafe { d.ptr.add(off) };
+                    prefetch_write(unsafe { d.ptr.add(off.wrapping_sub(size)) });
+                    return Some(p);
                 }
             }
         } else {
@@ -1279,7 +1321,10 @@ impl ThreadBump {
                     .compare_exchange_weak(cur, end, Ordering::Relaxed, Ordering::Relaxed)
                     .is_ok()
                 {
-                    return Some(unsafe { d.ptr.add(off) });
+                    // Донор-Backward растёт вверх: следующий кусок — по большему адресу.
+                    let p = unsafe { d.ptr.add(off) };
+                    prefetch_write(unsafe { d.ptr.add(off + size) });
+                    return Some(p);
                 }
             }
         }
@@ -1375,6 +1420,8 @@ impl ThreadBump {
         let chunk = fb.chunks.last().unwrap();
         let off = (fb.used + ALIGN - 1) & !(ALIGN - 1);
         let ptr = unsafe { chunk.ptr.add(off) };
+        // Новый чанк «где-то в памяти»: префетчим следующий блок в нём.
+        prefetch_write(unsafe { chunk.ptr.add(off + size) });
         fb.used = off + size;
         ptr
     }

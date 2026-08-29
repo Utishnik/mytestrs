@@ -69,6 +69,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36f64beae40a84da1b4b26ff2761a5b895c12adc41dc25aaee1c4f2bbfe97a6e"
 
 [[package]]
+name = "branches"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fff8e8a78270a39fea587b71eb20cdb5d80a16f692ecdec704f789f8904d003"
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -653,6 +659,7 @@ dependencies = [
  "allocation_hints",
  "allocator-api2",
  "boxcar",
+ "branches",
  "bumpalo",
  "core_affinity",
  "crossbeam-utils",
