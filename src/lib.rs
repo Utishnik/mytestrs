@@ -506,7 +506,9 @@ impl SharedArena {
     fn split_with(&self, num_threads: usize, dir: BumpDir) -> Vec<CachePadded<ThreadBump>> {
         let base = self.alloc.ptr;
         let total = self.alloc.size;
-        let chunk_size = total / num_threads;
+        // Выравниваем размер чанка, чтобы старт каждого чанка (base + i*chunk_size)
+        // оставался выровненным (иначе указатели доноров — UB под Tree Borrows).
+        let chunk_size = (total / num_threads).next_multiple_of(16);
 
         (0..num_threads)
             .map(|i| {
@@ -551,7 +553,9 @@ impl SharedArena {
     fn split_alternating(&self, num_threads: usize) -> Vec<CachePadded<ThreadBump>> {
         let base = self.alloc.ptr;
         let total = self.alloc.size;
-        let chunk_size = total / num_threads;
+        // Выравниваем размер чанка, чтобы старт каждого чанка (base + i*chunk_size)
+        // оставался выровненным (иначе указатели доноров — UB под Tree Borrows).
+        let chunk_size = (total / num_threads).next_multiple_of(16);
 
         (0..num_threads)
             .map(|i| {
@@ -605,7 +609,9 @@ impl SharedArena {
     fn split_paired(&self, num_threads: usize) -> Vec<CachePadded<ThreadBump>> {
         let base = self.alloc.ptr;
         let total = self.alloc.size;
-        let chunk_size = total / num_threads;
+        // Выравниваем размер чанка, чтобы старт каждого чанка (base + i*chunk_size)
+        // оставался выровненным (иначе указатели доноров — UB под Tree Borrows).
+        let chunk_size = (total / num_threads).next_multiple_of(16);
         let is_huge = self.alloc.is_huge;
 
         let bumps: Vec<CachePadded<ThreadBump>> = (0..num_threads)
@@ -729,7 +735,9 @@ impl SharedArena {
     ) -> Vec<CachePadded<ThreadBump>> {
         let base = self.alloc.ptr;
         let total = self.alloc.size;
-        let chunk_size = total / num_threads;
+        // Выравниваем размер чанка, чтобы старт каждого чанка (base + i*chunk_size)
+        // оставался выровненным (иначе указатели доноров — UB под Tree Borrows).
+        let chunk_size = (total / num_threads).next_multiple_of(16);
         let is_huge = self.alloc.is_huge;
 
         // Собираем записи о донорах в bump-скретч: служебные данные — не
@@ -2311,6 +2319,22 @@ mod tests {
     use super::*;
     use std::panic;
 
+    // Множитель для облегчения тестов под Miri (Tree Borrows): в обычном режиме
+    // = 1 (полные объёмы и арена), под Miri = 100 (в ×100 меньше аллокаций и
+    // пропорционально меньше арена). Соотношение «сколько заняли / размер чанка»
+    // сохраняется, поэтому логика переполнения/заимствования не меняется.
+    #[cfg(not(miri))]
+    const MS: usize = 1;
+    #[cfg(miri)]
+    const MS: usize = 100;
+
+    fn arena_scale(base: usize) -> usize {
+        (base / MS).next_multiple_of(4096)
+    }
+    fn count_scale(base: usize) -> usize {
+        base / MS
+    }
+
     /// Один bump заданного направления на `cap` байт.
     /// Возвращает также арену — она должна жить всё время жизни bump'а
     /// (иначе память освободится, а указатель в ThreadBump станет висячим).
@@ -2641,15 +2665,15 @@ mod tests {
         // Два потока одновременно: чётный (even) забирает больше своей половины
         // и заимствует у нечётного (odd) через lock-free CAS, нечётный — в своей
         // половине. Проверяем, что ни один не затёр данные другого.
-        let arena = SharedArena::new(2 * 1024 * 1024); // 2 MB: половина = 1 MB
+        let arena = SharedArena::new(arena_scale(2 * 1024 * 1024)); // 2 MB: половина = 1 MB
         let bumps = arena.split_paired(2);
 
         std::thread::scope(|s| {
             // even: 200_000 * 8 = 1.6 MB > своей половины (1 MB) -> заимствует 0.6 MB.
             s.spawn(|| {
                 let bump = &bumps[0];
-                let mut ptrs: Vec<*mut usize> = Vec::with_capacity(200_000);
-                for j in 0..200_000usize {
+                let mut ptrs: Vec<*mut usize> = Vec::with_capacity(count_scale(200_000));
+                for j in 0..count_scale(200_000) {
                     let p = bump.alloc_raw::<8>(8) as *mut usize;
                     unsafe { *p = 0xA000 + j };
                     ptrs.push(p);
@@ -2661,8 +2685,8 @@ mod tests {
             // odd: 50_000 * 8 = 0.4 MB < своей половины (1 MB), свою не покидает.
             s.spawn(|| {
                 let bump = &bumps[1];
-                let mut ptrs: Vec<*mut usize> = Vec::with_capacity(50_000);
-                for j in 0..50_000usize {
+                let mut ptrs: Vec<*mut usize> = Vec::with_capacity(count_scale(50_000));
+                for j in 0..count_scale(50_000) {
                     let p = bump.alloc_raw::<8>(8) as *mut usize;
                     unsafe { *p = 0xB000 + j };
                     ptrs.push(p);
@@ -2681,15 +2705,15 @@ mod tests {
         // 2 потока, индекс 0 — донор (0 % 2 == 0). Донор остаётся пустым, а
         // поток 1 переполняет свой чанк и должен забрать блок с высокой стороны
         // региона донора (противоположной заполнению Forward-донора низом).
-        let arena = SharedArena::new(2 * 1024 * 1024); // 1 MB на потока
+        let arena = SharedArena::new(arena_scale(2 * 1024 * 1024)); // 1 MB на потока
         let bumps = arena.split_donors(2, 2);
         let (donor, needy) = (&bumps[0], &bumps[1]);
         assert!(donor.can_give);
         assert!(!needy.can_give);
 
         // Поток 1: 200_000 * 8 = 1.6 MB > своего чанка (1 MB) -> берёт у донора.
-        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(200_000);
-        for j in 0..200_000usize {
+        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(count_scale(200_000));
+        for j in 0..count_scale(200_000) {
             let p = needy.alloc_raw::<8>(8) as *mut usize;
             unsafe { *p = 0xC000 + j };
             ptrs.push(p);
@@ -2714,7 +2738,7 @@ mod tests {
         // Ни один донор не помечен (every = 0): при нехватке места
         // выделяется новый чанк «где-то в памяти» (grow_fallback). Проверяем, что
         // он находится ВНЕ основной арены и данные живы; Drop освобождает его.
-        let arena = SharedArena::new(1 << 20);
+        let arena = SharedArena::new(arena_scale(1 << 20));
         let bumps = arena.split_donors(4, 0);
         let needy = &bumps[1];
         assert!(!bumps.iter().any(|b| b.can_give));
@@ -2722,8 +2746,8 @@ mod tests {
         let arena_start = arena.alloc.ptr as usize;
         let arena_end = arena_start + arena.alloc.size;
 
-        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(300_000);
-        for j in 0..300_000usize {
+        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(count_scale(300_000));
+        for j in 0..count_scale(300_000) {
             let p = needy.alloc_raw::<8>(8) as *mut usize;
             unsafe { *p = 0xD000 + j };
             ptrs.push(p);
@@ -2747,7 +2771,7 @@ mod tests {
         // 5 потоков, доноры — индексы 0 и 2 (every = 2). Явно задаём приоритеты
         // так, чтобы у донора 0 он БЫЛ ВЫШЕ, чем у донора 2. Значит донор 2
         // (низкий приоритет) должен использоваться первым.
-        let arena = SharedArena::new(5 * 1024 * 1024); // 1 MB на поток
+        let arena = SharedArena::new(arena_scale(5 * 1024 * 1024)); // 1 MB на поток
         let mut prio = vec![0u32; 5];
         prio[0] = 100; // высокий
         prio[2] = 1; // низкий (минимальный среди доноров 0,2,4)
@@ -2766,8 +2790,8 @@ mod tests {
         let d2 = &bumps[2];
 
         // Переполняем needy: первый заём должен уйти к донору 2 (низкий приоритет).
-        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(200_000);
-        for j in 0..200_000usize {
+        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(count_scale(200_000));
+        for j in 0..count_scale(200_000) {
             let p = needy.alloc_raw::<8>(8) as *mut usize;
             unsafe { *p = 0xE000 + j };
             ptrs.push(p);
@@ -2788,7 +2812,7 @@ mod tests {
 
     #[test]
     fn donors_orx_add_then_remove() {
-        let arena = SharedArena::new(2 * 1024 * 1024); // 1 MB на поток, 2 потока
+        let arena = SharedArena::new(arena_scale(2 * 1024 * 1024)); // 1 MB на поток, 2 потока
         // Изначально доноров нет (every = 0).
         let bumps = arena.split_donors_with(2, DonorPolicy::orx(0));
         let needy = &bumps[1];
@@ -2801,8 +2825,8 @@ mod tests {
         assert!(!needy.add_donor(0, 0)); // уже есть — повторно не добавляем (индекс тот же)
 
         // Переполняем needy: должен взять у добавленного донора 0.
-        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(200_000);
-        for j in 0..200_000usize {
+        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(count_scale(200_000));
+        for j in 0..count_scale(200_000) {
             let p = needy.alloc_raw::<8>(8) as *mut usize;
             unsafe { *p = 0xF000 + j };
             ptrs.push(p);
@@ -2839,7 +2863,7 @@ mod tests {
 
     #[test]
     fn donors_boxcar_add_then_remove() {
-        let arena = SharedArena::new(2 * 1024 * 1024);
+        let arena = SharedArena::new(arena_scale(2 * 1024 * 1024));
         let bumps = arena.split_donors_with(2, DonorPolicy::boxcar(0));
         let needy = &bumps[1];
         let donor0 = &bumps[0];
@@ -2847,8 +2871,8 @@ mod tests {
         let a_end = a_start + arena.alloc.size;
 
         assert!(needy.add_donor(0, 0));
-        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(200_000);
-        for j in 0..200_000usize {
+        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(count_scale(200_000));
+        for j in 0..count_scale(200_000) {
             let p = needy.alloc_raw::<8>(8) as *mut usize;
             unsafe { *p = 0xB000 + j };
             ptrs.push(p);
@@ -2880,7 +2904,7 @@ mod tests {
 
     #[test]
     fn donors_orx_priority_low_taken_first() {
-        let arena = SharedArena::new(5 * 1024 * 1024);
+        let arena = SharedArena::new(arena_scale(5 * 1024 * 1024));
         let mut prio = vec![0u32; 5];
         prio[0] = 100;
         prio[2] = 1; // низкий (минимальный среди доноров 0,2,4)
@@ -2898,8 +2922,8 @@ mod tests {
         let d0 = &bumps[0];
         let d2 = &bumps[2];
 
-        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(200_000);
-        for j in 0..200_000usize {
+        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(count_scale(200_000));
+        for j in 0..count_scale(200_000) {
             let p = needy.alloc_raw::<8>(8) as *mut usize;
             unsafe { *p = 0x9000 + j };
             ptrs.push(p);
@@ -2920,7 +2944,7 @@ mod tests {
 
     #[test]
     fn donors_boxcar_priority_low_taken_first() {
-        let arena = SharedArena::new(5 * 1024 * 1024);
+        let arena = SharedArena::new(arena_scale(5 * 1024 * 1024));
         let mut prio = vec![0u32; 5];
         prio[0] = 100;
         prio[2] = 1; // низкий (минимальный среди доноров 0,2,4)
@@ -2938,8 +2962,8 @@ mod tests {
         let d0 = &bumps[0];
         let d2 = &bumps[2];
 
-        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(200_000);
-        for j in 0..200_000usize {
+        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(count_scale(200_000));
+        for j in 0..count_scale(200_000) {
             let p = needy.alloc_raw::<8>(8) as *mut usize;
             unsafe { *p = 0x8000 + j };
             ptrs.push(p);
