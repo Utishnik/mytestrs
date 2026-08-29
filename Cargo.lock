@@ -63,6 +63,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
+name = "boxcar"
+version = "0.2.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36f64beae40a84da1b4b26ff2761a5b895c12adc41dc25aaee1c4f2bbfe97a6e"
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -492,6 +498,103 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "orx-concurrent-iter"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49dcb7d153086067a1cbfda330b3891d70b8d4a8ad2d2f3015dbb4403830df20"
+dependencies = [
+ "orx-iterable",
+ "orx-pseudo-default",
+]
+
+[[package]]
+name = "orx-concurrent-option"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf08bc1d1a17e53eec1610f8363d294c825756724d251b00971c59b272af1cd5"
+
+[[package]]
+name = "orx-concurrent-vec"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4bddf437002d42a7486c8e12769920790289e84eb258d91d7d174ac4f10f22b5"
+dependencies = [
+ "orx-concurrent-option",
+ "orx-fixed-vec",
+ "orx-pinned-concurrent-col",
+ "orx-pinned-vec",
+ "orx-pseudo-default",
+ "orx-split-vec",
+]
+
+[[package]]
+name = "orx-fixed-vec"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e762d40ef747b0d708432b53c601ef0f1adf5a13df988e9ab2b32db1afcc898"
+dependencies = [
+ "orx-concurrent-iter",
+ "orx-iterable",
+ "orx-pinned-vec",
+ "orx-pseudo-default",
+]
+
+[[package]]
+name = "orx-iterable"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfa2cb3f82a187c68835faac9cf03faaee70b93f4da3b85515ac1b4c6f8a432d"
+dependencies = [
+ "orx-self-or",
+]
+
+[[package]]
+name = "orx-pinned-concurrent-col"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d417d2c82bdfde5e6d54a0684cc69561781f2ffbc14ef9dae46a0c10bdb4c03e"
+dependencies = [
+ "orx-fixed-vec",
+ "orx-pinned-vec",
+ "orx-pseudo-default",
+ "orx-split-vec",
+]
+
+[[package]]
+name = "orx-pinned-vec"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58a569e70ec8007642e00d8e6218fd610fa6e03fb746716aeb974c91e6a5cfa1"
+dependencies = [
+ "orx-iterable",
+ "orx-pseudo-default",
+]
+
+[[package]]
+name = "orx-pseudo-default"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34eaace9ae01f7025804fbca40ec45b87c19ba0328d97195e01c6135897762a8"
+
+[[package]]
+name = "orx-self-or"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67a8e35dfe18921e475b9861266fd58a5ecfd681161f242d24a9e2d1e07fbc28"
+
+[[package]]
+name = "orx-split-vec"
+version = "4.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a118601cbce5d03367ce80a74075f5cbae8f4503146f0080cf744f7dc44f8903"
+dependencies = [
+ "orx-concurrent-iter",
+ "orx-iterable",
+ "orx-pinned-vec",
+ "orx-pseudo-default",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -549,6 +652,7 @@ version = "0.1.0"
 dependencies = [
  "allocation_hints",
  "allocator-api2",
+ "boxcar",
  "bumpalo",
  "core_affinity",
  "crossbeam-utils",
@@ -557,7 +661,9 @@ dependencies = [
  "libc",
  "mimalloc",
  "num_cpus",
+ "orx-concurrent-vec",
  "spin",
+ "triomphe",
  "windows-sys",
 ]
 
@@ -718,6 +824,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "stable_deref_trait"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -790,6 +902,16 @@ dependencies = [
  "chunked_transfer",
  "httpdate",
  "log",
+]
+
+[[package]]
+name = "triomphe"
+version = "0.1.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b40688ea6389c8171614b25491f71d4a27946e0c7ce2da1c6de27e25abf1a0ae"
+dependencies = [
+ "serde",
+ "stable_deref_trait",
 ]
 
 [[package]]

@@ -13,6 +13,9 @@ hotpath = { version = "0.24.0" }
 mimalloc = "0.1.52"
 num_cpus = "1.17.0"
 spin = "0.9"
+orx-concurrent-vec = "4"
+boxcar = "0.2"
+triomphe = "0.1"
 
 [features]
 hotpath = ["hotpath/hotpath"]

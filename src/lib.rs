@@ -1,10 +1,12 @@
+use boxcar::Vec as BoxcarVec;
 use crossbeam_utils::CachePadded;
+use orx_concurrent_vec::ConcurrentVec as OrxVec;
 use std::cell::Cell;
 use std::fmt;
 use std::ops::Deref;
 use std::ptr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use triomphe::Arc;
 
 // ============================================================
 //               ПЛАТФОРМЕННЫЙ СЛОЙ ВЫДЕЛЕНИЯ ПАМЯТИ
@@ -23,6 +25,110 @@ struct FallbackChunks {
     chunks: Vec<RawAllocation>,
     /// Байт занято в последнем чанке (`chunks.last()`).
     used: usize,
+}
+
+/// Запись о доноре в реестре: индекс в массиве bumps, его приоритет и флаг
+/// логического удаления (для динамических реестров orx/boxcar, где физическое
+/// удаление из lock-free вектора невозможно без `&mut`, — удаление помечает
+/// запись, а обход её пропускает).
+/// Более ВЫСОКИЙ приоритет означает, что этого донора берут в ПОСЛЕДНЮЮ
+/// очередь (сначала опустошают доноров с низким приоритетом).
+struct Donor {
+    idx: usize,
+    priority: u32,
+    removed: AtomicBool,
+}
+
+impl Clone for Donor {
+    fn clone(&self) -> Self {
+        Donor {
+            idx: self.idx,
+            priority: self.priority,
+            removed: AtomicBool::new(self.removed.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+/// Тип хранилища списка доноров. Сами доноры ссылаются на регионы через
+/// `donor_array` (общий стабильный массив bumps), здесь — только индексы.
+///
+/// Статичный список хранится как плоский срез в `bumpalo::Bump` (см.
+/// `donor_static_ptr`/`donor_static_len`/`donor_bump` в `ThreadBump`) — без
+/// глобального аллокатора и без `Arc`-накладных. Динамические списки (orx/
+/// boxcar) лежат в обёртке `triomphe::Arc` — более лёгкой, чем `std::sync::Arc`
+/// (без счётчика weak-ссылок).
+#[derive(Clone)]
+enum DonorReg {
+    /// Режим доноров не активен (переполнение ведёт к OOM-панике).
+    None,
+    /// Статичный список: заполняется один раз при старте и не меняется
+    /// (данные — в bump-буфере, на который указывает `donor_static_ptr`).
+    /// При `use_priority` — отсортирован по возрастанию приоритета, поэтому
+    /// первый подходящий донор автоматически имеет минимальный приоритет.
+    Static,
+    /// Динамический список на orx-concurrent-vec: доноры могут добавляться и
+    /// удаляться в рантайме (lock-free push / логическое удаление).
+    Orx(Arc<OrxVec<Donor>>),
+    /// Динамический список на boxcar::Vec — альтернативная реализация того же
+    /// контракта (добавление/удаление в рантайме).
+    Boxcar(Arc<BoxcarVec<Donor>>),
+}
+
+/// Какое хранилище списка доноров использовать.
+#[derive(Clone, Copy)]
+pub enum DonorListKind {
+    /// Статичный `Vec`, задаётся один раз.
+    Static,
+    /// `orx-concurrent-vec`.
+    Orx,
+    /// `boxcar::Vec`.
+    Boxcar,
+}
+
+/// Политика раздачи доноров: какой вид списка, использовать ли приоритет и
+/// как помечать доноров (`every`-й поток, начиная с 0, становится донором).
+pub struct DonorPolicy {
+    pub kind: DonorListKind,
+    pub use_priority: bool,
+    pub every: usize,
+    /// Явные приоритеты по индексу потока (если `use_priority`). При `None`
+    /// приоритет потока равен его индексу.
+    pub priorities: Option<Vec<u32>>,
+}
+
+impl DonorPolicy {
+    /// Статичный список, без приоритета.
+    pub fn static_(every: usize) -> Self {
+        Self {
+            kind: DonorListKind::Static,
+            use_priority: false,
+            every,
+            priorities: None,
+        }
+    }
+    /// Динамический список на orx-concurrent-vec.
+    pub fn orx(every: usize) -> Self {
+        Self {
+            kind: DonorListKind::Orx,
+            use_priority: false,
+            every,
+            priorities: None,
+        }
+    }
+    /// Динамический список на boxcar.
+    pub fn boxcar(every: usize) -> Self {
+        Self {
+            kind: DonorListKind::Boxcar,
+            use_priority: false,
+            every,
+            priorities: None,
+        }
+    }
+    /// То же, что и базовая политика, но с включённым приоритетом.
+    pub fn with_priority(mut self) -> Self {
+        self.use_priority = true;
+        self
+    }
 }
 
 #[cfg(windows)]
@@ -92,6 +198,12 @@ mod platform {
     }
 
     pub fn try_alloc_huge(size: usize) -> Option<RawAllocation> {
+        // Под Miri нет шимов для Windows-привилегий (AdjustTokenPrivileges и
+        // др.), поэтому huge-страницы просто не пытаемся — упадём на обычный
+        // VirtualAlloc через alloc_normal.
+        if cfg!(miri) {
+            return None;
+        }
         static PRIV: OnceLock<()> = OnceLock::new();
         PRIV.get_or_init(enable_lock_memory_privilege);
 
@@ -114,6 +226,7 @@ mod platform {
         }
     }
 
+    #[cfg(not(miri))]
     pub fn alloc_normal(size: usize) -> RawAllocation {
         unsafe {
             let ptr = VirtualAlloc(
@@ -131,18 +244,44 @@ mod platform {
         }
     }
 
+    // Под Miri VirtualAlloc не зашимлен — используем стандартный аллокатор,
+    // чтобы проверить логику (в первую очередь реестр доноров) через Miri.
+    // База должна быть выровнена не хуже страницы (как VirtualAlloc), иначе
+    // указатели вида `ptr + off` окажутся невыровненными (UB под Tree Borrows).
+    #[cfg(miri)]
+    pub fn alloc_normal(size: usize) -> RawAllocation {
+        use std::alloc::{Layout, alloc};
+        let layout = Layout::from_size_align(size, 16).unwrap();
+        let ptr = unsafe { alloc(layout) };
+        assert!(!ptr.is_null(), "std alloc failed (miri)");
+        RawAllocation {
+            ptr,
+            size,
+            is_huge: false,
+        }
+    }
+
     #[allow(dead_code)]
     pub fn lock_memory(ptr: *mut u8, size: usize) -> bool {
         unsafe { VirtualLock(ptr as *const _, size) != 0 }
     }
 
+    #[cfg(not(miri))]
     pub fn free(alloc: RawAllocation) {
         unsafe {
             VirtualFree(alloc.ptr as *mut _, 0, MEM_RELEASE);
         }
     }
 
+    #[cfg(miri)]
+    pub fn free(alloc: RawAllocation) {
+        use std::alloc::{Layout, dealloc};
+        let layout = Layout::from_size_align(alloc.size, 16).unwrap();
+        unsafe { dealloc(alloc.ptr, layout) };
+    }
+
     /// Размер обычной страницы (обычно 4 KB).
+    #[cfg(not(miri))]
     pub fn page_size() -> usize {
         static PAGE: OnceLock<usize> = OnceLock::new();
         *PAGE.get_or_init(|| unsafe {
@@ -152,10 +291,21 @@ mod platform {
         })
     }
 
+    #[cfg(miri)]
+    pub fn page_size() -> usize {
+        4096
+    }
+
     /// Минимальный размер large page (обычно 2 MB).
+    #[cfg(not(miri))]
     pub fn huge_page_size() -> usize {
         static HUGE: OnceLock<usize> = OnceLock::new();
         *HUGE.get_or_init(|| unsafe { GetLargePageMinimum() })
+    }
+
+    #[cfg(miri)]
+    pub fn huge_page_size() -> usize {
+        2 * 1024 * 1024
     }
 
     /// На Windows large pages выделяются физически сразу в VirtualAlloc —
@@ -380,7 +530,11 @@ impl SharedArena {
                     can_give: false,
                     self_index: 0,
                     donor_array: ptr::null(),
-                    donor_count: 0,
+                    donor_reg: DonorReg::None,
+                    donor_static_ptr: ptr::null(),
+                    donor_static_len: 0,
+                    donor_bump: None,
+                    use_priority: false,
                     base_chunk: 0,
                     fallback: SpinMutex::new(FallbackChunks {
                         chunks: Vec::new(),
@@ -426,7 +580,11 @@ impl SharedArena {
                     can_give: false,
                     self_index: 0,
                     donor_array: ptr::null(),
-                    donor_count: 0,
+                    donor_reg: DonorReg::None,
+                    donor_static_ptr: ptr::null(),
+                    donor_static_len: 0,
+                    donor_bump: None,
+                    use_priority: false,
                     base_chunk: 0,
                     fallback: SpinMutex::new(FallbackChunks {
                         chunks: Vec::new(),
@@ -473,7 +631,11 @@ impl SharedArena {
                         can_give: false,
                         self_index: 0,
                         donor_array: ptr::null(),
-                        donor_count: 0,
+                        donor_reg: DonorReg::None,
+                        donor_static_ptr: ptr::null(),
+                        donor_static_len: 0,
+                        donor_bump: None,
+                        use_priority: false,
                         base_chunk: 0,
                         fallback: SpinMutex::new(FallbackChunks {
                             chunks: Vec::new(),
@@ -497,7 +659,11 @@ impl SharedArena {
                         can_give: false,
                         self_index: 0,
                         donor_array: ptr::null(),
-                        donor_count: 0,
+                        donor_reg: DonorReg::None,
+                        donor_static_ptr: ptr::null(),
+                        donor_static_len: 0,
+                        donor_bump: None,
+                        use_priority: false,
                         base_chunk: 0,
                         fallback: SpinMutex::new(FallbackChunks {
                             chunks: Vec::new(),
@@ -537,15 +703,100 @@ impl SharedArena {
     ///
     /// `donor_every` — каждый `donor_every`-й чанк (начиная с 0) помечается
     /// донором.
-    fn split_donors(&self, num_threads: usize, donor_every: usize) -> Vec<CachePadded<ThreadBump>> {
+    /// Удобная обёртка: статичный список доноров без приоритета (каждый
+    /// `donor_every`-й поток, начиная с 0, помечается донором).
+    pub fn split_donors(
+        &self,
+        num_threads: usize,
+        donor_every: usize,
+    ) -> Vec<CachePadded<ThreadBump>> {
+        self.split_donors_with(num_threads, DonorPolicy::static_(donor_every))
+    }
+
+    /// Полная версия режима «доноры» с выбором хранилища списка доноров
+    /// (`DonorPolicy::kind`), приоритетом (`DonorPolicy::use_priority`) и
+    /// правилом пометки доноров (`DonorPolicy::every`).
+    ///
+    /// Каждый поток получает свой `Forward`-чанк. Помеченные доноры заносятся в
+    /// реестр (только они, чтобы при переполнении не перебирать все bumps). При
+    /// переполнении поток берёт блок с «другой стороны» региона донора; если
+    /// свободных доноров нет — выделяет новый чанк «где-то в памяти»
+    /// (см. `ThreadBump::try_take_from_donors` / `grow_fallback`).
+    fn split_donors_with(
+        &self,
+        num_threads: usize,
+        policy: DonorPolicy,
+    ) -> Vec<CachePadded<ThreadBump>> {
         let base = self.alloc.ptr;
         let total = self.alloc.size;
         let chunk_size = total / num_threads;
         let is_huge = self.alloc.is_huge;
 
+        // Собираем записи о донорах в bump-скретч: служебные данные — не
+        // глобальный аллокатор, а bumpalo (освобождается в конце функции).
+        let scratch = bumpalo::Bump::new();
+        let mut entries: bumpalo::collections::Vec<Donor> =
+            bumpalo::collections::Vec::new_in(&scratch);
+        for i in 0..num_threads {
+            let is_donor = policy.every > 0 && i % policy.every == 0;
+            if is_donor {
+                let priority = match &policy.priorities {
+                    Some(p) => *p.get(i).unwrap_or(&(i as u32)),
+                    None => i as u32,
+                };
+                entries.push(Donor {
+                    idx: i,
+                    priority,
+                    removed: AtomicBool::new(false),
+                });
+            }
+        }
+        let num_donors = entries.len();
+
+        // Строим реестр нужного вида. Статичный список размещаем в собственном
+        // bump-буфере (без глоб. аллокатора, без Arc-накладных); динамические —
+        // с capacity-подсказкой (with_capacity).
+        let mut donor_static_ptr: *const Donor = ptr::null();
+        let mut donor_static_len: usize = 0;
+        let mut donor_bump: Option<Arc<bumpalo::Bump>> = None;
+        let reg = match policy.kind {
+            DonorListKind::Static => {
+                let bump = Arc::new(bumpalo::Bump::new());
+                donor_bump = Some(bump);
+                let b = donor_bump.as_ref().unwrap();
+                let mut bv: bumpalo::collections::Vec<Donor> =
+                    bumpalo::collections::Vec::with_capacity_in(num_donors, b);
+                for d in entries.iter() {
+                    bv.push(d.clone());
+                }
+                if policy.use_priority {
+                    bv.sort_by_key(|d| d.priority);
+                }
+                donor_static_ptr = bv.as_ptr();
+                donor_static_len = bv.len();
+                DonorReg::Static
+            }
+            DonorListKind::Orx => {
+                // orx-concurrent-vec растёт сам (lock-free); capacity-подсказку
+                // дать не в виде одного числа нельзя, поэтому просто new().
+                let v: OrxVec<Donor> = OrxVec::new();
+                for d in entries.iter() {
+                    v.push(d.clone());
+                }
+                DonorReg::Orx(Arc::new(v))
+            }
+            DonorListKind::Boxcar => {
+                let v: BoxcarVec<Donor> = BoxcarVec::with_capacity(num_donors);
+                for d in entries.iter() {
+                    v.push(d.clone());
+                }
+                DonorReg::Boxcar(Arc::new(v))
+            }
+        };
+
         let bumps: Vec<CachePadded<ThreadBump>> = (0..num_threads)
             .map(|i| {
-                let can_give = donor_every > 0 && i % donor_every == 0;
+                let can_give = policy.every > 0 && i % policy.every == 0;
                 CachePadded::new(ThreadBump {
                     ptr: unsafe { base.add(i * chunk_size) },
                     len: chunk_size,
@@ -559,7 +810,11 @@ impl SharedArena {
                     can_give,
                     self_index: i,
                     donor_array: ptr::null(), // заполним ниже
-                    donor_count: 0,
+                    donor_reg: reg.clone(),
+                    donor_static_ptr,
+                    donor_static_len,
+                    donor_bump: donor_bump.clone(),
+                    use_priority: policy.use_priority,
                     base_chunk: chunk_size,
                     fallback: SpinMutex::new(FallbackChunks {
                         chunks: Vec::new(),
@@ -569,13 +824,12 @@ impl SharedArena {
             })
             .collect();
 
-        // Проставляем указатель на массив и число элементов — буфер Vec
-        // стабилен, поэтому raw-указатель валиден, пока живут потоки.
+        // Проставляем указатель на массив bumps — буфер Vec стабилен, поэтому
+        // raw-указатель валиден, пока живут потоки.
         let array = bumps.as_ptr();
         for i in 0..num_threads {
             unsafe {
                 (*(array.add(i) as *const ThreadBump as *mut ThreadBump)).donor_array = array;
-                (*(array.add(i) as *const ThreadBump as *mut ThreadBump)).donor_count = num_threads;
             }
         }
 
@@ -645,14 +899,27 @@ struct ThreadBump {
     self_index: usize,
     /// Указатель на массив bumps для обхода доноров (`null` вне режима доноров).
     donor_array: *const CachePadded<ThreadBump>,
-    /// Число элементов в массиве bumps.
-    donor_count: usize,
+    /// Реестр доноров: либо `None` (режим доноров не активен), либо список
+    /// только доноров (статичный или динамический), чтобы при переполнении не
+    /// перебирать ВСЕ bumps и не проверять каждый на `can_give`.
+    donor_reg: DonorReg,
+    /// Указатель на плоский срез доноров (для `DonorReg::Static`). Память
+    /// выделена в `bumpalo::Bump` (`donor_bump`), поэтому это НЕ глобальный
+    /// аллокатор и НЕ `Arc`. Валиден, пока жив `donor_bump`.
+    donor_static_ptr: *const Donor,
+    /// Длина среза `donor_static_ptr`.
+    donor_static_len: usize,
+    /// `bumpalo::Bump`, в котором лежит статичный список доноров (если
+    /// `DonorReg::Static`). Хранится как `Arc`, чтобы разделять между всеми
+    /// bumps; освобождается, когда последний bump выходит из области видимости.
+    donor_bump: Option<Arc<bumpalo::Bump>>,
+    /// Использовать ли приоритет при выборе донора (см. `Donor::priority`).
+    use_priority: bool,
     /// Размер первичного чанка (для размера fallback-чанков).
     base_chunk: usize,
     /// Дополнительные чанки, выделенные «где-то в памяти» при нехватке у
     /// доноров. Освобождаются в `Drop`.
     fallback: SpinMutex<FallbackChunks>,
-    // (������ ���������� ���������� fallback-����� �������� ������ FallbackChunks)
 }
 
 // Каждый ThreadBump владеет непересекающимся регионом памяти арены и
@@ -714,7 +981,7 @@ impl ThreadBump {
                         }
                     } else if let Some(p) = self.try_borrow::<ALIGN>(size) {
                         return p;
-                    } else if self.donor_array != ptr::null() {
+                    } else if !matches!(self.donor_reg, DonorReg::None) {
                         // Режим доноров: сначала пробуем взять чанк у помеченных
                         // доноров (с другой стороны их региона), иначе — новый
                         // чанк «где-то в памяти».
@@ -761,7 +1028,7 @@ impl ThreadBump {
                         }
                     } else if let Some(p) = self.try_borrow::<ALIGN>(size) {
                         return p;
-                    } else if self.donor_array != ptr::null() {
+                    } else if !matches!(self.donor_reg, DonorReg::None) {
                         if let Some(p) = self.try_take_from_donors::<ALIGN>(size) {
                             return p;
                         }
@@ -880,35 +1147,101 @@ impl ThreadBump {
 
     // ===== Режим «доноры»: заём чанка у помеченных доноров, иначе новый чанк =====
 
-    /// Обойти все помеченные доноры и попытаться взять у одного из них блок
+    /// Обойти только доноров из реестра и попытаться взять у одного из них блок
     /// `size` с «другой стороны» его региона (противоположной его заполнению).
-    /// Возвращает `Some(ptr)` при успехе или `None`, если ни у одного донора
-    /// нет свободной смежной половины.
+    /// Возвращает `Some(ptr)` при успехе или `None`, если ни у одного донора нет
+    /// свободной смежной половины. Перебираются ТОЛЬКО доноры (а не все bumps).
     #[inline(always)]
     fn try_take_from_donors<const ALIGN: usize>(&self, size: usize) -> Option<*mut u8> {
-        if self.donor_array == ptr::null() {
-            return None;
+        match &self.donor_reg {
+            DonorReg::None => None,
+            // Статичный список: при use_priority уже отсортирован по возрастанию
+            // приоритета, поэтому первый подходящий имеет минимальный приоритет.
+            DonorReg::Static => {
+                // Статичный список лежит в bump-буфере (raw ptr + len). При
+                // use_priority он уже отсортирован по возрастанию приоритета,
+                // поэтому первый подходящий донор имеет минимальный приоритет.
+                let slice = unsafe {
+                    std::slice::from_raw_parts(self.donor_static_ptr, self.donor_static_len)
+                };
+                for d in slice {
+                    if d.idx == self.self_index {
+                        continue;
+                    }
+                    if let Some(p) = self.take_from_donor::<ALIGN>(d.idx, size) {
+                        return Some(p);
+                    }
+                }
+                None
+            }
+            DonorReg::Orx(v) => {
+                self.take_from_registry::<ALIGN, _>(v.iter().map(|e| e.cloned()), size)
+            }
+            DonorReg::Boxcar(v) => {
+                self.take_from_registry::<ALIGN, _>(v.iter().map(|(_, d)| d.clone()), size)
+            }
         }
-        let arr = self.donor_array;
-        for i in 0..self.donor_count {
-            if i == self.self_index {
-                continue;
-            }
-            let d = unsafe { &*arr.add(i) };
-            if !d.can_give {
-                continue;
-            }
-            if let Some(p) = self.take_from_donor::<ALIGN>(d, size) {
-                return Some(p);
-            }
-        }
-        None
     }
 
-    /// Взять блок `size` из региона донора `d` с противоположной его заполнению
-    /// стороны, расширяя соответствующий счётчик донора через lock-free CAS.
+    /// Обход динамического реестра (orx/boxcar). Без приоритета — первый
+    /// подходящий; с приоритетом — из доступных выбирается донор с минимальным
+    /// приоритетом (== высокоприоритетные берутся в последнюю очередь).
+    /// Логически удалённые (`removed`) доноры пропускаются.
     #[inline(always)]
-    fn take_from_donor<const ALIGN: usize>(&self, d: &ThreadBump, size: usize) -> Option<*mut u8> {
+    fn take_from_registry<const ALIGN: usize, I>(&self, iter: I, size: usize) -> Option<*mut u8>
+    where
+        I: Iterator<Item = Donor>,
+    {
+        if !self.use_priority {
+            for d in iter {
+                if d.removed.load(Ordering::Relaxed) || d.idx == self.self_index {
+                    continue;
+                }
+                if let Some(p) = self.take_from_donor::<ALIGN>(d.idx, size) {
+                    return Some(p);
+                }
+            }
+            return None;
+        }
+        let mut best: Option<(u32, usize)> = None;
+        for d in iter {
+            if d.removed.load(Ordering::Relaxed) || d.idx == self.self_index {
+                continue;
+            }
+            if self.donor_has_space::<ALIGN>(d.idx, size)
+                && best.map_or(true, |(bp, _)| d.priority < bp)
+            {
+                best = Some((d.priority, d.idx));
+            }
+        }
+        best.and_then(|(_, idx)| self.take_from_donor::<ALIGN>(idx, size))
+    }
+
+    /// Непересекающаяся ли свободная «чужая» половина у донора (без изменений)?
+    #[inline(always)]
+    fn donor_has_space<const ALIGN: usize>(&self, donor_idx: usize, size: usize) -> bool {
+        let d = unsafe { &*self.donor_array.add(donor_idx) };
+        if d.dir == BumpDir::Forward {
+            let cur = d.hi.load(Ordering::Relaxed);
+            let off = (d.len - cur - size) & !(ALIGN - 1);
+            off >= d.lo.load(Ordering::Relaxed)
+        } else {
+            let cur = d.lo.load(Ordering::Relaxed);
+            let off = (cur + ALIGN - 1) & !(ALIGN - 1);
+            off + size <= d.len - d.hi.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Взять блок `size` из региона донора `donor_idx` с противоположной его
+    /// заполнению стороны, расширяя соответствующий счётчик донора через
+    /// lock-free CAS.
+    #[inline(always)]
+    fn take_from_donor<const ALIGN: usize>(
+        &self,
+        donor_idx: usize,
+        size: usize,
+    ) -> Option<*mut u8> {
+        let d = unsafe { &*self.donor_array.add(donor_idx) };
         if d.dir == BumpDir::Forward {
             // Донор заполняет низ [0, lo); отдаём с высокой стороны [len - hi, len).
             loop {
@@ -940,6 +1273,71 @@ impl ThreadBump {
                 {
                     return Some(unsafe { d.ptr.add(off) });
                 }
+            }
+        }
+    }
+
+    /// Добавить донора в рантайме. Работает только для динамических реестров
+    /// (orx/boxcar); для статичного/отсутствующего — возвращает `false`. Если
+    /// донор с таким индексом уже есть — не дублирует (возвращает `false`).
+    pub fn add_donor(&self, idx: usize, priority: u32) -> bool {
+        match &self.donor_reg {
+            DonorReg::None | DonorReg::Static => false,
+            DonorReg::Orx(v) => {
+                if v.iter().any(|e| {
+                    let d = e.cloned();
+                    d.idx == idx && !d.removed.load(Ordering::Relaxed)
+                }) {
+                    return false;
+                }
+                v.push(Donor {
+                    idx,
+                    priority,
+                    removed: AtomicBool::new(false),
+                });
+                true
+            }
+            DonorReg::Boxcar(v) => {
+                if v.iter()
+                    .any(|(_, d)| d.idx == idx && !d.removed.load(Ordering::Relaxed))
+                {
+                    return false;
+                }
+                v.push(Donor {
+                    idx,
+                    priority,
+                    removed: AtomicBool::new(false),
+                });
+                true
+            }
+        }
+    }
+
+    /// Удалить донора по индексу в рантайме (только для динамических реестров).
+    /// Физического удаления из lock-free вектора не происходит — запись
+    /// помечается `removed`, и обход её пропускает.
+    pub fn remove_donor(&self, idx: usize) -> bool {
+        match &self.donor_reg {
+            DonorReg::None | DonorReg::Static => false,
+            DonorReg::Orx(v) => {
+                for e in v.iter() {
+                    let d = e.cloned();
+                    if d.idx == idx && !d.removed.load(Ordering::Relaxed) {
+                        // Помечаем живой элемент удалённым.
+                        e.map(|x| x.removed.store(true, Ordering::Relaxed));
+                        return true;
+                    }
+                }
+                false
+            }
+            DonorReg::Boxcar(v) => {
+                for (_, d) in v.iter() {
+                    if d.idx == idx && !d.removed.load(Ordering::Relaxed) {
+                        d.removed.store(true, Ordering::Relaxed);
+                        return true;
+                    }
+                }
+                false
             }
         }
     }
@@ -1173,6 +1571,8 @@ use bumpalo::collections::Vec as BumpVec;
 use mimalloc::MiMalloc;
 use spin::Mutex as SpinMutex;
 
+// Под Miri mimalloc (FFI-аллокатор) не поддерживается — используем системный.
+#[cfg(not(miri))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
@@ -1364,10 +1764,18 @@ enum ArenaLayout {
     /// Чётные+нечётные соседи делят ОДИН объединённый регион и при нехватке
     /// места берут память друг у друга (см. `SharedArena::split_paired`).
     Pair,
-    /// Некоторые чанки помечены как доноры: при нехватке места у соседей берём
-    /// блок с другой стороны их региона, иначе — новый чанк в памяти
-    /// (см. `SharedArena::split_donors`).
+    /// Доноры: статичный список, без приоритета (см. `split_donors_with`).
     Donors,
+    /// Доноры: статичный список + приоритет (низкоприоритетные берутся первыми).
+    DonorsPrio,
+    /// Доноры: динамический список на orx-concurrent-vec, без приоритета.
+    DonorsOrx,
+    /// Доноры: динамический список на orx-concurrent-vec + приоритет.
+    DonorsOrxPrio,
+    /// Доноры: динамический список на boxcar, без приоритета.
+    DonorsBoxcar,
+    /// Доноры: динамический список на boxcar + приоритет.
+    DonorsBoxcarPrio,
 }
 
 /// Единое тело бенчмарка shared-арены. `full` управляет объёмом работы
@@ -1383,7 +1791,20 @@ fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
         ArenaLayout::Uniform(dir) => arena.split_with(core_ids.len(), dir),
         ArenaLayout::Neighbors => arena.split_alternating(core_ids.len()),
         ArenaLayout::Pair => arena.split_paired(core_ids.len()),
-        ArenaLayout::Donors => arena.split_donors(core_ids.len(), 4),
+        ArenaLayout::Donors => arena.split_donors_with(core_ids.len(), DonorPolicy::static_(4)),
+        ArenaLayout::DonorsPrio => {
+            arena.split_donors_with(core_ids.len(), DonorPolicy::static_(4).with_priority())
+        }
+        ArenaLayout::DonorsOrx => arena.split_donors_with(core_ids.len(), DonorPolicy::orx(4)),
+        ArenaLayout::DonorsOrxPrio => {
+            arena.split_donors_with(core_ids.len(), DonorPolicy::orx(4).with_priority())
+        }
+        ArenaLayout::DonorsBoxcar => {
+            arena.split_donors_with(core_ids.len(), DonorPolicy::boxcar(4))
+        }
+        ArenaLayout::DonorsBoxcarPrio => {
+            arena.split_donors_with(core_ids.len(), DonorPolicy::boxcar(4).with_priority())
+        }
     };
 
     let (vcap, outer, inner) = if full {
@@ -1489,14 +1910,52 @@ pub fn arena_light_pair(chunk_size: usize, smt: bool) {
     arena_bench(chunk_size, smt, false, ArenaLayout::Pair);
 }
 
-/// Полная версия: доноры отдают память с другой стороны, иначе новый чанк.
+// --- Доноры: статичный список, без приоритета ---
 pub fn arena_full_donors(chunk_size: usize, smt: bool) {
     arena_bench(chunk_size, smt, true, ArenaLayout::Donors);
 }
-
-/// Лёгкая версия: доноры отдают память с другой стороны, иначе новый чанк.
 pub fn arena_light_donors(chunk_size: usize, smt: bool) {
     arena_bench(chunk_size, smt, false, ArenaLayout::Donors);
+}
+
+// --- Доноры: статичный список + приоритет ---
+pub fn arena_full_donors_prio(chunk_size: usize, smt: bool) {
+    arena_bench(chunk_size, smt, true, ArenaLayout::DonorsPrio);
+}
+pub fn arena_light_donors_prio(chunk_size: usize, smt: bool) {
+    arena_bench(chunk_size, smt, false, ArenaLayout::DonorsPrio);
+}
+
+// --- Доноры: orx-concurrent-vec (динамический), без приоритета ---
+pub fn arena_full_donors_orx(chunk_size: usize, smt: bool) {
+    arena_bench(chunk_size, smt, true, ArenaLayout::DonorsOrx);
+}
+pub fn arena_light_donors_orx(chunk_size: usize, smt: bool) {
+    arena_bench(chunk_size, smt, false, ArenaLayout::DonorsOrx);
+}
+
+// --- Доноры: orx-concurrent-vec + приоритет ---
+pub fn arena_full_donors_orx_prio(chunk_size: usize, smt: bool) {
+    arena_bench(chunk_size, smt, true, ArenaLayout::DonorsOrxPrio);
+}
+pub fn arena_light_donors_orx_prio(chunk_size: usize, smt: bool) {
+    arena_bench(chunk_size, smt, false, ArenaLayout::DonorsOrxPrio);
+}
+
+// --- Доноры: boxcar (динамический), без приоритета ---
+pub fn arena_full_donors_boxcar(chunk_size: usize, smt: bool) {
+    arena_bench(chunk_size, smt, true, ArenaLayout::DonorsBoxcar);
+}
+pub fn arena_light_donors_boxcar(chunk_size: usize, smt: bool) {
+    arena_bench(chunk_size, smt, false, ArenaLayout::DonorsBoxcar);
+}
+
+// --- Доноры: boxcar + приоритет ---
+pub fn arena_full_donors_boxcar_prio(chunk_size: usize, smt: bool) {
+    arena_bench(chunk_size, smt, true, ArenaLayout::DonorsBoxcarPrio);
+}
+pub fn arena_light_donors_boxcar_prio(chunk_size: usize, smt: bool) {
+    arena_bench(chunk_size, smt, false, ArenaLayout::DonorsBoxcarPrio);
 }
 
 // ============================================================
@@ -1684,6 +2143,13 @@ fn run_directional_benchmarks(smt: bool, pgo_full_arena: usize, pgo_light_arena:
         ("Neighbors", |c, s| arena_full_neighbors(c, s)),
         ("Pair", |c, s| arena_full_pair(c, s)),
         ("Donors", |c, s| arena_full_donors(c, s)),
+        ("DonorsPrio", |c, s| arena_full_donors_prio(c, s)),
+        ("DonorsOrx", |c, s| arena_full_donors_orx(c, s)),
+        ("DonorsOrxPrio", |c, s| arena_full_donors_orx_prio(c, s)),
+        ("DonorsBoxcar", |c, s| arena_full_donors_boxcar(c, s)),
+        ("DonorsBoxcarPrio", |c, s| {
+            arena_full_donors_boxcar_prio(c, s)
+        }),
     ];
     println!("=== Directional FULL ({}) ===", mode_str);
     for (name, f) in full_variants {
@@ -1706,6 +2172,13 @@ fn run_directional_benchmarks(smt: bool, pgo_full_arena: usize, pgo_light_arena:
         ("Neighbors", |c, s| arena_light_neighbors(c, s)),
         ("Pair", |c, s| arena_light_pair(c, s)),
         ("Donors", |c, s| arena_light_donors(c, s)),
+        ("DonorsPrio", |c, s| arena_light_donors_prio(c, s)),
+        ("DonorsOrx", |c, s| arena_light_donors_orx(c, s)),
+        ("DonorsOrxPrio", |c, s| arena_light_donors_orx_prio(c, s)),
+        ("DonorsBoxcar", |c, s| arena_light_donors_boxcar(c, s)),
+        ("DonorsBoxcarPrio", |c, s| {
+            arena_light_donors_boxcar_prio(c, s)
+        }),
     ];
     println!("=== Directional LIGHT ({}) ===", mode_str);
     for (name, f) in light_variants {
@@ -2238,7 +2711,7 @@ mod tests {
 
     #[test]
     fn donors_fallback_when_no_donor_free() {
-        // Ни один донор не помечен (donor_every = 1000): при нехватке места
+        // Ни один донор не помечен (every = 0): при нехватке места
         // выделяется новый чанк «где-то в памяти» (grow_fallback). Проверяем, что
         // он находится ВНЕ основной арены и данные живы; Drop освобождает его.
         let arena = SharedArena::new(1 << 20);
@@ -2265,5 +2738,263 @@ mod tests {
         }
         // fallback непуст (Drop позже освободит).
         assert!(!needy.fallback.lock().chunks.is_empty());
+    }
+
+    // ---- Статичный список + приоритет: низкоприоритетный берётся первым ----
+
+    #[test]
+    fn donors_static_priority_low_taken_first() {
+        // 5 потоков, доноры — индексы 0 и 2 (every = 2). Явно задаём приоритеты
+        // так, чтобы у донора 0 он БЫЛ ВЫШЕ, чем у донора 2. Значит донор 2
+        // (низкий приоритет) должен использоваться первым.
+        let arena = SharedArena::new(5 * 1024 * 1024); // 1 MB на поток
+        let mut prio = vec![0u32; 5];
+        prio[0] = 100; // высокий
+        prio[2] = 1; // низкий (минимальный среди доноров 0,2,4)
+        prio[4] = 50; // средний
+        let bumps = arena.split_donors_with(
+            5,
+            DonorPolicy {
+                kind: DonorListKind::Static,
+                use_priority: true,
+                every: 2,
+                priorities: Some(prio),
+            },
+        );
+        let needy = &bumps[1];
+        let d0 = &bumps[0];
+        let d2 = &bumps[2];
+
+        // Переполняем needy: первый заём должен уйти к донору 2 (низкий приоритет).
+        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(200_000);
+        for j in 0..200_000usize {
+            let p = needy.alloc_raw::<8>(8) as *mut usize;
+            unsafe { *p = 0xE000 + j };
+            ptrs.push(p);
+        }
+        let last = *ptrs.last().unwrap() as usize;
+        let in_d0 = last >= d0.ptr as usize && last < d0.ptr as usize + d0.len;
+        let in_d2 = last >= d2.ptr as usize && last < d2.ptr as usize + d2.len;
+        assert!(
+            in_d2 && !in_d0,
+            "первым должен взяться низкоприоритетный донор 2"
+        );
+        for (j, p) in ptrs.iter().enumerate() {
+            assert_eq!(unsafe { **p }, 0xE000 + j);
+        }
+    }
+
+    // ---- orx-concurrent-vec: динамическое добавление/удаление донора ----
+
+    #[test]
+    fn donors_orx_add_then_remove() {
+        let arena = SharedArena::new(2 * 1024 * 1024); // 1 MB на поток, 2 потока
+        // Изначально доноров нет (every = 0).
+        let bumps = arena.split_donors_with(2, DonorPolicy::orx(0));
+        let needy = &bumps[1];
+        let donor0 = &bumps[0];
+        let a_start = arena.alloc.ptr as usize;
+        let a_end = a_start + arena.alloc.size;
+
+        // Добавляем донора 0 в рантайме.
+        assert!(needy.add_donor(0, 0));
+        assert!(!needy.add_donor(0, 0)); // уже есть — повторно не добавляем (индекс тот же)
+
+        // Переполняем needy: должен взять у добавленного донора 0.
+        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(200_000);
+        for j in 0..200_000usize {
+            let p = needy.alloc_raw::<8>(8) as *mut usize;
+            unsafe { *p = 0xF000 + j };
+            ptrs.push(p);
+        }
+        let last = *ptrs.last().unwrap() as usize;
+        assert!(
+            last >= donor0.ptr as usize && last < donor0.ptr as usize + donor0.len,
+            "блок должен быть взят у динамически добавленного донора 0"
+        );
+        for (j, p) in ptrs.iter().enumerate() {
+            assert_eq!(unsafe { **p }, 0xF000 + j);
+        }
+
+        // Удаляем донора 0 — теперь заём невозможен, пойдёт fallback вне арены.
+        assert!(needy.remove_donor(0));
+        assert!(!needy.remove_donor(0)); // уже удалён
+        let extra: Vec<*mut usize> = (0..2000)
+            .map(|j| {
+                let p = needy.alloc_raw::<8>(8) as *mut usize;
+                unsafe { *p = 0xA000 + j };
+                p
+            })
+            .collect();
+        let all_outside = extra
+            .iter()
+            .all(|&p| (p as usize) < a_start || (p as usize) >= a_end);
+        assert!(
+            all_outside,
+            "после удаления донора должен быть fallback вне арены"
+        );
+    }
+
+    // ---- boxcar: то же динамическое добавление/удаление ----
+
+    #[test]
+    fn donors_boxcar_add_then_remove() {
+        let arena = SharedArena::new(2 * 1024 * 1024);
+        let bumps = arena.split_donors_with(2, DonorPolicy::boxcar(0));
+        let needy = &bumps[1];
+        let donor0 = &bumps[0];
+        let a_start = arena.alloc.ptr as usize;
+        let a_end = a_start + arena.alloc.size;
+
+        assert!(needy.add_donor(0, 0));
+        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(200_000);
+        for j in 0..200_000usize {
+            let p = needy.alloc_raw::<8>(8) as *mut usize;
+            unsafe { *p = 0xB000 + j };
+            ptrs.push(p);
+        }
+        let last = *ptrs.last().unwrap() as usize;
+        assert!(last >= donor0.ptr as usize && last < donor0.ptr as usize + donor0.len);
+        for (j, p) in ptrs.iter().enumerate() {
+            assert_eq!(unsafe { **p }, 0xB000 + j);
+        }
+
+        assert!(needy.remove_donor(0));
+        let extra: Vec<*mut usize> = (0..2000)
+            .map(|j| {
+                let p = needy.alloc_raw::<8>(8) as *mut usize;
+                unsafe { *p = 0xC000 + j };
+                p
+            })
+            .collect();
+        let all_outside = extra
+            .iter()
+            .all(|&p| (p as usize) < a_start || (p as usize) >= a_end);
+        assert!(
+            all_outside,
+            "после удаления донора должен быть fallback вне арены"
+        );
+    }
+
+    // ---- orx + приоритет: из доступных выбирается минимальный приоритет ----
+
+    #[test]
+    fn donors_orx_priority_low_taken_first() {
+        let arena = SharedArena::new(5 * 1024 * 1024);
+        let mut prio = vec![0u32; 5];
+        prio[0] = 100;
+        prio[2] = 1; // низкий (минимальный среди доноров 0,2,4)
+        prio[4] = 50; // средний
+        let bumps = arena.split_donors_with(
+            5,
+            DonorPolicy {
+                kind: DonorListKind::Orx,
+                use_priority: true,
+                every: 2,
+                priorities: Some(prio),
+            },
+        );
+        let needy = &bumps[1];
+        let d0 = &bumps[0];
+        let d2 = &bumps[2];
+
+        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(200_000);
+        for j in 0..200_000usize {
+            let p = needy.alloc_raw::<8>(8) as *mut usize;
+            unsafe { *p = 0x9000 + j };
+            ptrs.push(p);
+        }
+        let last = *ptrs.last().unwrap() as usize;
+        let in_d0 = last >= d0.ptr as usize && last < d0.ptr as usize + d0.len;
+        let in_d2 = last >= d2.ptr as usize && last < d2.ptr as usize + d2.len;
+        assert!(
+            in_d2 && !in_d0,
+            "orx+prio: первым берётся низкоприоритетный донор 2"
+        );
+        for (j, p) in ptrs.iter().enumerate() {
+            assert_eq!(unsafe { **p }, 0x9000 + j);
+        }
+    }
+
+    // ---- boxcar + приоритет: то же самое ----
+
+    #[test]
+    fn donors_boxcar_priority_low_taken_first() {
+        let arena = SharedArena::new(5 * 1024 * 1024);
+        let mut prio = vec![0u32; 5];
+        prio[0] = 100;
+        prio[2] = 1; // низкий (минимальный среди доноров 0,2,4)
+        prio[4] = 50; // средний
+        let bumps = arena.split_donors_with(
+            5,
+            DonorPolicy {
+                kind: DonorListKind::Boxcar,
+                use_priority: true,
+                every: 2,
+                priorities: Some(prio),
+            },
+        );
+        let needy = &bumps[1];
+        let d0 = &bumps[0];
+        let d2 = &bumps[2];
+
+        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(200_000);
+        for j in 0..200_000usize {
+            let p = needy.alloc_raw::<8>(8) as *mut usize;
+            unsafe { *p = 0x8000 + j };
+            ptrs.push(p);
+        }
+        let last = *ptrs.last().unwrap() as usize;
+        let in_d0 = last >= d0.ptr as usize && last < d0.ptr as usize + d0.len;
+        let in_d2 = last >= d2.ptr as usize && last < d2.ptr as usize + d2.len;
+        assert!(
+            in_d2 && !in_d0,
+            "boxcar+prio: первым берётся низкоприоритетный донор 2"
+        );
+        for (j, p) in ptrs.iter().enumerate() {
+            assert_eq!(unsafe { **p }, 0x8000 + j);
+        }
+    }
+
+    // Лёгкий smoke-тест для прогона под Miri (Tree Borrows) — малые объёмы,
+    // чтобы проверить звуковость реестра доноров и заимствование памяти.
+    #[test]
+    fn donors_miri_smoke() {
+        // static: забор с высокой стороны донора (маленькая арена -> переполнение)
+        let arena = SharedArena::new(32 * 1024);
+        let bumps = arena.split_donors(2, 2);
+        let (donor, needy) = (&bumps[0], &bumps[1]);
+        let mut ptrs: Vec<*mut usize> = Vec::with_capacity(3_000);
+        for j in 0..3_000usize {
+            let p = needy.alloc_raw::<8>(8) as *mut usize;
+            unsafe { *p = 0xC000 + j };
+            ptrs.push(p);
+        }
+        for (j, p) in ptrs.iter().enumerate() {
+            assert_eq!(unsafe { **p }, 0xC000 + j);
+        }
+        let last = *ptrs.last().unwrap() as usize;
+        let d_start = donor.ptr as usize;
+        let d_end = d_start + donor.len;
+        assert!(
+            last >= d_start && last < d_end,
+            "static: блок взят не у донора"
+        );
+
+        // orx: динамическое удаление -> fallback вне арены
+        let arena2 = SharedArena::new(32 * 1024);
+        let bumps2 = arena2.split_donors_with(2, DonorPolicy::orx(0));
+        let needy2 = &bumps2[1];
+        needy2.remove_donor(0);
+        let extra: Vec<*mut usize> = (0..3_000)
+            .map(|j| {
+                let p = needy2.alloc_raw::<8>(8) as *mut usize;
+                unsafe { *p = 0xD000 + j };
+                p
+            })
+            .collect();
+        for (j, p) in extra.iter().enumerate() {
+            assert_eq!(unsafe { **p }, 0xD000 + j);
+        }
     }
 }

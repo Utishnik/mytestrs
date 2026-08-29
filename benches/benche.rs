@@ -198,6 +198,71 @@ fn arena_full_donors_no_smt() {
     arena_full_donors(fa, false);
 }
 
+// Donors (статичный список) + приоритет.
+#[divan::bench(name = "arena_full/donors_prio/smt", sample_count = RUNS)]
+fn arena_full_donors_prio_smt() {
+    let (_, _, fa, _) = pgo();
+    arena_full_donors_prio(fa, true);
+}
+
+#[divan::bench(name = "arena_full/donors_prio/no-smt", sample_count = RUNS)]
+fn arena_full_donors_prio_no_smt() {
+    let (_, _, fa, _) = pgo();
+    arena_full_donors_prio(fa, false);
+}
+
+// Donors на orx-concurrent-vec (динамический), без приоритета.
+#[divan::bench(name = "arena_full/donors_orx/smt", sample_count = RUNS)]
+fn arena_full_donors_orx_smt() {
+    let (_, _, fa, _) = pgo();
+    arena_full_donors_orx(fa, true);
+}
+
+#[divan::bench(name = "arena_full/donors_orx/no-smt", sample_count = RUNS)]
+fn arena_full_donors_orx_no_smt() {
+    let (_, _, fa, _) = pgo();
+    arena_full_donors_orx(fa, false);
+}
+
+// Donors на orx-concurrent-vec + приоритет.
+#[divan::bench(name = "arena_full/donors_orx_prio/smt", sample_count = RUNS)]
+fn arena_full_donors_orx_prio_smt() {
+    let (_, _, fa, _) = pgo();
+    arena_full_donors_orx_prio(fa, true);
+}
+
+#[divan::bench(name = "arena_full/donors_orx_prio/no-smt", sample_count = RUNS)]
+fn arena_full_donors_orx_prio_no_smt() {
+    let (_, _, fa, _) = pgo();
+    arena_full_donors_orx_prio(fa, false);
+}
+
+// Donors на boxcar (динамический), без приоритета.
+#[divan::bench(name = "arena_full/donors_boxcar/smt", sample_count = RUNS)]
+fn arena_full_donors_boxcar_smt() {
+    let (_, _, fa, _) = pgo();
+    arena_full_donors_boxcar(fa, true);
+}
+
+#[divan::bench(name = "arena_full/donors_boxcar/no-smt", sample_count = RUNS)]
+fn arena_full_donors_boxcar_no_smt() {
+    let (_, _, fa, _) = pgo();
+    arena_full_donors_boxcar(fa, false);
+}
+
+// Donors на boxcar + приоритет.
+#[divan::bench(name = "arena_full/donors_boxcar_prio/smt", sample_count = RUNS)]
+fn arena_full_donors_boxcar_prio_smt() {
+    let (_, _, fa, _) = pgo();
+    arena_full_donors_boxcar_prio(fa, true);
+}
+
+#[divan::bench(name = "arena_full/donors_boxcar_prio/no-smt", sample_count = RUNS)]
+fn arena_full_donors_boxcar_prio_no_smt() {
+    let (_, _, fa, _) = pgo();
+    arena_full_donors_boxcar_prio(fa, false);
+}
+
 // То же самое для LIGHT-версии.
 #[divan::bench(name = "arena_light/forward/smt", sample_count = RUNS)]
 fn arena_light_forward_smt() {
@@ -269,4 +334,69 @@ fn arena_light_donors_smt() {
 fn arena_light_donors_no_smt() {
     let (_, _, _, la) = pgo();
     arena_light_donors(la, false);
+}
+
+// Donors (статичный список) + приоритет.
+#[divan::bench(name = "arena_light/donors_prio/smt", sample_count = RUNS)]
+fn arena_light_donors_prio_smt() {
+    let (_, _, _, la) = pgo();
+    arena_light_donors_prio(la, true);
+}
+
+#[divan::bench(name = "arena_light/donors_prio/no-smt", sample_count = RUNS)]
+fn arena_light_donors_prio_no_smt() {
+    let (_, _, _, la) = pgo();
+    arena_light_donors_prio(la, false);
+}
+
+// Donors на orx-concurrent-vec (динамический), без приоритета.
+#[divan::bench(name = "arena_light/donors_orx/smt", sample_count = RUNS)]
+fn arena_light_donors_orx_smt() {
+    let (_, _, _, la) = pgo();
+    arena_light_donors_orx(la, true);
+}
+
+#[divan::bench(name = "arena_light/donors_orx/no-smt", sample_count = RUNS)]
+fn arena_light_donors_orx_no_smt() {
+    let (_, _, _, la) = pgo();
+    arena_light_donors_orx(la, false);
+}
+
+// Donors на orx-concurrent-vec + приоритет.
+#[divan::bench(name = "arena_light/donors_orx_prio/smt", sample_count = RUNS)]
+fn arena_light_donors_orx_prio_smt() {
+    let (_, _, _, la) = pgo();
+    arena_light_donors_orx_prio(la, true);
+}
+
+#[divan::bench(name = "arena_light/donors_orx_prio/no-smt", sample_count = RUNS)]
+fn arena_light_donors_orx_prio_no_smt() {
+    let (_, _, _, la) = pgo();
+    arena_light_donors_orx_prio(la, false);
+}
+
+// Donors на boxcar (динамический), без приоритета.
+#[divan::bench(name = "arena_light/donors_boxcar/smt", sample_count = RUNS)]
+fn arena_light_donors_boxcar_smt() {
+    let (_, _, _, la) = pgo();
+    arena_light_donors_boxcar(la, true);
+}
+
+#[divan::bench(name = "arena_light/donors_boxcar/no-smt", sample_count = RUNS)]
+fn arena_light_donors_boxcar_no_smt() {
+    let (_, _, _, la) = pgo();
+    arena_light_donors_boxcar(la, false);
+}
+
+// Donors на boxcar + приоритет.
+#[divan::bench(name = "arena_light/donors_boxcar_prio/smt", sample_count = RUNS)]
+fn arena_light_donors_boxcar_prio_smt() {
+    let (_, _, _, la) = pgo();
+    arena_light_donors_boxcar_prio(la, true);
+}
+
+#[divan::bench(name = "arena_light/donors_boxcar_prio/no-smt", sample_count = RUNS)]
+fn arena_light_donors_boxcar_prio_no_smt() {
+    let (_, _, _, la) = pgo();
+    arena_light_donors_boxcar_prio(la, false);
 }
