@@ -21,6 +21,11 @@ branches = { version = "0.5.0", features = ["prefetch"] }
 [features]
 hotpath = ["hotpath/hotpath"]
 hotpath-cpu = ["hotpath/hotpath-cpu"]
+# Асинхронный prefetch страниц на Windows через PrefetchVirtualMemory.
+# ВЫКЛЮЧЕН по умолчанию: на практике worker-потоки ядра фолтят страницы
+# в чужом контексте (working-set lock, чужая NUMA-нода) и это даёт
+# регрессию. Включается явно: `cargo build --features win-prefetch-pages`.
+win-prefetch-pages = []
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -42,7 +47,7 @@ harness = false
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
@@ -52,14 +57,12 @@ incremental = false
 
 [profile.bench]
 inherits = "release"
-lto = true
+lto = "fat"
 codegen-units = 1
 
-# Лёгкий LTO (thin) для сборок со свежесобранным std (-Zbuild-std),
-# чтобы fat-LTO поверх std не взрывал время/память сборки.
 [profile.native]
 inherits = "release"
-lto = "thin"
+lto = "fat"
 # Для -Zbuild-std нельзя panic="abort": sysroot-шный panic_abort тянет
 # sysroot-шный core, который дублирует build-std core (E0152). Unwind-ранайм
 # собирается из исходников вместе с остальным std.

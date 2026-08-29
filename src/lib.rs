@@ -211,6 +211,16 @@ mod platform {
         }
     }
 
+    /// Идемпотентно запрашивает `SeLockMemoryPrivilege` («Lock pages in memory»)
+    /// ровно один раз за процесс. Благодаря этому `MEM_LARGE_PAGES` (и, как
+    /// следствие, эффективный префетч/быстрая арена, как на Linux) начинает
+    /// работать на Windows. Вызывается автоматически из `alloc_normal` и
+    /// `try_alloc_huge`, поэтому право запрашивается само при первом выделении.
+    fn ensure_lock_memory_privilege() {
+        static PRIV: OnceLock<()> = OnceLock::new();
+        PRIV.get_or_init(enable_lock_memory_privilege);
+    }
+
     pub fn try_alloc_huge(size: usize) -> Option<RawAllocation> {
         // Под Miri нет шимов для Windows-привилегий (AdjustTokenPrivileges и
         // др.), поэтому huge-страницы просто не пытаемся — упадём на обычный
@@ -218,8 +228,7 @@ mod platform {
         if cfg!(miri) {
             return None;
         }
-        static PRIV: OnceLock<()> = OnceLock::new();
-        PRIV.get_or_init(enable_lock_memory_privilege);
+        ensure_lock_memory_privilege();
 
         unsafe {
             let ptr = VirtualAlloc(
@@ -242,6 +251,7 @@ mod platform {
 
     #[cfg(not(miri))]
     pub fn alloc_normal(size: usize) -> RawAllocation {
+        ensure_lock_memory_privilege();
         unsafe {
             let ptr = VirtualAlloc(
                 ptr::null_mut(),
@@ -333,15 +343,24 @@ mod platform {
         false
     }
 
-    /// Асинхронный prefetch через PrefetchVirtualMemory. По умолчанию
-    /// ВЫКЛЮЧЕН: на практике worker-потоки ядра фолтят страницы в другом
-    /// контексте (конкуренция за working-set lock, чужая NUMA-нода), что
-    /// только замедляет prefault. Включается через R3_ASYNC_PREFETCH=1
-    /// для экспериментов.
+    /// Асинхронный prefetch страниц через PrefetchVirtualMemory. ВЫКЛЮЧЕН по
+    /// умолчанию и включается ТОЛЬКО под фичей `win-prefetch-pages`
+    /// (`cargo build --features win-prefetch-pages`): на практике worker-потоки
+    /// ядра фолтят страницы в чужом контексте (working-set lock, чужая NUMA-нода)
+    /// и это даёт регрессию. Huge pages (MEM_LARGE_PAGES) от этого не зависят —
+    /// они включаются через `ensure_lock_memory_privilege` независимо.
     pub fn prefetch_async(ptr: *mut u8, len: usize) {
-        if len == 0 || std::env::var_os("R3_ASYNC_PREFETCH").is_none() {
+        if len == 0 {
             return;
         }
+        // Когда фича выключена, `ptr` не используется — гасим warning.
+        #[cfg(not(feature = "win-prefetch-pages"))]
+        let _ = ptr;
+        // Под Miri PrefetchVirtualMemory не зашимлен — пропускаем.
+        if cfg!(miri) {
+            return;
+        }
+        #[cfg(feature = "win-prefetch-pages")]
         unsafe {
             let range = WIN32_MEMORY_RANGE_ENTRY {
                 VirtualAddress: ptr as *mut _,
@@ -350,6 +369,9 @@ mod platform {
             PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
         }
     }
+
+    /// На Windows huge pages уже получены через MEM_LARGE_PAGES, подсказка не нужна.
+    pub fn advise_huge(_ptr: *mut u8, _len: usize) {}
 }
 
 #[cfg(unix)]
@@ -468,6 +490,17 @@ mod platform {
 
     /// На Linux асинхронный prefetch не нужен: madvise покрывает всё синхронно.
     pub fn prefetch_async(_ptr: *mut u8, _len: usize) {}
+
+    /// Просим ядро использовать transparent huge pages для региона (best-effort).
+    /// Работает без резервирования явных huge pages; если THP выключен — no-op.
+    pub fn advise_huge(ptr: *mut u8, len: usize) {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_HUGEPAGE);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (ptr, len);
+    }
 }
 
 // ============================================================
@@ -483,12 +516,25 @@ unsafe impl Sync for SharedArena {}
 
 impl SharedArena {
     fn new(total_capacity: usize) -> Self {
-        let alloc = platform::try_alloc_huge(total_capacity)
-            .unwrap_or_else(|| platform::alloc_normal(total_capacity));
+        // Размер под huge pages должен быть кратен huge_page_size(), иначе
+        // MEM_LARGE_PAGES / MAP_HUGETLB молча не срабатывают и регион
+        // выделяется обычными 4KB-страницами. Округляем только для крупных
+        // арен (мелкие и так не получают huge pages и должны сохранять
+        // точный размер — иначе ломаются тесты границ/OOM).
+        let huge = platform::huge_page_size();
+        let cap = if total_capacity >= huge {
+            total_capacity.next_multiple_of(huge)
+        } else {
+            total_capacity
+        };
+        let alloc = platform::try_alloc_huge(cap).unwrap_or_else(|| platform::alloc_normal(cap));
+        // Best-effort THP (Linux): работает без резервирования явных huge pages.
+        platform::advise_huge(alloc.ptr, alloc.size);
 
         if verbose_enabled() {
             println!(
-                "  [Arena] Выделено {} MB, huge pages: {}",
+                "  [Arena] Выделено {} MB (запрошено {} MB), huge pages: {}",
+                cap / (1024 * 1024),
                 total_capacity / (1024 * 1024),
                 alloc.is_huge
             );
@@ -1050,7 +1096,11 @@ impl ThreadBump {
                             )
                             .is_ok()
                         {
-                            return unsafe { self.ptr.add(off) };
+                            // Backward-заполнение идёт вниз: префетчим следующий
+                            // блок (по меньшему адресу), в который будем писать.
+                            let p = unsafe { self.ptr.add(off) };
+                            prefetch_write(unsafe { self.ptr.add(off.wrapping_sub(size)) });
+                            return p;
                         }
                     } else if let Some(p) = self.try_borrow::<ALIGN>(size) {
                         return p;
