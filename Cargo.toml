@@ -53,3 +53,13 @@ incremental = false
 inherits = "release"
 lto = true
 codegen-units = 1
+
+# Лёгкий LTO (thin) для сборок со свежесобранным std (-Zbuild-std),
+# чтобы fat-LTO поверх std не взрывал время/память сборки.
+[profile.native]
+inherits = "release"
+lto = "thin"
+# Для -Zbuild-std нельзя panic="abort": sysroot-шный panic_abort тянет
+# sysroot-шный core, который дублирует build-std core (E0152). Unwind-ранайм
+# собирается из исходников вместе с остальным std.
+panic = "unwind"

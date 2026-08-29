@@ -2136,6 +2136,102 @@ pub fn run() {
     run_directional_benchmarks(false, pgo_full_arena, pgo_light_arena);
 }
 
+/// Быстрый, но репрезентативный прогон горячих путей аллокатора для сбора
+/// PGO-профилей. Запускается вместо тяжёлых бенчмарков `run()` только когда
+/// задана переменная окружения `R3_PGO_TRAIN` (её выставляет build.ps1 во время
+/// тренировочного прогона). Несколько сотен тысяч аллокаций — секунды, а не минуты.
+/// Между пачками делается reset(), чтобы одиночные bump'ы не ушли в OOM-панику.
+pub fn pgo_train() {
+    const BATCH: u32 = 20_000;
+    const ROUNDS: u32 = 10; // ~200k аллокаций на каждый режим
+
+    // Forward / Backward / MiddleOut на одном bump.
+    for &dir in &[BumpDir::Forward, BumpDir::Backward, BumpDir::MiddleOut] {
+        let arena = SharedArena::new(8 * 1024 * 1024);
+        let mut v = arena.split_with(1, dir);
+        let b = &v[0];
+        for _ in 0..ROUNDS {
+            for _ in 0..BATCH {
+                let p = b.alloc_raw::<8>(8);
+                let q = b.alloc_raw::<1>(1);
+                let r = b.alloc_raw::<16>(24);
+                unsafe {
+                    *q = 0xAB;
+                    let _ = (p, r);
+                }
+            }
+            b.reset();
+        }
+    }
+
+    // Neighbors (alternating directions).
+    {
+        let arena = SharedArena::new(8 * 1024 * 1024);
+        let bumps = arena.split_alternating(2);
+        let (a, c) = (&bumps[0], &bumps[1]);
+        for _ in 0..ROUNDS {
+            for _ in 0..BATCH {
+                let _ = a.alloc_raw::<8>(8);
+                let _ = c.alloc_raw::<8>(8);
+            }
+            a.reset();
+            c.reset();
+        }
+    }
+
+    // Pair (shared combined region).
+    {
+        let arena = SharedArena::new(16 * 1024 * 1024);
+        let bumps = arena.split_paired(2);
+        let (a, c) = (&bumps[0], &bumps[1]);
+        for _ in 0..ROUNDS {
+            for _ in 0..BATCH {
+                let _ = a.alloc_raw::<8>(8);
+                let _ = c.alloc_raw::<8>(8);
+            }
+            a.reset();
+            c.reset();
+        }
+    }
+
+    // Donors: Static / Orx / Boxcar — переполнение + приоритет + удаление -> fallback.
+    for &kind in &[
+        DonorListKind::Static,
+        DonorListKind::Orx,
+        DonorListKind::Boxcar,
+    ] {
+        let arena = SharedArena::new(16 * 1024 * 1024);
+        let mut prio = vec![0u32; 5];
+        prio[0] = 100;
+        prio[2] = 1; // низкий (минимальный среди доноров 0,2,4)
+        prio[4] = 50;
+        let bumps = arena.split_donors_with(
+            5,
+            DonorPolicy {
+                kind,
+                use_priority: true,
+                every: 2,
+                priorities: Some(prio),
+            },
+        );
+        let needy = &bumps[1];
+        for _ in 0..ROUNDS {
+            for _ in 0..BATCH {
+                let _ = needy.alloc_raw::<8>(8);
+            }
+            needy.reset();
+        }
+        // Динамическое удаление донора -> fallback вне арены.
+        needy.remove_donor(0);
+        for _ in 0..(ROUNDS / 2) {
+            for _ in 0..BATCH {
+                let _ = needy.alloc_raw::<8>(8);
+            }
+            needy.reset();
+        }
+    }
+}
+
 fn run_directional_benchmarks(smt: bool, pgo_full_arena: usize, pgo_light_arena: usize) {
     let mode_str = if smt {
         "SMT (all logical cores)"
