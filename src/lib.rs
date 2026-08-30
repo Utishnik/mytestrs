@@ -1153,6 +1153,7 @@ impl Drop for ThreadBump {
 /// вызов `align_of::<T>()` в аргументе const-generic запрещён компилятором,
 /// а через ассоциированную константу — разрешён).
 impl ThreadBump {
+    // inner-loop аллокатора: не инструментируем (весь цикл меряется `measure_block!`).
     #[inline(always)]
     fn alloc_raw<const ALIGN: usize>(&self, size: usize) -> *mut u8 {
         // `lo` — байт выделено с левого края (для Backward/MiddleOut семантика
@@ -1607,6 +1608,7 @@ impl ThreadBump {
     /// аллокатор) и вернуть в нём указатель на блок `size`. Чанк сохраняется в
     /// `fallback` и освобождается в `Drop`. Адрес возвращается вызывающему — его
     /// собственный регион при этом не трогается.
+    #[hotpath::measure]
     #[inline(always)]
     fn grow_fallback<const ALIGN: usize>(&self, size: usize) -> *mut u8 {
         let page = platform::page_size();
@@ -1645,6 +1647,7 @@ impl ThreadBump {
         self.alloc_raw::<ALIGN>(size) as *mut T
     }
 
+    #[hotpath::measure]
     fn reset(&self) {
         self.lo.store(0, Ordering::Relaxed);
         self.hi.store(0, Ordering::Relaxed);
@@ -1653,6 +1656,7 @@ impl ThreadBump {
 
     /// First-touch: фолтим страницы ИСПОЛЬЗОВАННЫХ областей из текущего
     /// потока, чтобы они легли в локальную NUMA-ноду.
+    #[hotpath::measure]
     fn prefault_local(&self) {
         if self.is_huge && platform::large_pages_precommitted() {
             return;
@@ -2354,7 +2358,6 @@ struct ArenaVec<T> {
 }
 
 impl<T> ArenaVec<T> {
-    #[hotpath::measure]
     #[inline(always)]
     fn with_capacity_in<const ALIGN: usize>(capacity: usize, bump: &ThreadBump) -> Self {
         if capacity == 0 {
@@ -2987,14 +2990,8 @@ fn median(times: &[u128]) -> u128 {
 #[hotpath::main]
 pub fn run() {
     let all_cores = core_affinity::get_core_ids().unwrap();
-    println!(
-        "Р вЂєР С•Р С–Р С‘РЎвЂЎР ВµРЎРѓР С”Р С‘РЎвЂ¦ РЎРЏР Т‘Р ВµРЎР‚: {}",
-        all_cores.len()
-    );
-    println!(
-        "Р В¤Р С‘Р В·Р С‘РЎвЂЎР ВµРЎРѓР С”Р С‘РЎвЂ¦ РЎРЏР Т‘Р ВµРЎР‚: {}",
-        num_cpus::get_physical()
-    );
+    println!("Логических ядер: {}", all_cores.len());
+    println!("Физических ядер: {}", num_cpus::get_physical());
     println!();
 
     // PGO для bumpalo
@@ -3045,15 +3042,17 @@ pub fn pgo_train() {
         let v = arena.split_with_safe(1, dir);
         let b = &v[0];
         for _ in 0..ROUNDS {
-            for _ in 0..BATCH {
-                let p = b.alloc_raw::<8>(8);
-                let q = b.alloc_raw::<1>(1);
-                let r = b.alloc_raw::<16>(24);
-                unsafe {
-                    *q = 0xAB;
-                    let _ = (p, r);
+            hotpath::measure_block!("pgo-alloc", {
+                for _ in 0..BATCH {
+                    let p = b.alloc_raw::<8>(8);
+                    let q = b.alloc_raw::<1>(1);
+                    let r = b.alloc_raw::<16>(24);
+                    unsafe {
+                        *q = 0xAB;
+                        let _ = (p, r);
+                    }
                 }
-            }
+            });
             b.reset();
         }
     }
@@ -3110,17 +3109,21 @@ pub fn pgo_train() {
         );
         let needy = &bumps[1];
         for _ in 0..ROUNDS {
-            for _ in 0..BATCH {
-                let _ = needy.alloc_raw::<8>(8);
-            }
+            hotpath::measure_block!("pgo-donors-alloc", {
+                for _ in 0..BATCH {
+                    let _ = needy.alloc_raw::<8>(8);
+                }
+            });
             needy.reset();
         }
         // Динамическое удаление донора -> fallback вне арены.
         needy.remove_donor(0);
         for _ in 0..(ROUNDS / 2) {
-            for _ in 0..BATCH {
-                let _ = needy.alloc_raw::<8>(8);
-            }
+            hotpath::measure_block!("pgo-donors-fallback", {
+                for _ in 0..BATCH {
+                    let _ = needy.alloc_raw::<8>(8);
+                }
+            });
             needy.reset();
         }
     }
