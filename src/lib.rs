@@ -5,8 +5,10 @@ use crossbeam_utils::CachePadded;
 use orx_concurrent_vec::ConcurrentVec as OrxVec;
 use std::cell::Cell;
 use std::fmt;
+use std::marker::PhantomData;
 use std::ops::Deref;
 use std::ptr;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use triomphe::Arc;
 
@@ -204,7 +206,7 @@ mod platform {
                     if enabled {
                         "ENABLED"
                     } else {
-                        "недоступна (large pages выключены)"
+                        "Р Р…Р ВµР Т‘Р С•РЎРѓРЎвЂљРЎС“Р С—Р Р…Р В° (large pages Р Р†РЎвЂ№Р С”Р В»РЎР‹РЎвЂЎР ВµР Р…РЎвЂ№)"
                     }
                 );
             }
@@ -533,7 +535,7 @@ impl SharedArena {
 
         if verbose_enabled() {
             println!(
-                "  [Arena] Выделено {} MB (запрошено {} MB), huge pages: {}",
+                "  [Arena] Р вЂ™РЎвЂ№Р Т‘Р ВµР В»Р ВµР Р…Р С• {} MB (Р В·Р В°Р С—РЎР‚Р С•РЎв‚¬Р ВµР Р…Р С• {} MB), huge pages: {}",
                 cap / (1024 * 1024),
                 total_capacity / (1024 * 1024),
                 alloc.is_huge
@@ -556,18 +558,33 @@ impl SharedArena {
         Self { alloc }
     }
 
-    fn split(&self, num_threads: usize) -> Vec<CachePadded<ThreadBump>> {
-        self.split_with(num_threads, BumpDir::Forward)
-    }
-
     /// Разбить арену на `num_threads` непересекающихся чанков заданного
     /// направления заполнения. Для `MiddleOut` каждый чанк стартует из своей
     /// середины.
-    fn split_with(&self, num_threads: usize, dir: BumpDir) -> Vec<CachePadded<ThreadBump>> {
+    // Выравниваем размер чанка, чтобы старт каждого чанка (base + i*chunk_size)
+    #[allow(dead_code)]
+    pub unsafe fn split(&self, num_threads: usize) -> Vec<CachePadded<ThreadBump>> {
+        unsafe { self.split_with(num_threads, BumpDir::Forward) }
+    }
+    // оставался выровненным (иначе указатели доноров — UB под Tree Borrows).
+
+    pub fn split_safe(&self, num_threads: usize) -> Split<'_> {
+        self.split_with_safe(num_threads, BumpDir::Forward)
+    }
+    /// Чётные потоки заполняют свой чанк справа налево (`Backward`), нечётные —
+    /// слева направо (`Forward`). Так соседние чанки «доходят» до общей границы
+    /// навстречу друг другу (идея совместного использования памяти соседа).
+    // Выравниваем размер чанка, чтобы старт каждого чанка (base + i*chunk_size)
+    // оставался выровненным (иначе указатели доноров — UB под Tree Borrows).
+
+    /// Р вЂ™Р С•Р В·Р Р†РЎР‚Р В°РЎвЂ°Р В°Р ВµР СРЎвЂ№Р в„– `Vec` Р Р…Р Вµ РЎРѓР Р†РЎРЏР В·Р В°Р Р… РЎРѓ Р Р†РЎР‚Р ВµР СР ВµР Р…Р ВµР С Р В¶Р С‘Р В·Р Р…Р С‘ Р В°РЎР‚Р ВµР Р…РЎвЂ№: bumps Р Т‘Р ВµРЎР‚Р В¶Р В°РЎвЂљ РЎРѓРЎвЂ№РЎР‚РЎвЂ№Р Вµ
+    /// РЎС“Р С”Р В°Р В·Р В°РЎвЂљР ВµР В»Р С‘ Р Р† РЎР‚Р ВµР С–Р С‘Р С•Р Р…. Р вЂ™РЎвЂ№Р В·РЎвЂ№Р Р†Р В°РЎР‹РЎвЂ°Р С‘Р в„– Р С•Р В±РЎРЏР В·Р В°Р Р… Р Т‘Р ВµРЎР‚Р В¶Р В°РЎвЂљРЎРЉ `self` Р В¶Р С‘Р Р†Р С•Р в„– Р С‘ Р Р…Р Вµ Р Т‘Р В°РЎвЂљРЎРЉ
+    /// bumps Р С—Р ВµРЎР‚Р ВµР В¶Р С‘РЎвЂљРЎРЉ Р В°РЎР‚Р ВµР Р…РЎС“ (Р С‘Р Р…Р В°РЎвЂЎР Вµ use-after-free).
+    unsafe fn split_with(&self, num_threads: usize, dir: BumpDir) -> Vec<CachePadded<ThreadBump>> {
         let base = self.alloc.ptr;
         let total = self.alloc.size;
-        // Выравниваем размер чанка, чтобы старт каждого чанка (base + i*chunk_size)
-        // оставался выровненным (иначе указатели доноров — UB под Tree Borrows).
+        // Р вЂ™РЎвЂ№РЎР‚Р В°Р Р†Р Р…Р С‘Р Р†Р В°Р ВµР С РЎР‚Р В°Р В·Р СР ВµРЎР‚ РЎвЂЎР В°Р Р…Р С”Р В°, РЎвЂЎРЎвЂљР С•Р В±РЎвЂ№ РЎРѓРЎвЂљР В°РЎР‚РЎвЂљ Р С”Р В°Р В¶Р Т‘Р С•Р С–Р С• РЎвЂЎР В°Р Р…Р С”Р В° (base + i*chunk_size)
+        // Р С•РЎРѓРЎвЂљР В°Р Р†Р В°Р В»РЎРѓРЎРЏ Р Р†РЎвЂ№РЎР‚Р С•Р Р†Р Р…Р ВµР Р…Р Р…РЎвЂ№Р С (Р С‘Р Р…Р В°РЎвЂЎР Вµ РЎС“Р С”Р В°Р В·Р В°РЎвЂљР ВµР В»Р С‘ Р Т‘Р С•Р Р…Р С•РЎР‚Р С•Р Р† РІР‚вЂќ UB Р С—Р С•Р Т‘ Tree Borrows).
         let chunk_size = (total / num_threads).next_multiple_of(16);
 
         (0..num_threads)
@@ -589,11 +606,12 @@ impl SharedArena {
                     is_huge: self.alloc.is_huge,
                     neighbor_idx: None,
                     array: ptr::null(),
+                    #[cfg(test)]
                     can_give: false,
                     self_index: 0,
                     donor_array: ptr::null(),
                     donor_reg: DonorReg::None,
-                    donor_static_ptr: ptr::null(),
+                    donor_static_ptr: None,
                     donor_static_len: 0,
                     donor_bump: None,
                     use_priority: false,
@@ -607,10 +625,23 @@ impl SharedArena {
             .collect()
     }
 
-    /// Чётные потоки заполняют свой чанк справа налево (`Backward`), нечётные —
-    /// слева направо (`Forward`). Так соседние чанки «доходят» до общей границы
-    /// навстречу друг другу (идея совместного использования памяти соседа).
-    fn split_alternating(&self, num_threads: usize) -> Vec<CachePadded<ThreadBump>> {
+    /// Р вЂР ВµР В·Р С•Р С—Р В°РЎРѓР Р…Р В°РЎРЏ Р Р†Р ВµРЎР‚РЎРѓР С‘РЎРЏ `split_with`: Р Р†Р С•Р В·Р Р†РЎР‚Р В°РЎвЂ°Р В°Р ВµРЎвЂљ sound-`Split`.
+    pub fn split_with_safe(&self, num_threads: usize, dir: BumpDir) -> Split<'_> {
+        Split {
+            arena: self,
+            bumps: unsafe { self.split_with(num_threads, dir) },
+        }
+    }
+
+    /// Чётные потоки заполняют свой чанк слева направо (`Backward`), нечётные —
+    /// справа налево (`Forward`). Так каждый чанк доходит до своей половины
+    /// навстречу друг другу (идея совместного использования памяти соседом).
+    ///
+    /// # Safety
+    /// Возвращённый `Vec` не связывает время жизни с ареной. Требуется держать
+    /// `self` живым и не давать эти bumps после того, как арена будет
+    /// освобождена.
+    unsafe fn split_alternating(&self, num_threads: usize) -> Vec<CachePadded<ThreadBump>> {
         let base = self.alloc.ptr;
         let total = self.alloc.size;
         // Выравниваем размер чанка, чтобы старт каждого чанка (base + i*chunk_size)
@@ -641,11 +672,12 @@ impl SharedArena {
                     is_huge: self.alloc.is_huge,
                     neighbor_idx: None,
                     array: ptr::null(),
+                    #[cfg(test)]
                     can_give: false,
                     self_index: 0,
                     donor_array: ptr::null(),
                     donor_reg: DonorReg::None,
-                    donor_static_ptr: ptr::null(),
+                    donor_static_ptr: None,
                     donor_static_len: 0,
                     donor_bump: None,
                     use_priority: false,
@@ -659,14 +691,20 @@ impl SharedArena {
             .collect()
     }
 
-    /// Объединённый регион ПАРЫ: соседние потоки (2k — `Backward`, 2k+1 —
-    /// `Forward`) делят ОДИН регион размером `2 * chunk_size` и заполняют его
-    /// навстречу друг другу от внешних краёв к середине. Когда одна сторона
-    /// доходит до середины и в своём чанке места больше нет, она «берёт»
-    /// смежную свободную половину соседа (через lock-free CAS по счётчику
-    /// соседа, см. `ThreadBump::try_borrow`). Если соседей нечётное число,
-    /// последний поток получает собственный изолированный чанк без соседа.
-    fn split_paired(&self, num_threads: usize) -> Vec<CachePadded<ThreadBump>> {
+    /// Чётные потоки заполняют свой чанк справа налево (`Backward`), нечётные —
+    /// слева направо (`Forward`). Так соседние чанки растут навстречу друг другу.
+    pub fn split_alternating_safe(&self, num_threads: usize) -> Split<'_> {
+        Split {
+            arena: self,
+            bumps: unsafe { self.split_alternating(num_threads) },
+        }
+    }
+
+    /// # Safety
+    /// Возвращённый `Vec` не связывает время жизни с ареной. Требуется держать
+    /// `self` живым и не давать эти bumps после того, как арена будет
+    /// освобождена.
+    unsafe fn split_paired(&self, num_threads: usize) -> Vec<CachePadded<ThreadBump>> {
         let base = self.alloc.ptr;
         let total = self.alloc.size;
         // Выравниваем размер чанка, чтобы старт каждого чанка (base + i*chunk_size)
@@ -674,7 +712,7 @@ impl SharedArena {
         let chunk_size = (total / num_threads).next_multiple_of(16);
         let is_huge = self.alloc.is_huge;
 
-        let bumps: Vec<CachePadded<ThreadBump>> = (0..num_threads)
+        let mut bumps: Vec<CachePadded<ThreadBump>> = (0..num_threads)
             .map(|i| {
                 if i % 2 == 0 {
                     // Чётный — ведущий чанк пары: общий регион [2k*cs, 2k*cs+2cs).
@@ -694,11 +732,12 @@ impl SharedArena {
                         is_huge,
                         neighbor_idx: None,
                         array: ptr::null(),
+                        #[cfg(test)]
                         can_give: false,
                         self_index: 0,
                         donor_array: ptr::null(),
                         donor_reg: DonorReg::None,
-                        donor_static_ptr: ptr::null(),
+                        donor_static_ptr: None,
                         donor_static_len: 0,
                         donor_bump: None,
                         use_priority: false,
@@ -722,11 +761,12 @@ impl SharedArena {
                         is_huge,
                         neighbor_idx: None,
                         array: ptr::null(),
+                        #[cfg(test)]
                         can_give: false,
                         self_index: 0,
                         donor_array: ptr::null(),
                         donor_reg: DonorReg::None,
-                        donor_static_ptr: ptr::null(),
+                        donor_static_ptr: None,
                         donor_static_len: 0,
                         donor_bump: None,
                         use_priority: false,
@@ -744,20 +784,29 @@ impl SharedArena {
         // Адрес буфера Vec стабилен (не переезжает при move/заимствовании),
         // поэтому raw-указатель остаётся валидным, пока живут потоки.
         let array = bumps.as_ptr();
-        let mut k = 0;
-        while k + 1 < num_threads {
-            unsafe {
-                (*(array.add(k) as *const ThreadBump as *mut ThreadBump)).neighbor_idx =
-                    Some(k + 1);
-                (*(array.add(k + 1) as *const ThreadBump as *mut ThreadBump)).neighbor_idx =
-                    Some(k);
-                (*(array.add(k) as *const ThreadBump as *mut ThreadBump)).array = array;
-                (*(array.add(k + 1) as *const ThreadBump as *mut ThreadBump)).array = array;
-            }
-            k += 2;
+        for (i, pair) in bumps.chunks_exact_mut(2).enumerate() {
+            let k = i * 2;
+            let (a, b) = pair.split_at_mut(1);
+            a[0].neighbor_idx = Some(k + 1);
+            b[0].neighbor_idx = Some(k);
+            a[0].array = array;
+            b[0].array = array;
         }
-
         bumps
+    }
+
+    /// Объединённый регион ПАРЫ: соседние потоки (2k — `Backward`, 2k+1 —
+    /// `Forward`) делят ОДИН регион размером `2 * chunk_size` и заполняют его
+    /// навстречу друг другу от внешних краёв к середине. Когда одна сторона
+    /// доходит до середины и в своём чанке места больше нет, она «берёт»
+    /// смежную свободную половину соседа (через lock-free CAS по счётчику
+    /// соседа, см. `ThreadBump::try_borrow`). Если соседей нечётное число,
+    /// последний поток получает собственный изолированный чанк без соседа.
+    pub fn split_paired_safe(&self, num_threads: usize) -> Split<'_> {
+        Split {
+            arena: self,
+            bumps: unsafe { self.split_paired(num_threads) },
+        }
     }
 
     /// Режим «доноры» (отдельная версия): каждый поток получает свой чанк
@@ -768,27 +817,42 @@ impl SharedArena {
     /// (см. `ThreadBump::try_take_from_donors` / `grow_fallback`).
     ///
     /// `donor_every` — каждый `donor_every`-й чанк (начиная с 0) помечается
-    /// донором.
-    /// Удобная обёртка: статичный список доноров без приоритета (каждый
-    /// `donor_every`-й поток, начиная с 0, помечается донором).
-    pub fn split_donors(
+    /// донором. Удобная обёртка: статичный список доноров без приоритета
+    /// (каждый `donor_every`-й поток, начиная с 0, помечается донором).
+    ///
+    /// # Safety
+    /// Возвращённый `Vec` не связывает время жизни с ареной. Требуется держать
+    /// `self` живым и не давать эти bumps после того, как арена будет
+    /// освобождена.
+    #[allow(dead_code)]
+    pub unsafe fn split_donors(
         &self,
         num_threads: usize,
         donor_every: usize,
     ) -> Vec<CachePadded<ThreadBump>> {
-        self.split_donors_with(num_threads, DonorPolicy::static_(donor_every))
+        unsafe { self.split_donors_with(num_threads, DonorPolicy::static_(donor_every)) }
     }
 
     /// Полная версия режима «доноры» с выбором хранилища списка доноров
     /// (`DonorPolicy::kind`), приоритетом (`DonorPolicy::use_priority`) и
-    /// правилом пометки доноров (`DonorPolicy::every`).
-    ///
+    /// правилом пометки доноров (`DonorPolicy::every`). Безопасная обёртка:
+    /// возвращает sound-`Split`.
+    #[allow(dead_code)]
+    pub fn split_donors_safe(&self, num_threads: usize, donor_every: usize) -> Split<'_> {
+        self.split_donors_with_safe(num_threads, DonorPolicy::static_(donor_every))
+    }
+
     /// Каждый поток получает свой `Forward`-чанк. Помеченные доноры заносятся в
     /// реестр (только они, чтобы при переполнении не перебирать все bumps). При
     /// переполнении поток берёт блок с «другой стороны» региона донора; если
     /// свободных доноров нет — выделяет новый чанк «где-то в памяти»
     /// (см. `ThreadBump::try_take_from_donors` / `grow_fallback`).
-    fn split_donors_with(
+    ///
+    /// # Safety
+    /// Возвращённый `Vec` не связывает время жизни с ареной. Требуется держать
+    /// `self` живым и не давать эти bumps после того, как арена будет
+    /// освобождена.
+    unsafe fn split_donors_with(
         &self,
         num_threads: usize,
         policy: DonorPolicy,
@@ -824,7 +888,7 @@ impl SharedArena {
         // Строим реестр нужного вида. Статичный список размещаем в собственном
         // bump-буфере (без глоб. аллокатора, без Arc-накладных); динамические —
         // с capacity-подсказкой (with_capacity).
-        let mut donor_static_ptr: *const Donor = ptr::null();
+        let mut donor_static_ptr: Option<*const Donor> = None;
         let mut donor_static_len: usize = 0;
         let mut donor_bump: Option<Arc<bumpalo::Bump>> = None;
         let reg = match policy.kind {
@@ -840,7 +904,7 @@ impl SharedArena {
                 if policy.use_priority {
                     bv.sort_by_key(|d| d.priority);
                 }
-                donor_static_ptr = bv.as_ptr();
+                donor_static_ptr = Some(bv.as_ptr());
                 donor_static_len = bv.len();
                 DonorReg::Static
             }
@@ -862,8 +926,9 @@ impl SharedArena {
             }
         };
 
-        let bumps: Vec<CachePadded<ThreadBump>> = (0..num_threads)
+        let mut bumps: Vec<CachePadded<ThreadBump>> = (0..num_threads)
             .map(|i| {
+                #[cfg(test)]
                 let can_give = policy.every > 0 && i % policy.every == 0;
                 CachePadded::new(ThreadBump {
                     ptr: unsafe { base.add(i * chunk_size) },
@@ -875,9 +940,10 @@ impl SharedArena {
                     is_huge,
                     neighbor_idx: None,
                     array: ptr::null(),
+                    #[cfg(test)]
                     can_give,
                     self_index: i,
-                    donor_array: ptr::null(), // заполним ниже
+                    donor_array: ptr::null(), // Р В·Р В°Р С—Р С•Р В»Р Р…Р С‘Р С Р Р…Р С‘Р В¶Р Вµ
                     donor_reg: reg.clone(),
                     donor_static_ptr,
                     donor_static_len,
@@ -894,14 +960,21 @@ impl SharedArena {
 
         // Проставляем указатель на массив bumps — буфер Vec стабилен, поэтому
         // raw-указатель валиден, пока живут потоки.
+
         let array = bumps.as_ptr();
-        for i in 0..num_threads {
-            unsafe {
-                (*(array.add(i) as *const ThreadBump as *mut ThreadBump)).donor_array = array;
-            }
+        for b in bumps.iter_mut() {
+            b.donor_array = array;
         }
 
         bumps
+    }
+
+    /// Р вЂР ВµР В·Р С•Р С—Р В°РЎРѓР Р…Р В°РЎРЏ Р Р†Р ВµРЎР‚РЎРѓР С‘РЎРЏ `split_donors_with`: Р Р†Р С•Р В·Р Р†РЎР‚Р В°РЎвЂ°Р В°Р ВµРЎвЂљ sound-`Split`.
+    pub fn split_donors_with_safe(&self, num_threads: usize, policy: DonorPolicy) -> Split<'_> {
+        Split {
+            arena: self,
+            bumps: unsafe { self.split_donors_with(num_threads, policy) },
+        }
     }
 }
 
@@ -928,6 +1001,65 @@ impl Drop for SharedArena {
 ///   отсюда идея, что сосед может дотянуться до чужой памяти.
 /// * `MiddleOut`— старт из середины чанка с чередованием вправо/влево.
 ///   Два соседа, встречаясь от середин своих чанков, делят общую границу.
+//    Р Р…Р В°РЎР‚РЎС“Р В¶РЎС“ РЎР‚Р В°Р В·Р Т‘Р ВµР В»РЎРЏР ВµР СРЎвЂ№Р СР С‘ РЎРѓРЎРѓРЎвЂ№Р В»Р С”Р В°Р СР С‘.
+//
+// `Split<'a>` Р В°Р Р†РЎвЂљР С•Р СР В°РЎвЂљР С‘РЎвЂЎР ВµРЎРѓР С”Р С‘ `Send`/`Sync`, Р ВµРЎРѓР В»Р С‘ `ThreadBump: Send + Sync` (Р В° Р С•Р Р… Р С‘Р С
+// Р С•Р В±РЎР‰РЎРЏР Р†Р В»Р ВµР Р… РЎвЂЎР ВµРЎР‚Р ВµР В· `unsafe impl`), РЎвЂљ.Р Вµ. РЎР‚Р В°Р В·Р Т‘Р В°Р Р†Р В°РЎвЂљРЎРЉ `&bumps[i]` Р Р† scoped-Р С—Р С•РЎвЂљР С•Р С”Р С‘ Р СР С•Р В¶Р Р…Р С•.
+pub struct Split<'a> {
+    #[allow(dead_code)]
+    arena: &'a SharedArena,
+    bumps: Vec<CachePadded<ThreadBump>>,
+}
+
+impl<'a> Split<'a> {
+    #[inline]
+    pub fn bumps(&self) -> &[CachePadded<ThreadBump>] {
+        &self.bumps
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.bumps.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.bumps.is_empty()
+    }
+
+    /// Р вЂќР С•РЎРѓРЎвЂљРЎС“Р С— Р С” Р С”Р С•Р Р…Р С”РЎР‚Р ВµРЎвЂљР Р…Р С•Р СРЎС“ bump'РЎС“ Р С—Р С• Р С‘Р Р…Р Т‘Р ВµР С”РЎРѓРЎС“ (safe, Р Р…Р С• lifetime Р С—РЎР‚Р С‘Р Р†РЎРЏР В·Р В°Р Р… Р С” `&self`).
+    #[inline]
+    pub fn get(&self, i: usize) -> Option<&CachePadded<ThreadBump>> {
+        self.bumps.get(i)
+    }
+
+    /// Р СџРЎР‚Р ВµР С•Р В±РЎР‚Р В°Р В·Р С•Р Р†Р В°РЎвЂљРЎРЉ Р Р† РЎР‚Р В°Р В·Р Т‘Р ВµР В»РЎРЏР ВµР СРЎвЂ№Р в„– Р С—Р С•Р Т‘Р СР В°РЎРѓРЎРѓР С‘Р Р† (Р Т‘Р В»РЎРЏ Р С—Р ВµРЎР‚Р ВµР Т‘Р В°РЎвЂЎР С‘ `&bumps[i]` Р Р† Р С—Р С•РЎвЂљР С•Р С”Р С‘).
+    #[inline]
+    pub fn as_slice(&self) -> &[CachePadded<ThreadBump>] {
+        &self.bumps
+    }
+}
+
+impl<'a> std::ops::Deref for Split<'a> {
+    type Target = [CachePadded<ThreadBump>];
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.bumps
+    }
+}
+
+// ============================================================
+//            THREAD-LOCAL BUMP (Р вЂР вЂўР вЂ” Р РЋР ВР СњР ТђР В Р С›Р СњР ВР вЂ”Р С’Р В¦Р ВР В)
+// ============================================================
+
+/// Р СњР В°Р С—РЎР‚Р В°Р Р†Р В»Р ВµР Р…Р С‘Р Вµ Р В·Р В°Р С—Р С•Р В»Р Р…Р ВµР Р…Р С‘РЎРЏ thread-local bump-Р В°Р В»Р В»Р С•Р С”Р В°РЎвЂљР С•РЎР‚Р В°.
+///
+/// * `Forward`  РІР‚вЂќ РЎРѓРЎвЂљР В°Р Р…Р Т‘Р В°РЎР‚РЎвЂљ: РЎРѓР В»Р ВµР Р†Р В° Р Р…Р В°Р С—РЎР‚Р В°Р Р†Р С• (cursor РЎР‚Р В°РЎРѓРЎвЂљРЎвЂРЎвЂљ Р С•РЎвЂљ 0 Р Р†Р Р†Р ВµРЎР‚РЎвЂ¦).
+/// * `Backward` РІР‚вЂќ РЎРѓР С—РЎР‚Р В°Р Р†Р В° Р Р…Р В°Р В»Р ВµР Р†Р С• (right-to-left). Р РЋР С•РЎРѓР ВµР Т‘Р Р…Р С‘Р в„– Р С—Р С•РЎвЂљР С•Р С” РЎРѓР С—РЎР‚Р В°Р Р†Р В°,
+///   Р В·Р В°Р С—Р С•Р В»Р Р…РЎРЏРЎР‹РЎвЂ°Р С‘Р в„– РЎРѓР Р†Р С•Р в„– РЎвЂЎР В°Р Р…Р С” РЎРѓР В»Р ВµР Р†Р В° Р Р…Р В°Р С—РЎР‚Р В°Р Р†Р С•, Р’В«Р Т‘Р С•РЎвЂ¦Р С•Р Т‘Р С‘РЎвЂљР’В» Р Т‘Р С• РЎвЂљР С•Р в„– Р В¶Р Вµ Р С–РЎР‚Р В°Р Р…Р С‘РЎвЂ РЎвЂ№ РІР‚вЂќ
+///   Р С•РЎвЂљРЎРѓРЎР‹Р Т‘Р В° Р С‘Р Т‘Р ВµРЎРЏ, РЎвЂЎРЎвЂљР С• РЎРѓР С•РЎРѓР ВµР Т‘ Р СР С•Р В¶Р ВµРЎвЂљ Р Т‘Р С•РЎвЂљРЎРЏР Р…РЎС“РЎвЂљРЎРЉРЎРѓРЎРЏ Р Т‘Р С• РЎвЂЎРЎС“Р В¶Р С•Р в„– Р С—Р В°Р СРЎРЏРЎвЂљР С‘.
+/// * `MiddleOut`РІР‚вЂќ РЎРѓРЎвЂљР В°РЎР‚РЎвЂљ Р С‘Р В· РЎРѓР ВµРЎР‚Р ВµР Т‘Р С‘Р Р…РЎвЂ№ РЎвЂЎР В°Р Р…Р С”Р В° РЎРѓ РЎвЂЎР ВµРЎР‚Р ВµР Т‘Р С•Р Р†Р В°Р Р…Р С‘Р ВµР С Р Р†Р С—РЎР‚Р В°Р Р†Р С•/Р Р†Р В»Р ВµР Р†Р С•.
+///   Р вЂќР Р†Р В° РЎРѓР С•РЎРѓР ВµР Т‘Р В°, Р Р†РЎРѓРЎвЂљРЎР‚Р ВµРЎвЂЎР В°РЎРЏРЎРѓРЎРЉ Р С•РЎвЂљ РЎРѓР ВµРЎР‚Р ВµР Т‘Р С‘Р Р… РЎРѓР Р†Р С•Р С‘РЎвЂ¦ РЎвЂЎР В°Р Р…Р С”Р С•Р Р†, Р Т‘Р ВµР В»РЎРЏРЎвЂљ Р С•Р В±РЎвЂ°РЎС“РЎР‹ Р С–РЎР‚Р В°Р Р…Р С‘РЎвЂ РЎС“.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BumpDir {
     Forward,
@@ -935,7 +1067,7 @@ pub enum BumpDir {
     MiddleOut,
 }
 
-struct ThreadBump {
+pub struct ThreadBump {
     ptr: *mut u8,
     len: usize,
     /// Байт, выделенный с левого края (для Forward — сама граница; для
@@ -962,6 +1094,7 @@ struct ThreadBump {
     array: *const CachePadded<ThreadBump>,
     // ===== Поля режима «доноры» (отдельная версия) =====
     /// Помечен ли этот bump как способный отдавать память («донор»).
+    #[cfg(test)]
     can_give: bool,
     /// Собственный индекс в массиве bumps (чтобы не брать у самого себя).
     self_index: usize,
@@ -974,12 +1107,16 @@ struct ThreadBump {
     /// Указатель на плоский срез доноров (для `DonorReg::Static`). Память
     /// выделена в `bumpalo::Bump` (`donor_bump`), поэтому это НЕ глобальный
     /// аллокатор и НЕ `Arc`. Валиден, пока жив `donor_bump`.
-    donor_static_ptr: *const Donor,
     /// Длина среза `donor_static_ptr`.
+    donor_static_ptr: Option<*const Donor>,
+    /// Р вЂќР В»Р С‘Р Р…Р В° РЎРѓРЎР‚Р ВµР В·Р В° `donor_static_ptr` (Р Р†Р В°Р В»Р С‘Р Т‘Р ВµР Р… РЎвЂљР С•Р В»РЎРЉР С”Р С• Р С—РЎР‚Р С‘ `Some`).
     donor_static_len: usize,
     /// `bumpalo::Bump`, в котором лежит статичный список доноров (если
     /// `DonorReg::Static`). Хранится как `Arc`, чтобы разделять между всеми
     /// bumps; освобождается, когда последний bump выходит из области видимости.
+    /// Р вЂ™ Р С–Р С•РЎР‚РЎРЏРЎвЂЎР ВµР С Р С—РЎС“РЎвЂљР С‘ Р СњР вЂў РЎвЂЎР С‘РЎвЂљР В°Р ВµРЎвЂљРЎРѓРЎРЏ РІР‚вЂќ РЎРЊРЎвЂљР С• keep-alive (drop-guard): Р С—Р С•Р С”Р В° Р В¶Р С‘Р Р† РЎРЊРЎвЂљР С•РЎвЂљ
+    /// `Arc`, Р В¶Р С‘Р Р† Р С‘ Р В±РЎС“РЎвЂћР ВµРЎР‚, Р Р…Р В° Р С”Р С•РЎвЂљР С•РЎР‚РЎвЂ№Р в„– РЎС“Р С”Р В°Р В·РЎвЂ№Р Р†Р В°Р ВµРЎвЂљ `donor_static_ptr`.
+    #[allow(dead_code)]
     donor_bump: Option<Arc<bumpalo::Bump>>,
     /// Использовать ли приоритет при выборе донора (см. `Donor::priority`).
     use_priority: bool,
@@ -1099,7 +1236,9 @@ impl ThreadBump {
                             // Backward-заполнение идёт вниз: префетчим следующий
                             // блок (по меньшему адресу), в который будем писать.
                             let p = unsafe { self.ptr.add(off) };
-                            prefetch_write(unsafe { self.ptr.add(off.wrapping_sub(size)) });
+                            if off >= size {
+                                prefetch_write(unsafe { self.ptr.add(off - size) });
+                            }
                             return p;
                         }
                     } else if let Some(p) = self.try_borrow::<ALIGN>(size) {
@@ -1235,7 +1374,9 @@ impl ThreadBump {
                     // Сосед-Backward отдаёт с высокой стороны (растёт вниз):
                     // следующий заём — по меньшему адресу.
                     let p = unsafe { self.ptr.add(off) };
-                    prefetch_write(unsafe { self.ptr.add(off.wrapping_sub(size)) });
+                    if off >= size {
+                        prefetch_write(unsafe { self.ptr.add(off - size) });
+                    }
                     return Some(p);
                 }
             }
@@ -1258,9 +1399,10 @@ impl ThreadBump {
                 // Статичный список лежит в bump-буфере (raw ptr + len). При
                 // use_priority он уже отсортирован по возрастанию приоритета,
                 // поэтому первый подходящий донор имеет минимальный приоритет.
-                let slice = unsafe {
-                    std::slice::from_raw_parts(self.donor_static_ptr, self.donor_static_len)
-                };
+                let ptr = self
+                    .donor_static_ptr
+                    .expect("donor_static_ptr Р В·Р В°Р Т‘Р В°РЎвЂРЎвЂљРЎРѓРЎРЏ Р Т‘Р В»РЎРЏ DonorReg::Static");
+                let slice = unsafe { std::slice::from_raw_parts(ptr, self.donor_static_len) };
                 for d in slice {
                     if d.idx == self.self_index {
                         continue;
@@ -1320,12 +1462,19 @@ impl ThreadBump {
         let d = unsafe { &*self.donor_array.add(donor_idx) };
         if d.dir == BumpDir::Forward {
             let cur = d.hi.load(Ordering::Relaxed);
+            if cur + size > d.len {
+                return false;
+            }
             let off = (d.len - cur - size) & !(ALIGN - 1);
             off >= d.lo.load(Ordering::Relaxed)
         } else {
             let cur = d.lo.load(Ordering::Relaxed);
+            let hi = d.hi.load(Ordering::Relaxed);
+            if hi > d.len {
+                return false;
+            }
             let off = (cur + ALIGN - 1) & !(ALIGN - 1);
-            off + size <= d.len - d.hi.load(Ordering::Relaxed)
+            off + size <= d.len - hi
         }
     }
 
@@ -1343,9 +1492,12 @@ impl ThreadBump {
             // Донор заполняет низ [0, lo); отдаём с высокой стороны [len - hi, len).
             loop {
                 let cur = d.hi.load(Ordering::Relaxed);
+                if cur + size > d.len {
+                    return None; // Р Т‘Р С•Р Р…Р С•РЎР‚ Р С‘Р В·РЎР‚Р В°РЎРѓРЎвЂ¦Р С•Р Т‘Р С•Р Р†Р В°Р Р… РІР‚вЂќ Р Р…Р Вµ Р Т‘Р В°РЎвЂР С hi Р С—РЎР‚Р ВµР Р†РЎвЂ№РЎРѓР С‘РЎвЂљРЎРЉ len
+                }
                 let off = (d.len - cur - size) & !(ALIGN - 1);
                 if off < d.lo.load(Ordering::Relaxed) {
-                    return None; // упёрлись бы в собственные данные донора
+                    return None; // РЎС“Р С—РЎвЂРЎР‚Р В»Р С‘РЎРѓРЎРЉ Р В±РЎвЂ№ Р Р† РЎРѓР С•Р В±РЎРѓРЎвЂљР Р†Р ВµР Р…Р Р…РЎвЂ№Р Вµ Р Т‘Р В°Р Р…Р Р…РЎвЂ№Р Вµ Р Т‘Р С•Р Р…Р С•РЎР‚Р В°
                 }
                 let new_hi = d.len - off;
                 if d.hi
@@ -1354,7 +1506,9 @@ impl ThreadBump {
                 {
                     // Донор-Forward растёт вниз: следующий кусок — по меньшему адресу.
                     let p = unsafe { d.ptr.add(off) };
-                    prefetch_write(unsafe { d.ptr.add(off.wrapping_sub(size)) });
+                    if off >= size {
+                        prefetch_write(unsafe { d.ptr.add(off - size) });
+                    }
                     return Some(p);
                 }
             }
@@ -1362,9 +1516,13 @@ impl ThreadBump {
             // Донор заполняет высокую [len - hi, len); отдаём с низкой [0, lo).
             loop {
                 let cur = d.lo.load(Ordering::Relaxed);
+                let hi = d.hi.load(Ordering::Relaxed);
+                if hi > d.len {
+                    return None; // Р Т‘Р С•Р Р…Р С•РЎР‚ Р С‘Р В·РЎР‚Р В°РЎРѓРЎвЂ¦Р С•Р Т‘Р С•Р Р†Р В°Р Р… РІР‚вЂќ Р В·Р В°РЎвЂ°Р С‘РЎвЂљР В° Р С•РЎвЂљ underflow
+                }
                 let off = (cur + ALIGN - 1) & !(ALIGN - 1);
                 let end = off + size;
-                if end > d.len - d.hi.load(Ordering::Relaxed) {
+                if end > d.len - hi {
                     return None;
                 }
                 if d.lo
@@ -1552,10 +1710,653 @@ impl ThreadBump {
         // Forward: lo; Backward: hi; MiddleOut: lo (левая половина) + hi (правая).
         self.lo.load(Ordering::Relaxed) + self.hi.load(Ordering::Relaxed)
     }
+
+    // ============================================================
+    //          ARENA VEC / ARENA STRING (ВСЁ ИЗ ОДНОГО БУФЕРА)
+    // ============================================================
+    #[allow(dead_code)]
+    fn child_bump(
+        ptr: *mut u8,
+        len: usize,
+        dir: BumpDir,
+        is_huge: bool,
+        base_chunk: usize,
+    ) -> ThreadBump {
+        ThreadBump {
+            ptr,
+            len,
+            lo: AtomicUsize::new(0),
+            hi: AtomicUsize::new(0),
+            toggle: Cell::new(false),
+            dir,
+            is_huge,
+            neighbor_idx: None,
+            array: ptr::null(),
+            #[cfg(test)]
+            can_give: false,
+            self_index: 0,
+            donor_array: ptr::null(),
+            donor_reg: DonorReg::None,
+            donor_static_ptr: None,
+            donor_static_len: 0,
+            donor_bump: None,
+            use_priority: false,
+            base_chunk,
+            fallback: SpinMutex::new(FallbackChunks {
+                chunks: Vec::new(),
+                used: 0,
+            }),
+        }
+    }
+
+    /// Р С™Р С•Р Р…РЎРѓРЎвЂљРЎР‚РЎС“Р С”РЎвЂљР С•РЎР‚ Р Т‘Р С•РЎвЂЎР ВµРЎР‚Р Р…Р ВµР С–Р С• bump'Р В° Р Р† РЎР‚Р ВµР В¶Р С‘Р СР Вµ Р Т‘Р С•Р Р…Р С•РЎР‚Р С•Р Р† (Р С•Р В±РЎвЂ°Р С‘Р в„– Р Т‘Р С‘Р Р…Р В°Р СР С‘РЎвЂЎР ВµРЎРѓР С”Р С‘Р в„– РЎР‚Р ВµР ВµРЎРѓРЎвЂљРЎР‚).
+    /// `donor_array` Р Р†РЎвЂ№РЎРѓРЎвЂљР В°Р Р†Р В»РЎРЏР ВµРЎвЂљРЎРѓРЎРЏ Р Р†РЎвЂ№Р В·РЎвЂ№Р Р†Р В°РЎР‹РЎвЂ°Р С‘Р С Р СџР С›Р РЋР вЂєР вЂў РЎРѓР В±Р С•РЎР‚Р С”Р С‘ Р СР В°РЎРѓРЎРѓР С‘Р Р†Р В° (Р С‘Р Р…Р В°РЎвЂЎР Вµ Р В°Р Т‘РЎР‚Р ВµРЎРѓ
+    /// Р Р…Р ВµРЎРѓРЎвЂљР В°Р В±Р С‘Р В»Р ВµР Р… Р С‘Р В·-Р В·Р В° Р Р†Р С•Р В·Р СР С•Р В¶Р Р…Р С•Р С–Р С• Р С—Р ВµРЎР‚Р ВµР В°Р В»Р В»Р С•РЎвЂ Р С‘РЎР‚Р С•Р Р†Р В°Р Р…Р С‘РЎРЏ `Vec`).
+    #[allow(dead_code)]
+    fn child_bump_donor(
+        ptr: *mut u8,
+        len: usize,
+        dir: BumpDir,
+        is_huge: bool,
+        base_chunk: usize,
+        self_index: usize,
+        use_priority: bool,
+        donor_reg: DonorReg,
+    ) -> ThreadBump {
+        ThreadBump {
+            ptr,
+            len,
+            lo: AtomicUsize::new(0),
+            hi: AtomicUsize::new(0),
+            toggle: Cell::new(false),
+            dir,
+            is_huge,
+            neighbor_idx: None,
+            array: ptr::null(),
+            #[cfg(test)]
+            can_give: true,
+            self_index,
+            donor_array: ptr::null(),
+            donor_reg,
+            donor_static_ptr: None,
+            donor_static_len: 0,
+            donor_bump: None,
+            use_priority,
+            base_chunk,
+            fallback: SpinMutex::new(FallbackChunks {
+                chunks: Vec::new(),
+                used: 0,
+            }),
+        }
+    }
+
+    /// Р В Р В°Р В·Р Т‘Р ВµР В»Р С‘РЎвЂљРЎРЉ РЎР‚Р ВµР С–Р С‘Р С•Р Р… РЎРЊРЎвЂљР С•Р С–Р С• bump'Р В° Р Р…Р В° `n` Р Р…Р ВµР С—Р ВµРЎР‚Р ВµРЎРѓР ВµР С”Р В°РЎР‹РЎвЂ°Р С‘РЎвЂ¦РЎРѓРЎРЏ Send-Р С—Р С•Р Т‘-bump'Р С•Р Р†
+    /// (Р Р…Р В°Р С—РЎР‚Р В°Р Р†Р В»Р ВµР Р…Р С‘Р Вµ Р В·Р В°Р С—Р С•Р В»Р Р…Р ВµР Р…Р С‘РЎРЏ РЎС“ Р Р†РЎРѓР ВµРЎвЂ¦ Р С•Р Т‘Р С‘Р Р…Р В°Р С”Р С•Р Р†Р С•Р Вµ РІР‚вЂќ `dir`). Р В§Р В°РЎРѓРЎвЂљР С‘РЎвЂЎР Р…РЎвЂ№Р в„– Р С•РЎРѓРЎвЂљР В°РЎвЂљР С•Р С” Р С•РЎвЂљ
+    /// Р Т‘Р ВµР В»Р ВµР Р…Р С‘РЎРЏ Р В°Р Т‘РЎР‚Р ВµРЎРѓРЎС“Р ВµРЎвЂљРЎРѓРЎРЏ РЎР‚Р В°Р В·Р СР ВµРЎР‚Р С•Р С РЎвЂЎР В°Р Р…Р С”Р В°, Р Р†РЎвЂ№РЎР‚Р С•Р Р†Р Р…Р ВµР Р…Р Р…РЎвЂ№Р С Р С—Р С• 16 (РЎРѓР С. `split_with`).
+    #[allow(dead_code)]
+    pub fn split(&self, n: usize, dir: BumpDir) -> Vec<CachePadded<ThreadBump>> {
+        let base = self.ptr;
+        let total = self.len;
+        let chunk_size = (total / n).next_multiple_of(16);
+        (0..n)
+            .map(|i| {
+                let start = i * chunk_size;
+                let end = if i == n - 1 {
+                    total
+                } else {
+                    start + chunk_size
+                };
+                CachePadded::new(Self::child_bump(
+                    unsafe { base.add(start) },
+                    end - start,
+                    dir,
+                    self.is_huge,
+                    self.base_chunk,
+                ))
+            })
+            .collect()
+    }
+
+    /// Р В Р В°Р В·Р Т‘Р ВµР В»Р С‘РЎвЂљРЎРЉ РЎР‚Р ВµР С–Р С‘Р С•Р Р… Р С—Р С• Р В·Р В°Р Т‘Р В°Р Р…Р Р…РЎвЂ№Р С РЎР‚Р В°Р В·Р СР ВµРЎР‚Р В°Р С (Р Р† Р В±Р В°Р в„–РЎвЂљР В°РЎвЂ¦); Р С•РЎРѓРЎвЂљР В°РЎвЂљР С•Р С” Р С•РЎвЂљ РЎРѓРЎС“Р СР СРЎвЂ№
+    /// РЎР‚Р В°Р В·Р СР ВµРЎР‚Р С•Р Р† Р Т‘Р С•РЎРѓРЎвЂљР В°РЎвЂРЎвЂљРЎРѓРЎРЏ Р С—Р С•РЎРѓР В»Р ВµР Т‘Р Р…Р ВµР СРЎС“ РЎвЂЎР В°Р Р…Р С”РЎС“. Р С™Р В°Р В¶Р Т‘РЎвЂ№Р в„– РЎР‚Р В°Р В·Р СР ВµРЎР‚ Р С•Р С”РЎР‚РЎС“Р С–Р В»РЎРЏР ВµРЎвЂљРЎРѓРЎРЏ Р Р†Р Р†Р ВµРЎР‚РЎвЂ¦ Р Т‘Р С•
+    /// 16, РЎвЂЎРЎвЂљР С•Р В±РЎвЂ№ РЎРѓРЎвЂљР В°РЎР‚РЎвЂљРЎвЂ№ РЎвЂЎР В°Р Р…Р С”Р С•Р Р† Р С•РЎРѓРЎвЂљР В°Р Р†Р В°Р В»Р С‘РЎРѓРЎРЉ Р Р†РЎвЂ№РЎР‚Р С•Р Р†Р Р…Р ВµР Р…Р Р…РЎвЂ№Р СР С‘ (Tree Borrows).
+    #[allow(dead_code)]
+    pub fn split_by_sizes(&self, sizes: &[usize], dir: BumpDir) -> Vec<CachePadded<ThreadBump>> {
+        assert!(
+            sizes.len() > 0,
+            "split_by_sizes: Р С—РЎС“РЎРѓРЎвЂљР С•Р в„– РЎРѓР С—Р С‘РЎРѓР С•Р С”"
+        );
+        let base = self.ptr;
+        let total = self.len;
+        let mut children = Vec::with_capacity(sizes.len());
+        let mut start = 0usize;
+        let last = sizes.len() - 1;
+        for (i, &sz) in sizes.iter().enumerate() {
+            let step = sz.next_multiple_of(16);
+            let end = if i == last { total } else { start + step };
+            children.push(CachePadded::new(Self::child_bump(
+                unsafe { base.add(start) },
+                end - start,
+                dir,
+                self.is_huge,
+                self.base_chunk,
+            )));
+            start = end;
+        }
+        children
+    }
+
+    /// Р С™Р В°Р С” `split`, Р Р…Р С• Р С”Р В°Р В¶Р Т‘РЎвЂ№Р в„– Р Т‘Р С•РЎвЂЎР ВµРЎР‚Р Р…Р С‘Р в„– bump РЎРѓРЎвЂљР В°Р Р…Р С•Р Р†Р С‘РЎвЂљРЎРѓРЎРЏ Р Т‘Р С•Р Р…Р С•РЎР‚Р С•Р С Р Р† Р С•Р В±РЎвЂ°Р ВµР С
+    /// Р Т‘Р С‘Р Р…Р В°Р СР С‘РЎвЂЎР ВµРЎРѓР С”Р С•Р С (orx) РЎР‚Р ВµР ВµРЎРѓРЎвЂљРЎР‚Р Вµ Р С‘ РЎР‚Р ВµР С–Р С‘РЎРѓРЎвЂљРЎР‚Р С‘РЎР‚РЎС“Р ВµРЎвЂљ Р С•РЎРѓРЎвЂљР В°Р В»РЎРЉР Р…РЎвЂ№РЎвЂ¦ РІР‚вЂќ РЎвЂљ.Р Вµ. Р С—РЎР‚Р С‘
+    /// Р С—Р ВµРЎР‚Р ВµР С—Р С•Р В»Р Р…Р ВµР Р…Р С‘Р С‘ Р В·Р В°РЎвЂР С Р С‘Р Т‘РЎвЂРЎвЂљ РЎС“ Р’В«РЎРѓР С•РЎРѓР ВµР Т‘Р Р…Р С‘РЎвЂ¦Р’В» Р Т‘Р С•Р Р…Р С•РЎР‚Р С•Р Р†, Р В° Р Р…Р Вµ РЎРѓРЎР‚Р В°Р В·РЎС“ Р Р† fallback.
+    #[allow(dead_code)]
+    pub fn split_donors(&self, n: usize, dir: BumpDir) -> Vec<CachePadded<ThreadBump>> {
+        let base = self.ptr;
+        let total = self.len;
+        let chunk_size = (total / n).next_multiple_of(16);
+        let shared: Arc<OrxVec<Donor>> = Arc::new(OrxVec::new());
+        let mut children: Vec<CachePadded<ThreadBump>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let start = i * chunk_size;
+            let end = if i == n - 1 {
+                total
+            } else {
+                start + chunk_size
+            };
+            children.push(CachePadded::new(Self::child_bump_donor(
+                unsafe { base.add(start) },
+                end - start,
+                dir,
+                self.is_huge,
+                self.base_chunk,
+                i,
+                true,
+                DonorReg::Orx(shared.clone()),
+            )));
+        }
+        // Р В¤Р С‘Р С”РЎРѓР С‘РЎР‚РЎС“Р ВµР С Р В°Р Т‘РЎР‚Р ВµРЎРѓ Р СР В°РЎРѓРЎРѓР С‘Р Р†Р В° (РЎРѓРЎвЂљР В°Р В±Р С‘Р В»Р ВµР Р… Р С—Р С•РЎРѓР В»Р Вµ РЎРѓР В±Р С•РЎР‚Р С”Р С‘) Р С‘ РЎР‚Р ВµР С–Р С‘РЎРѓРЎвЂљРЎР‚Р С‘РЎР‚РЎС“Р ВµР С Р Р†РЎРѓР ВµРЎвЂ¦
+        // Р С”Р В°Р С” Р Т‘Р С•Р Р…Р С•РЎР‚Р С•Р Р† Р Т‘РЎР‚РЎС“Р С– Р Т‘Р В»РЎРЏ Р Т‘РЎР‚РЎС“Р С–Р В° (РЎвЂЎР ВµРЎР‚Р ВµР В· Р С—РЎС“Р В±Р В»Р С‘РЎвЂЎР Р…РЎвЂ№Р в„– `add_donor`).
+        let arr = children.as_ptr();
+        for (i, c) in children.iter_mut().enumerate() {
+            c.donor_array = arr;
+            c.add_donor(i, 0);
+        }
+        children
+    }
+
+    /// Р С™Р В°Р С” `split_by_sizes`, Р Р…Р С• РЎРѓ Р Т‘Р С•Р Р…Р С•РЎР‚РЎРѓР С”Р С•Р в„– РЎРѓР Р†РЎРЏР В·Р С”Р С•Р в„– (РЎРѓР С. `split_donors`).
+    #[allow(dead_code)]
+    pub fn split_donors_by_sizes(
+        &self,
+        sizes: &[usize],
+        dir: BumpDir,
+    ) -> Vec<CachePadded<ThreadBump>> {
+        assert!(
+            sizes.len() > 0,
+            "split_donors_by_sizes: Р С—РЎС“РЎРѓРЎвЂљР С•Р в„– РЎРѓР С—Р С‘РЎРѓР С•Р С”"
+        );
+        let base = self.ptr;
+        let total = self.len;
+        let shared: Arc<OrxVec<Donor>> = Arc::new(OrxVec::new());
+        let mut children: Vec<CachePadded<ThreadBump>> = Vec::with_capacity(sizes.len());
+        let mut start = 0usize;
+        let last = sizes.len() - 1;
+        for (i, &sz) in sizes.iter().enumerate() {
+            let step = sz.next_multiple_of(16);
+            let end = if i == last { total } else { start + step };
+            children.push(CachePadded::new(Self::child_bump_donor(
+                unsafe { base.add(start) },
+                end - start,
+                dir,
+                self.is_huge,
+                self.base_chunk,
+                i,
+                true,
+                DonorReg::Orx(shared.clone()),
+            )));
+            start = end;
+        }
+        let arr = children.as_ptr();
+        for (i, c) in children.iter_mut().enumerate() {
+            c.donor_array = arr;
+            c.add_donor(i, 0);
+        }
+        children
+    }
+
+    /// Р В Р В°Р В·Р Т‘Р ВµР В»Р С‘РЎвЂљРЎРЉ РЎР‚Р ВµР С–Р С‘Р С•Р Р… Р Р…Р В° `n` Р Р…Р ВµР С—Р ВµРЎР‚Р ВµРЎРѓР ВµР С”Р В°РЎР‹РЎвЂ°Р С‘РЎвЂ¦РЎРѓРЎРЏ Р СњР вЂў-Send Р В·Р С•Р Р… (`ZoneBump`).
+    #[allow(dead_code)]
+    pub fn split_local(&self, n: usize, dir: BumpDir) -> Vec<ZoneBump<'static>> {
+        let base = self.ptr;
+        let total = self.len;
+        let chunk_size = (total / n).next_multiple_of(16);
+        (0..n)
+            .map(|i| {
+                let start = i * chunk_size;
+                let end = if i == n - 1 {
+                    total
+                } else {
+                    start + chunk_size
+                };
+                Self::make_zone(
+                    unsafe { base.add(start) },
+                    end - start,
+                    dir,
+                    self.is_huge,
+                    self.base_chunk,
+                )
+            })
+            .collect()
+    }
+
+    /// Р С™Р В°Р С” `split_local`, Р Р…Р С• Р С—Р С• Р В·Р В°Р Т‘Р В°Р Р…Р Р…РЎвЂ№Р С РЎР‚Р В°Р В·Р СР ВµРЎР‚Р В°Р С.
+    #[allow(dead_code)]
+    pub fn split_local_by_sizes(&self, sizes: &[usize], dir: BumpDir) -> Vec<ZoneBump<'static>> {
+        assert!(
+            sizes.len() > 0,
+            "split_local_by_sizes: Р С—РЎС“РЎРѓРЎвЂљР С•Р в„– РЎРѓР С—Р С‘РЎРѓР С•Р С”"
+        );
+        let base = self.ptr;
+        let total = self.len;
+        let mut zones = Vec::with_capacity(sizes.len());
+        let mut start = 0usize;
+        let last = sizes.len() - 1;
+        for (i, &sz) in sizes.iter().enumerate() {
+            let step = sz.next_multiple_of(16);
+            let end = if i == last { total } else { start + step };
+            zones.push(Self::make_zone(
+                unsafe { base.add(start) },
+                end - start,
+                dir,
+                self.is_huge,
+                self.base_chunk,
+            ));
+            start = end;
+        }
+        zones
+    }
+
+    /// Р СџР С•Р С–Р В»Р С•РЎвЂљР С‘РЎвЂљРЎРЉ РЎРЊРЎвЂљР С•РЎвЂљ bump Р С”Р В°Р С” `ZoneBump` (Р С•Р Т‘Р Р…Р С•Р С—Р С•РЎвЂљР С•РЎвЂЎР Р…РЎвЂ№Р в„– Р Р†Р В»Р В°Р Т‘Р ВµР В»Р ВµРЎвЂ ). Р СћРЎР‚Р ВµР В±РЎС“Р ВµРЎвЂљ,
+    /// РЎвЂЎРЎвЂљР С•Р В±РЎвЂ№ bump Р В±РЎвЂ№Р В» Р С‘Р В·Р С•Р В»Р С‘РЎР‚Р С•Р Р†Р В°Р Р… (Р В±Р ВµР В· РЎРѓР С•РЎРѓР ВµР Т‘Р В° Р С‘ Р Т‘Р С•Р Р…Р С•РЎР‚Р С•Р Р†). Fallback-РЎвЂЎР В°Р Р…Р С”Р С‘
+    /// Р С—Р ВµРЎР‚Р ВµР Р…Р С•РЎРѓРЎРЏРЎвЂљРЎРѓРЎРЏ Р С‘Р В· bump'Р В° Р Р† Р В·Р С•Р Р…РЎС“ (Р С‘РЎвЂ¦ Р С•РЎРѓР Р†Р С•Р В±Р С•Р В¶Р Т‘Р ВµР Р…Р С‘Р Вµ РІР‚вЂќ Р Р† `Drop` Р В·Р С•Р Р…РЎвЂ№).
+    #[allow(dead_code)]
+    pub fn into_zone(self) -> ZoneBump<'static> {
+        assert!(
+            self.neighbor_idx.is_none(),
+            "into_zone: bump Р Р† РЎР‚Р ВµР В¶Р С‘Р СР Вµ Р С—Р В°РЎР‚РЎвЂ№ Р Р…Р ВµР В»РЎРЉР В·РЎРЏ Р С”Р С•Р Р…Р Р†Р ВµРЎР‚РЎвЂљР С‘РЎР‚Р С•Р Р†Р В°РЎвЂљРЎРЉ"
+        );
+        assert!(
+            matches!(self.donor_reg, DonorReg::None),
+            "into_zone: bump Р Р† РЎР‚Р ВµР В¶Р С‘Р СР Вµ Р Т‘Р С•Р Р…Р С•РЎР‚Р С•Р Р† Р Р…Р ВµР В»РЎРЉР В·РЎРЏ Р С”Р С•Р Р…Р Р†Р ВµРЎР‚РЎвЂљР С‘РЎР‚Р С•Р Р†Р В°РЎвЂљРЎРЉ"
+        );
+        let ptr = self.ptr;
+        let len = self.len;
+        let dir = self.dir;
+        let is_huge = self.is_huge;
+        let base_chunk = self.base_chunk;
+        let lo = self.lo.load(Ordering::Relaxed);
+        let hi = self.hi.load(Ordering::Relaxed);
+        let toggle = self.toggle.get();
+        let fallback = unsafe {
+            // Р вЂ™РЎвЂ№РЎвЂљР В°РЎРѓР С”Р С‘Р Р†Р В°Р ВµР С fallback Р С‘Р В· РЎвЂљР С‘Р С—Р В° РЎРѓ Drop (Р С‘Р Р…Р В°РЎвЂЎР Вµ Р С•Р Р… РЎРѓР В°Р С Р В±РЎвЂ№ Р ВµР С–Р С• Р С•РЎРѓР Р†Р С•Р В±Р С•Р Т‘Р С‘Р В»).
+            let me = std::mem::ManuallyDrop::new(self);
+            core::ptr::read(&me.fallback)
+        };
+        let zone = ZoneData {
+            ptr,
+            len,
+            lo: Cell::new(lo),
+            hi: Cell::new(hi),
+            toggle: Cell::new(toggle),
+            dir,
+            is_huge,
+            base_chunk,
+            fallback,
+        };
+        ZoneBump {
+            inner: Rc::new(zone),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Р вЂќР В»РЎРЏ `ZoneBump`: РЎРѓР С•Р В±РЎР‚Р В°РЎвЂљРЎРЉ Р В·Р С•Р Р…РЎС“ Р Р†Р С•Р С”РЎР‚РЎС“Р С– РЎС“Р С”Р В°Р В·Р В°Р Р…Р Р…Р С•Р С–Р С• РЎР‚Р ВµР С–Р С‘Р С•Р Р…Р В° (Р С‘РЎРѓР С—Р С•Р В»РЎРЉР В·РЎС“Р ВµРЎвЂљРЎРѓРЎРЏ
+    /// `split_local*`). Р В Р В°Р В·Р СР ВµРЎвЂ°РЎвЂР Р… Р С”Р В°Р С” Р В°РЎРѓРЎРѓР С•РЎвЂ Р С‘Р С‘РЎР‚Р С•Р Р†Р В°Р Р…Р Р…Р В°РЎРЏ РЎвЂћРЎС“Р Р…Р С”РЎвЂ Р С‘РЎРЏ ThreadBump, Р Р…Р С•
+    /// Р Т‘Р ВµР В»Р ВµР С–Р С‘РЎР‚РЎС“Р ВµРЎвЂљ Р С”Р С•Р Р…РЎРѓРЎвЂљРЎР‚РЎС“Р С”РЎвЂљР С•РЎР‚РЎС“ Р В·Р С•Р Р…РЎвЂ№.
+    #[allow(dead_code)]
+    fn make_zone(
+        ptr: *mut u8,
+        len: usize,
+        dir: BumpDir,
+        is_huge: bool,
+        base_chunk: usize,
+    ) -> ZoneBump<'static> {
+        ZoneBump::from_region(ptr, len, dir, is_huge, base_chunk)
+    }
+
+    /// Р С›Р В±РЎР‚Р В°РЎвЂљР Р…Р В°РЎРЏ Р С” `into_zone` РЎРѓР В±Р С•РЎР‚Р С”Р В° `ThreadBump` Р С‘Р В· `ZoneData` (Р С‘РЎРѓР С—Р С•Р В»РЎРЉР В·РЎС“Р ВµРЎвЂљРЎРѓРЎРЏ
+    /// `ZoneBump::into_thread`). Р РЋРЎвЂЎРЎвЂРЎвЂљРЎвЂЎР С‘Р С”Р С‘ Р С‘ fallback Р С—Р ВµРЎР‚Р ВµР Р…Р С•РЎРѓРЎРЏРЎвЂљРЎРѓРЎРЏ Р С‘Р В· Р В·Р С•Р Р…РЎвЂ№.
+    #[allow(dead_code)]
+    fn restore_from_zone(z: ZoneData) -> ThreadBump {
+        let z = std::mem::ManuallyDrop::new(z);
+        let fallback = unsafe { core::ptr::read(&z.fallback) };
+        ThreadBump {
+            ptr: z.ptr,
+            len: z.len,
+            lo: AtomicUsize::new(z.lo.get()),
+            hi: AtomicUsize::new(z.hi.get()),
+            toggle: Cell::new(z.toggle.get()),
+            dir: z.dir,
+            is_huge: z.is_huge,
+            neighbor_idx: None,
+            array: ptr::null(),
+            #[cfg(test)]
+            can_give: false,
+            self_index: 0,
+            donor_array: ptr::null(),
+            donor_reg: DonorReg::None,
+            donor_static_ptr: None,
+            donor_static_len: 0,
+            donor_bump: None,
+            use_priority: false,
+            base_chunk: z.base_chunk,
+            fallback,
+        }
+    }
 }
 
 // ============================================================
-//          ARENA VEC / ARENA STRING (ВСЁ ИЗ ОДНОГО БУФЕРА)
+//       ZONE BUMP (Р С›Р вЂќР СњР С›Р СџР С›Р СћР С›Р В§Р СњР С’Р Р‡, Р СњР вЂў-Send Р вЂ”Р С›Р СњР С’ Р вЂ™Р СњР Р€Р СћР В Р В AREN)
+// ============================================================
+// `ZoneBump` РІР‚вЂќ РЎРЊРЎвЂљР С• Р’В«Р В·Р С•Р Р…Р В°Р’В» Р С‘Р В· РЎР‚Р ВµР С–Р С‘Р С•Р Р…Р В° Р В°РЎР‚Р ВµР Р…РЎвЂ№, Р С”Р С•РЎвЂљР С•РЎР‚Р С•Р в„– Р Р†Р В»Р В°Р Т‘Р ВµР ВµРЎвЂљ РЎР‚Р С•Р Р†Р Р…Р С• Р С•Р Т‘Р С‘Р Р… Р С—Р С•РЎвЂљР С•Р С”.
+// Р вЂ™Р Р…РЎС“РЎвЂљРЎР‚Р ВµР Р…Р Р…Р С•РЎРѓРЎвЂљР С‘ Р В¶Р С‘Р Р†РЎС“РЎвЂљ Р Р† `Rc<ZoneData>`, Р С—Р С•РЎРЊРЎвЂљР С•Р СРЎС“ РЎвЂљР С‘Р С— Р С—Р С• РЎРѓР Р†Р С•Р ВµР в„– Р С—РЎР‚Р С‘РЎР‚Р С•Р Т‘Р Вµ `!Send` Р С‘
+// `!Sync` (Р Р† Р С•РЎвЂљР В»Р С‘РЎвЂЎР С‘Р Вµ Р С•РЎвЂљ `ThreadBump`, Р С–Р Т‘Р Вµ `unsafe impl Send`). Р РЋРЎвЂЎРЎвЂРЎвЂљРЎвЂЎР С‘Р С”Р С‘ РІР‚вЂќ Р Р†
+// `Cell`: Р Р…Р С‘Р С”Р В°Р С”Р С•Р С–Р С• Р В°РЎвЂљР С•Р СР В°РЎР‚Р Р…Р С•Р С–Р С• Р Т‘Р С•РЎРѓРЎвЂљРЎС“Р С—Р В° Р Р…Р ВµРЎвЂљ, Р Р†РЎРѓРЎвЂ РЎвЂЎР С‘РЎРѓРЎвЂљР С• Р В»Р С•Р С”Р В°Р В»РЎРЉР Р…Р С•Р Вµ. Р С›РЎвЂљР В»Р С‘РЎвЂЎР В°Р ВµРЎвЂљРЎРѓРЎРЏ Р С•РЎвЂљ
+// `ThreadBump` РЎвЂљР ВµР С, РЎвЂЎРЎвЂљР С• Р Р…Р Вµ РЎС“РЎвЂЎР В°РЎРѓРЎвЂљР Р†РЎС“Р ВµРЎвЂљ Р Р† Р С—Р В°РЎР‚Р В°РЎвЂ¦/Р Т‘Р С•Р Р…Р С•РЎР‚Р В°РЎвЂ¦ Р С‘ Р С•РЎвЂљР Т‘Р В°РЎвЂРЎвЂљ РЎР‚Р ВµР С–Р С‘Р С•Р Р… Р С•Р В±РЎР‚Р В°РЎвЂљР Р…Р С•
+// Р Р† Р Р†Р С‘Р Т‘Р Вµ `ThreadBump` РЎвЂЎР ВµРЎР‚Р ВµР В· `into_thread`.
+
+struct ZoneData {
+    ptr: *mut u8,
+    len: usize,
+    lo: Cell<usize>,
+    hi: Cell<usize>,
+    toggle: Cell<bool>,
+    dir: BumpDir,
+    is_huge: bool,
+    base_chunk: usize,
+    fallback: SpinMutex<FallbackChunks>,
+}
+
+impl Drop for ZoneData {
+    fn drop(&mut self) {
+        // Р В Р ВµР С–Р С‘Р С•Р Р… Р В°РЎР‚Р ВµР Р…РЎвЂ№ Р С•РЎРѓР Р†Р С•Р В±Р С•Р В¶Р Т‘Р В°Р ВµРЎвЂљ Р Р†Р В»Р В°Р Т‘Р ВµР В»Р ВµРЎвЂ ; Р В·Р Т‘Р ВµРЎРѓРЎРЉ РІР‚вЂќ РЎвЂљР С•Р В»РЎРЉР С”Р С• fallback-РЎвЂЎР В°Р Р…Р С”Р С‘.
+        let mut fb = self.fallback.lock();
+        for a in fb.chunks.drain(..) {
+            platform::free(a);
+        }
+    }
+}
+
+pub struct ZoneBump<'a> {
+    inner: Rc<ZoneData>,
+    // `&'a ()` РІР‚вЂќ Р Р…Р С•РЎРѓР С‘Р С РЎвЂљР С•Р В»РЎРЉР С”Р С• Р Т‘Р В»РЎРЏ РЎРѓРЎР‚Р С•Р С”Р С•Р Р† Р В¶Р С‘Р В·Р Р…Р С‘; `Rc` РЎС“Р В¶Р Вµ Р Т‘Р ВµР В»Р В°Р ВµРЎвЂљ РЎвЂљР С‘Р С— !Send/!Sync.
+    _marker: PhantomData<&'a ()>,
+}
+
+impl ZoneBump<'static> {
+    /// Р РЋР С•Р В±РЎР‚Р В°РЎвЂљРЎРЉ Р В·Р С•Р Р…РЎС“ Р Р†Р С•Р С”РЎР‚РЎС“Р С– РЎС“Р С”Р В°Р В·Р В°Р Р…Р Р…Р С•Р С–Р С• (Р В·Р В°РЎР‚Р В°Р Р…Р ВµР Вµ Р Р†РЎвЂ№РЎР‚Р С•Р Р†Р Р…Р ВµР Р…Р Р…Р С•Р С–Р С•) РЎР‚Р ВµР С–Р С‘Р С•Р Р…Р В°.
+    #[allow(dead_code)]
+    fn from_region(
+        ptr: *mut u8,
+        len: usize,
+        dir: BumpDir,
+        is_huge: bool,
+        base_chunk: usize,
+    ) -> ZoneBump<'static> {
+        ZoneBump {
+            inner: Rc::new(ZoneData {
+                ptr,
+                len,
+                lo: Cell::new(0),
+                hi: Cell::new(0),
+                toggle: Cell::new(false),
+                dir,
+                is_huge,
+                base_chunk,
+                fallback: SpinMutex::new(FallbackChunks {
+                    chunks: Vec::new(),
+                    used: 0,
+                }),
+            }),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Р СњР В°Р С—РЎР‚Р В°Р Р†Р В»Р ВµР Р…Р С‘Р Вµ Р В·Р В°Р С—Р С•Р В»Р Р…Р ВµР Р…Р С‘РЎРЏ РЎРЊРЎвЂљР С•Р в„– Р В·Р С•Р Р…РЎвЂ№.
+    #[allow(dead_code)]
+    pub fn dir(&self) -> BumpDir {
+        self.inner.dir
+    }
+
+    /// Р вЂР В°Р в„–РЎвЂљ, Р Р†РЎвЂ№Р Т‘Р ВµР В»Р ВµР Р…Р Р…РЎвЂ№Р в„– Р С‘Р В· РЎРѓР С•Р В±РЎРѓРЎвЂљР Р†Р ВµР Р…Р Р…Р С•Р С–Р С• РЎР‚Р ВµР С–Р С‘Р С•Р Р…Р В° Р В·Р С•Р Р…РЎвЂ№ (Р В±Р ВµР В· fallback).
+    #[allow(dead_code)]
+    pub fn allocated_bytes(&self) -> usize {
+        self.inner.lo.get() + self.inner.hi.get()
+    }
+
+    /// Р РЋР В±РЎР‚Р С•РЎРѓР С‘РЎвЂљРЎРЉ РЎРѓРЎвЂЎРЎвЂРЎвЂљРЎвЂЎР С‘Р С”Р С‘ Р В·Р С•Р Р…РЎвЂ№ (РЎР‚Р ВµР С–Р С‘Р С•Р Р… Р С—Р ВµРЎР‚Р ВµР С‘РЎРѓР С—Р С•Р В»РЎРЉР В·РЎС“Р ВµРЎвЂљРЎРѓРЎРЏ РЎРѓ Р Р…РЎС“Р В»РЎРЏ). Р СњР Вµ РЎвЂљРЎР‚Р С•Р С–Р В°Р ВµРЎвЂљ
+    /// РЎС“Р В¶Р Вµ Р Р†РЎвЂ№Р Т‘Р ВµР В»Р ВµР Р…Р Р…РЎвЂ№Р Вµ fallback-РЎвЂЎР В°Р Р…Р С”Р С‘.
+    #[allow(dead_code)]
+    pub fn reset(&self) {
+        self.inner.lo.set(0);
+        self.inner.hi.set(0);
+        self.inner.toggle.set(false);
+    }
+
+    /// Р С›Р Т‘Р Р…Р С•Р С—Р С•РЎвЂљР С•РЎвЂЎР Р…Р В°РЎРЏ bump-Р В°Р В»Р В»Р С•Р С”Р В°РЎвЂ Р С‘РЎРЏ Р С‘Р В· РЎР‚Р ВµР С–Р С‘Р С•Р Р…Р В° Р В·Р С•Р Р…РЎвЂ№. Р СџРЎР‚Р С‘ Р С‘РЎРѓРЎвЂЎР ВµРЎР‚Р С—Р В°Р Р…Р С‘Р С‘ РЎР‚Р ВµР С–Р С‘Р С•Р Р…Р В°
+    /// Р Р†РЎвЂ№Р Т‘Р ВµР В»РЎРЏР ВµРЎвЂљРЎРѓРЎРЏ Р Р…Р С•Р Р†РЎвЂ№Р в„– РЎвЂЎР В°Р Р…Р С” Р’В«Р С–Р Т‘Р Вµ-РЎвЂљР С• Р Р† Р С—Р В°Р СРЎРЏРЎвЂљР С‘Р’В» (Р С”Р В°Р С” `grow_fallback`).
+    #[allow(dead_code)]
+    pub fn alloc<const ALIGN: usize>(&self, size: usize) -> *mut u8 {
+        let d = &self.inner;
+        let (off, new_lo, new_hi, pf) = match d.dir {
+            BumpDir::Forward => {
+                let cur = d.lo.get();
+                let off = (cur + ALIGN - 1) & !(ALIGN - 1);
+                let end = off + size;
+                if end <= d.len {
+                    let pf = unsafe { d.ptr.add(off + size) };
+                    (off, end, d.hi.get(), pf)
+                } else {
+                    return self.grow_fallback(size);
+                }
+            }
+            BumpDir::Backward => {
+                let cur = d.hi.get();
+                let off = (d.len - cur - size) & !(ALIGN - 1);
+                if off >= size {
+                    let new_hi = d.len - off;
+                    let pf = unsafe { d.ptr.add(off - size) };
+                    (off, d.lo.get(), new_hi, pf)
+                } else {
+                    return self.grow_fallback(size);
+                }
+            }
+            BumpDir::MiddleOut => {
+                let mid = d.len / 2;
+                let side = d.toggle.get();
+                d.toggle.set(!side);
+                if !side {
+                    let base = mid - d.lo.get();
+                    if size <= base {
+                        let off = (base - size) & !(ALIGN - 1);
+                        let new_lo = mid - off;
+                        let pf = unsafe { d.ptr.add(mid + d.hi.get() + size) };
+                        (off, new_lo, d.hi.get(), pf)
+                    } else {
+                        return self.grow_fallback(size);
+                    }
+                } else {
+                    let base = mid + d.hi.get();
+                    let off = (base + ALIGN - 1) & !(ALIGN - 1);
+                    let end = off + size;
+                    if end <= d.len {
+                        let new_hi = off + size - mid;
+                        let pf = unsafe { d.ptr.add(mid - d.lo.get() - size) };
+                        (off, d.lo.get(), new_hi, pf)
+                    } else {
+                        return self.grow_fallback(size);
+                    }
+                }
+            }
+        };
+        d.lo.set(new_lo);
+        d.hi.set(new_hi);
+        let p = unsafe { d.ptr.add(off) };
+        prefetch_write(pf);
+        p
+    }
+
+    /// Р вЂ™РЎвЂ№Р Т‘Р ВµР В»Р С‘РЎвЂљРЎРЉ Р В±Р В»Р С•Р С” Р С‘Р В· Р Р…Р С•Р Р†Р С•Р С–Р С• РЎвЂЎР В°Р Р…Р С”Р В° Р’В«Р С–Р Т‘Р Вµ-РЎвЂљР С• Р Р† Р С—Р В°Р СРЎРЏРЎвЂљР С‘Р’В» (Р В°Р Р…Р В°Р В»Р С•Р С–
+    /// `ThreadBump::grow_fallback`); РЎвЂЎР В°Р Р…Р С” РЎРѓР С•РЎвЂ¦РЎР‚Р В°Р Р…РЎРЏР ВµРЎвЂљРЎРѓРЎРЏ Р Р† Р В·Р С•Р Р…Р Вµ Р С‘ Р С•РЎРѓР Р†Р С•Р В±Р С•Р В¶Р Т‘Р В°Р ВµРЎвЂљРЎРѓРЎРЏ Р Р†
+    /// Р ВµРЎвЂ `Drop`.
+    fn grow_fallback(&self, size: usize) -> *mut u8 {
+        let d = &self.inner;
+        let page = platform::page_size();
+        let need = (size + 15) & !15;
+        let mut fb = d.fallback.lock();
+        let full = match fb.chunks.last() {
+            Some(c) => fb.used + need > c.size,
+            None => true,
+        };
+        if full {
+            let alloc_size = need.max(d.base_chunk).next_multiple_of(page);
+            fb.chunks.push(platform::alloc_normal(alloc_size));
+            fb.used = 0;
+        }
+        let chunk = fb.chunks.last().unwrap();
+        let off = (fb.used + 15) & !15;
+        let ptr = unsafe { chunk.ptr.add(off) };
+        prefetch_write(unsafe { chunk.ptr.add(off + size) });
+        fb.used = off + size;
+        ptr
+    }
+
+    /// Р В Р В°Р В·Р Т‘Р ВµР В»Р С‘РЎвЂљРЎРЉ РЎР‚Р ВµР С–Р С‘Р С•Р Р… Р В·Р С•Р Р…РЎвЂ№ Р Р…Р В° `n` Р Р…Р ВµР С—Р ВµРЎР‚Р ВµРЎРѓР ВµР С”Р В°РЎР‹РЎвЂ°Р С‘РЎвЂ¦РЎРѓРЎРЏ РЎРѓРЎС“Р В±-Р В·Р С•Р Р… (Р Р†РЎРѓР Вµ `!Send`).
+    #[allow(dead_code)]
+    pub fn split(&self, n: usize) -> Vec<ZoneBump<'static>> {
+        let d = &self.inner;
+        let total = d.len;
+        let chunk_size = (total / n).next_multiple_of(16);
+        (0..n)
+            .map(|i| {
+                let start = i * chunk_size;
+                let end = if i == n - 1 {
+                    total
+                } else {
+                    start + chunk_size
+                };
+                ZoneBump::from_region(
+                    unsafe { d.ptr.add(start) },
+                    end - start,
+                    d.dir,
+                    d.is_huge,
+                    d.base_chunk,
+                )
+            })
+            .collect()
+    }
+
+    /// Р В Р В°Р В·Р Т‘Р ВµР В»Р С‘РЎвЂљРЎРЉ РЎР‚Р ВµР С–Р С‘Р С•Р Р… Р В·Р С•Р Р…РЎвЂ№ Р С—Р С• Р В·Р В°Р Т‘Р В°Р Р…Р Р…РЎвЂ№Р С РЎР‚Р В°Р В·Р СР ВµРЎР‚Р В°Р С (Р С•РЎРѓРЎвЂљР В°РЎвЂљР С•Р С” РІР‚вЂќ Р С—Р С•РЎРѓР В»Р ВµР Т‘Р Р…Р ВµР в„– Р В·Р С•Р Р…Р Вµ).
+    #[allow(dead_code)]
+    pub fn split_by_sizes(&self, sizes: &[usize]) -> Vec<ZoneBump<'static>> {
+        assert!(
+            sizes.len() > 0,
+            "split_by_sizes: Р С—РЎС“РЎРѓРЎвЂљР С•Р в„– РЎРѓР С—Р С‘РЎРѓР С•Р С”"
+        );
+        let d = &self.inner;
+        let total = d.len;
+        let mut zones = Vec::with_capacity(sizes.len());
+        let mut start = 0usize;
+        let last = sizes.len() - 1;
+        for (i, &sz) in sizes.iter().enumerate() {
+            let step = sz.next_multiple_of(16);
+            let end = if i == last { total } else { start + step };
+            zones.push(ZoneBump::from_region(
+                unsafe { d.ptr.add(start) },
+                end - start,
+                d.dir,
+                d.is_huge,
+                d.base_chunk,
+            ));
+            start = end;
+        }
+        zones
+    }
+
+    /// Р В Р В°Р В·Р Т‘Р ВµР В»Р С‘РЎвЂљРЎРЉ РЎР‚Р ВµР С–Р С‘Р С•Р Р… Р В·Р С•Р Р…РЎвЂ№ Р Р…Р В° `n` Send-`ThreadBump` (Р С—Р С•Р В»Р ВµР В·Р Р…Р С• Р С•РЎвЂљР Т‘Р В°РЎвЂљРЎРЉ Р С—Р С•РЎвЂљР С•Р С”Р В°Р С).
+    #[allow(private_interfaces)]
+    pub fn split_into_threads(&self, n: usize) -> Vec<CachePadded<ThreadBump>> {
+        let d = &self.inner;
+        let total = d.len;
+        let chunk_size = (total / n).next_multiple_of(16);
+        (0..n)
+            .map(|i| {
+                let start = i * chunk_size;
+                let end = if i == n - 1 {
+                    total
+                } else {
+                    start + chunk_size
+                };
+                CachePadded::new(ThreadBump::child_bump(
+                    unsafe { d.ptr.add(start) },
+                    end - start,
+                    d.dir,
+                    d.is_huge,
+                    d.base_chunk,
+                ))
+            })
+            .collect()
+    }
+
+    /// Р В Р В°Р В·Р Т‘Р ВµР В»Р С‘РЎвЂљРЎРЉ РЎР‚Р ВµР С–Р С‘Р С•Р Р… Р В·Р С•Р Р…РЎвЂ№ Р Р…Р В° Send-`ThreadBump` Р С—Р С• Р В·Р В°Р Т‘Р В°Р Р…Р Р…РЎвЂ№Р С РЎР‚Р В°Р В·Р СР ВµРЎР‚Р В°Р С.
+    #[allow(private_interfaces)]
+    pub fn split_into_threads_by_sizes(&self, sizes: &[usize]) -> Vec<CachePadded<ThreadBump>> {
+        assert!(
+            sizes.len() > 0,
+            "split_into_threads_by_sizes: Р С—РЎС“РЎРѓРЎвЂљР С•Р в„– РЎРѓР С—Р С‘РЎРѓР С•Р С”"
+        );
+        let d = &self.inner;
+        let total = d.len;
+        let mut out = Vec::with_capacity(sizes.len());
+        let mut start = 0usize;
+        let last = sizes.len() - 1;
+        for (i, &sz) in sizes.iter().enumerate() {
+            let step = sz.next_multiple_of(16);
+            let end = if i == last { total } else { start + step };
+            out.push(CachePadded::new(ThreadBump::child_bump(
+                unsafe { d.ptr.add(start) },
+                end - start,
+                d.dir,
+                d.is_huge,
+                d.base_chunk,
+            )));
+            start = end;
+        }
+        out
+    }
+
+    /// Р СџР С•Р С–Р В»Р С•РЎвЂљР С‘РЎвЂљРЎРЉ Р В·Р С•Р Р…РЎС“ Р С”Р В°Р С” `ThreadBump`. Р СџР В°Р Р…Р С‘Р С”РЎС“Р ВµРЎвЂљ, Р ВµРЎРѓР В»Р С‘ РЎС“ Р В·Р С•Р Р…РЎвЂ№ Р ВµРЎРѓРЎвЂљРЎРЉ Р В¶Р С‘Р Р†РЎвЂ№Р Вµ
+    /// Р С”Р В»Р С•Р Р…РЎвЂ№ (`Rc::try_unwrap` Р Р…Р Вµ РЎС“Р Т‘Р В°Р В»РЎРѓРЎРЏ) РІР‚вЂќ РЎвЂљ.Р Вµ. Р ВµРЎРѓР В»Р С‘ Р Р…Р В° РЎвЂљРЎС“ Р В¶Р Вµ Р С—Р В°Р СРЎРЏРЎвЂљРЎРЉ Р Р†РЎРѓРЎвЂ Р ВµРЎвЂ°РЎвЂ
+    /// РЎРѓРЎРѓРЎвЂ№Р В»Р В°РЎР‹РЎвЂљРЎРѓРЎРЏ Р Т‘РЎР‚РЎС“Р С–Р С‘Р Вµ `ZoneBump`.
+    #[allow(private_interfaces)]
+    pub fn into_thread(self) -> CachePadded<ThreadBump> {
+        let data = Rc::try_unwrap(self.inner)
+            .unwrap_or_else(|_| panic!("into_thread: РЎС“ Р В·Р С•Р Р…РЎвЂ№ Р ВµРЎРѓРЎвЂљРЎРЉ Р В¶Р С‘Р Р†РЎвЂ№Р Вµ Р С”Р В»Р С•Р Р…РЎвЂ№"));
+        CachePadded::new(ThreadBump::restore_from_zone(data))
+    }
+}
+
+// ============================================================
+//          ARENA VEC / ARENA STRING (Р вЂ™Р РЋР Рѓ Р ВР вЂ” Р С›Р вЂќР СњР С›Р вЂњР С› Р вЂР Р€Р В¤Р вЂўР В Р С’)
 // ============================================================
 
 struct ArenaVec<T> {
@@ -1751,8 +2552,8 @@ pub fn bump_scope_m(chunk_size: usize, smt: bool) {
                         }
                     }
                     core::hint::black_box(&vectr);
-                    drop(vectr); // <-- явно дропаем vectr
-                    bump.reset(); // теперь можно сбросить
+                    drop(vectr); // <-- РЎРЏР Р†Р Р…Р С• Р Т‘РЎР‚Р С•Р С—Р В°Р ВµР С vectr
+                    bump.reset(); // РЎвЂљР ВµР С—Р ВµРЎР‚РЎРЉ Р СР С•Р В¶Р Р…Р С• РЎРѓР В±РЎР‚Р С•РЎРѓР С‘РЎвЂљРЎРЉ
                 }
             });
         }
@@ -1892,23 +2693,25 @@ fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
         println!("[TOTAL CAPACITY]:  {}", total_capacity);
     }
     let arena = SharedArena::new(total_capacity);
-    let bumps = match layout {
-        ArenaLayout::Uniform(dir) => arena.split_with(core_ids.len(), dir),
-        ArenaLayout::Neighbors => arena.split_alternating(core_ids.len()),
-        ArenaLayout::Pair => arena.split_paired(core_ids.len()),
-        ArenaLayout::Donors => arena.split_donors_with(core_ids.len(), DonorPolicy::static_(4)),
-        ArenaLayout::DonorsPrio => {
-            arena.split_donors_with(core_ids.len(), DonorPolicy::static_(4).with_priority())
+    let bumps: Split<'_> = match layout {
+        ArenaLayout::Uniform(dir) => arena.split_with_safe(core_ids.len(), dir),
+        ArenaLayout::Neighbors => arena.split_alternating_safe(core_ids.len()),
+        ArenaLayout::Pair => arena.split_paired_safe(core_ids.len()),
+        ArenaLayout::Donors => {
+            arena.split_donors_with_safe(core_ids.len(), DonorPolicy::static_(4))
         }
-        ArenaLayout::DonorsOrx => arena.split_donors_with(core_ids.len(), DonorPolicy::orx(4)),
+        ArenaLayout::DonorsPrio => {
+            arena.split_donors_with_safe(core_ids.len(), DonorPolicy::static_(4).with_priority())
+        }
+        ArenaLayout::DonorsOrx => arena.split_donors_with_safe(core_ids.len(), DonorPolicy::orx(4)),
         ArenaLayout::DonorsOrxPrio => {
-            arena.split_donors_with(core_ids.len(), DonorPolicy::orx(4).with_priority())
+            arena.split_donors_with_safe(core_ids.len(), DonorPolicy::orx(4).with_priority())
         }
         ArenaLayout::DonorsBoxcar => {
-            arena.split_donors_with(core_ids.len(), DonorPolicy::boxcar(4))
+            arena.split_donors_with_safe(core_ids.len(), DonorPolicy::boxcar(4))
         }
         ArenaLayout::DonorsBoxcarPrio => {
-            arena.split_donors_with(core_ids.len(), DonorPolicy::boxcar(4).with_priority())
+            arena.split_donors_with_safe(core_ids.len(), DonorPolicy::boxcar(4).with_priority())
         }
     };
 
@@ -1930,7 +2733,7 @@ fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
             s.spawn(move || {
                 core_affinity::set_for_current(core);
                 hotpath::measure_block!("prefault", {
-                    bump.prefault_local(); // first-touch в локальной NUMA-ноде
+                    bump.prefault_local(); // first-touch Р Р† Р В»Р С•Р С”Р В°Р В»РЎРЉР Р…Р С•Р в„– NUMA-Р Р…Р С•Р Т‘Р Вµ
                 });
                 for _ in 0..3 {
                     hotpath::measure_block!("alloc", {
@@ -2109,7 +2912,7 @@ pub fn profile_bump_chunk_size_light() -> usize {
 
 pub fn profile_arena_chunk_size_full() -> usize {
     let arena = SharedArena::new(1024 * 1024 * 1024);
-    let bumps = arena.split(1);
+    let bumps = arena.split_safe(1);
     let bump = &bumps[0];
 
     let mut vectr: ArenaVec<ArenaVec<ArenaString>> = ArenaVec::with_capacity_in::<
@@ -2137,7 +2940,7 @@ pub fn profile_arena_chunk_size_full() -> usize {
 
 pub fn profile_arena_chunk_size_light() -> usize {
     let arena = SharedArena::new(512 * 1024 * 1024);
-    let bumps = arena.split(1);
+    let bumps = arena.split_safe(1);
     let bump = &bumps[0];
 
     let mut vectr: ArenaVec<ArenaVec<ArenaString>> = ArenaVec::with_capacity_in::<
@@ -2196,8 +2999,14 @@ fn median(times: &[u128]) -> u128 {
 #[hotpath::main]
 pub fn run() {
     let all_cores = core_affinity::get_core_ids().unwrap();
-    println!("Логических ядер: {}", all_cores.len());
-    println!("Физических ядер: {}", num_cpus::get_physical());
+    println!(
+        "Р вЂєР С•Р С–Р С‘РЎвЂЎР ВµРЎРѓР С”Р С‘РЎвЂ¦ РЎРЏР Т‘Р ВµРЎР‚: {}",
+        all_cores.len()
+    );
+    println!(
+        "Р В¤Р С‘Р В·Р С‘РЎвЂЎР ВµРЎРѓР С”Р С‘РЎвЂ¦ РЎРЏР Т‘Р ВµРЎР‚: {}",
+        num_cpus::get_physical()
+    );
     println!();
 
     // PGO для bumpalo
@@ -2240,12 +3049,12 @@ pub fn run() {
 /// Между пачками делается reset(), чтобы одиночные bump'ы не ушли в OOM-панику.
 pub fn pgo_train() {
     const BATCH: u32 = 20_000;
-    const ROUNDS: u32 = 10; // ~200k аллокаций на каждый режим
+    const ROUNDS: u32 = 10; // ~200k Р В°Р В»Р В»Р С•Р С”Р В°РЎвЂ Р С‘Р в„– Р Р…Р В° Р С”Р В°Р В¶Р Т‘РЎвЂ№Р в„– РЎР‚Р ВµР В¶Р С‘Р С
 
     // Forward / Backward / MiddleOut на одном bump.
     for &dir in &[BumpDir::Forward, BumpDir::Backward, BumpDir::MiddleOut] {
         let arena = SharedArena::new(8 * 1024 * 1024);
-        let mut v = arena.split_with(1, dir);
+        let v = arena.split_with_safe(1, dir);
         let b = &v[0];
         for _ in 0..ROUNDS {
             for _ in 0..BATCH {
@@ -2264,7 +3073,7 @@ pub fn pgo_train() {
     // Neighbors (alternating directions).
     {
         let arena = SharedArena::new(8 * 1024 * 1024);
-        let bumps = arena.split_alternating(2);
+        let bumps = arena.split_alternating_safe(2);
         let (a, c) = (&bumps[0], &bumps[1]);
         for _ in 0..ROUNDS {
             for _ in 0..BATCH {
@@ -2279,7 +3088,7 @@ pub fn pgo_train() {
     // Pair (shared combined region).
     {
         let arena = SharedArena::new(16 * 1024 * 1024);
-        let bumps = arena.split_paired(2);
+        let bumps = arena.split_paired_safe(2);
         let (a, c) = (&bumps[0], &bumps[1]);
         for _ in 0..ROUNDS {
             for _ in 0..BATCH {
@@ -2300,9 +3109,9 @@ pub fn pgo_train() {
         let arena = SharedArena::new(16 * 1024 * 1024);
         let mut prio = vec![0u32; 5];
         prio[0] = 100;
-        prio[2] = 1; // низкий (минимальный среди доноров 0,2,4)
+        prio[2] = 1; // Р Р…Р С‘Р В·Р С”Р С‘Р в„– (Р СР С‘Р Р…Р С‘Р СР В°Р В»РЎРЉР Р…РЎвЂ№Р в„– РЎРѓРЎР‚Р ВµР Т‘Р С‘ Р Т‘Р С•Р Р…Р С•РЎР‚Р С•Р Р† 0,2,4)
         prio[4] = 50;
-        let bumps = arena.split_donors_with(
+        let bumps = arena.split_donors_with_safe(
             5,
             DonorPolicy {
                 kind,
@@ -2361,7 +3170,7 @@ fn run_directional_benchmarks(smt: bool, pgo_full_arena: usize, pgo_light_arena:
                 start.elapsed().as_micros()
             })
             .collect();
-        println!("  {:<10}: {} µs", name, median(&t));
+        println!("  {:<10}: {} Р’Вµs", name, median(&t));
     }
 
     let light_variants: &[(&str, fn(usize, bool))] = &[
@@ -2390,7 +3199,7 @@ fn run_directional_benchmarks(smt: bool, pgo_full_arena: usize, pgo_light_arena:
                 start.elapsed().as_micros()
             })
             .collect();
-        println!("  {:<10}: {} µs", name, median(&t));
+        println!("  {:<10}: {} Р’Вµs", name, median(&t));
     }
 }
 
@@ -2406,7 +3215,10 @@ fn run_benchmarks(
     } else {
         "NO SMT (physical cores only)"
     };
-    println!("\n########## Режим: {} ##########\n", mode_str);
+    println!(
+        "\n########## Р В Р ВµР В¶Р С‘Р С: {} ##########\n",
+        mode_str
+    );
 
     // Прогрев
     for _ in 0..5 {
@@ -2452,7 +3264,7 @@ fn run_benchmarks(
             .collect();
 
         println!(
-            "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena = {} µs",
+            "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena = {} Р’Вµs",
             round + 1,
             median(&mimm_times),
             median(&bump_times),
@@ -2493,7 +3305,7 @@ fn run_benchmarks(
             .collect();
 
         println!(
-            "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena = {} µs",
+            "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena = {} Р’Вµs",
             round + 1,
             median(&mimm_times),
             median(&bump_times),
@@ -2533,8 +3345,33 @@ mod tests {
     /// (иначе память освободится, а указатель в ThreadBump станет висячим).
     fn make_one(dir: BumpDir, cap: usize) -> (SharedArena, CachePadded<ThreadBump>) {
         let arena = SharedArena::new(cap);
-        let mut v = arena.split_with(1, dir);
+        // Р С‘Р В·Р С•Р В»Р С‘РЎР‚Р С•Р Р†Р В°Р Р…Р Р…РЎвЂ№Р в„– bump Р В±Р ВµР В· РЎРѓР С•РЎРѓР ВµР Т‘Р В°/Р Т‘Р С•Р Р…Р С•РЎР‚Р С•Р Р†; Р В°РЎР‚Р ВµР Р…Р В° Р Р†Р С•Р В·Р Р†РЎР‚Р В°РЎвЂ°Р В°Р ВµРЎвЂљРЎРѓРЎРЏ Р Р†Р СР ВµРЎРѓРЎвЂљР Вµ РЎРѓ Р Р…Р С‘Р С,
+        // Р С—Р С•РЎРЊРЎвЂљР С•Р СРЎС“ lifetime-Р С‘Р Р…Р Р†Р В°РЎР‚Р С‘Р В°Р Р…РЎвЂљ РЎРѓР С•Р В±Р В»РЎР‹Р Т‘РЎвЂР Р… (unsafe РІР‚вЂќ РЎвЂљ.Р С”. РЎР‚РЎвЂ№Р Р…Р С•Р С” РЎРѓРЎвЂ№РЎР‚Р С•Р С–Р С• Vec).
+        let mut v = unsafe { arena.split_with(1, dir) };
         (arena, v.pop().unwrap())
+    }
+
+    // Р СћР ВµРЎРѓРЎвЂљР С•Р Р†РЎвЂ№Р Вµ Р С•Р В±РЎвЂРЎР‚РЎвЂљР С”Р С‘ Р Р…Р В°Р Т‘ РЎРѓРЎвЂ№РЎР‚РЎвЂ№Р СР С‘ (unsafe) split-Р СР ВµРЎвЂљР С•Р Т‘Р В°Р СР С‘: Р Р† РЎвЂљР ВµРЎРѓРЎвЂљР В°РЎвЂ¦ Р В°РЎР‚Р ВµР Р…Р В°
+    // Р В¶Р С‘Р Р†РЎвЂРЎвЂљ Р Р† РЎвЂљР С•Р в„– Р В¶Р Вµ РЎвЂћРЎС“Р Р…Р С”РЎвЂ Р С‘Р С‘, РЎвЂЎРЎвЂљР С• Р С‘ bumps, Р С—Р С•РЎРЊРЎвЂљР С•Р СРЎС“ lifetime-Р С‘Р Р…Р Р†Р В°РЎР‚Р С‘Р В°Р Р…РЎвЂљ
+    // (Р’В«Р В°РЎР‚Р ВµР Р…Р В° Р Р…Р Вµ РЎС“Р СР С‘РЎР‚Р В°Р ВµРЎвЂљ РЎР‚Р В°Р Р…РЎРЉРЎв‚¬Р Вµ bumpsР’В») РЎРѓР С•Р В±Р В»РЎР‹Р Т‘Р В°Р ВµРЎвЂљРЎРѓРЎРЏ РЎРЏР Р†Р Р…Р С•.
+    fn split_with_raw(arena: &SharedArena, n: usize, dir: BumpDir) -> Vec<CachePadded<ThreadBump>> {
+        unsafe { arena.split_with(n, dir) }
+    }
+    fn split_alt_raw(arena: &SharedArena, n: usize) -> Vec<CachePadded<ThreadBump>> {
+        unsafe { arena.split_alternating(n) }
+    }
+    fn split_pair_raw(arena: &SharedArena, n: usize) -> Vec<CachePadded<ThreadBump>> {
+        unsafe { arena.split_paired(n) }
+    }
+    fn split_don_raw(arena: &SharedArena, n: usize, every: usize) -> Vec<CachePadded<ThreadBump>> {
+        unsafe { arena.split_donors(n, every) }
+    }
+    fn split_don_with_raw(
+        arena: &SharedArena,
+        n: usize,
+        p: DonorPolicy,
+    ) -> Vec<CachePadded<ThreadBump>> {
+        unsafe { arena.split_donors_with(n, p) }
     }
 
     #[test]
@@ -2542,7 +3379,10 @@ mod tests {
         let (_arena, bump) = make_one(BumpDir::Forward, 4096);
         let p0 = bump.alloc_raw::<1>(16) as usize;
         let p1 = bump.alloc_raw::<1>(16) as usize;
-        assert!(p1 > p0, "forward должен расти вверх");
+        assert!(
+            p1 > p0,
+            "forward Р Т‘Р С•Р В»Р В¶Р ВµР Р… РЎР‚Р В°РЎРѓРЎвЂљР С‘ Р Р†Р Р†Р ВµРЎР‚РЎвЂ¦"
+        );
         assert!(p0 >= bump.ptr as usize);
         assert!(p1 + 16 <= bump.ptr as usize + bump.len);
         assert_eq!(bump.allocated_bytes(), 32);
@@ -2553,10 +3393,16 @@ mod tests {
         let (_arena, bump) = make_one(BumpDir::Backward, 4096);
         let p0 = bump.alloc_raw::<1>(16) as usize;
         let p1 = bump.alloc_raw::<1>(16) as usize;
-        assert!(p1 < p0, "backward должен расти вниз");
+        assert!(
+            p1 < p0,
+            "backward Р Т‘Р С•Р В»Р В¶Р ВµР Р… РЎР‚Р В°РЎРѓРЎвЂљР С‘ Р Р†Р Р…Р С‘Р В·"
+        );
         let end = bump.ptr as usize + bump.len;
         assert!(p0 + 16 <= end);
-        assert!(p0 >= end - 32, "backward стартует с конца чанка");
+        assert!(
+            p0 >= end - 32,
+            "backward РЎРѓРЎвЂљР В°РЎР‚РЎвЂљРЎС“Р ВµРЎвЂљ РЎРѓ Р С”Р С•Р Р…РЎвЂ Р В° РЎвЂЎР В°Р Р…Р С”Р В°"
+        );
         assert!(p1 >= end - 64);
         assert_eq!(bump.allocated_bytes(), 32);
     }
@@ -2569,12 +3415,12 @@ mod tests {
         assert_eq!(
             bump.lo.load(Ordering::Relaxed),
             0,
-            "MiddleOut стартует с нуля (lo)"
+            "MiddleOut РЎРѓРЎвЂљР В°РЎР‚РЎвЂљРЎС“Р ВµРЎвЂљ РЎРѓ Р Р…РЎС“Р В»РЎРЏ (lo)"
         );
         assert_eq!(
             bump.hi.load(Ordering::Relaxed),
             0,
-            "MiddleOut стартует с нуля (hi)"
+            "MiddleOut РЎРѓРЎвЂљР В°РЎР‚РЎвЂљРЎС“Р ВµРЎвЂљ РЎРѓ Р Р…РЎС“Р В»РЎРЏ (hi)"
         );
 
         // Сравниваем относительные смещения внутри чанка (адреса абсолютны).
@@ -2583,27 +3429,42 @@ mod tests {
         // 1-я аллокация — левая сторона (ниже середины), 2-я — правая (выше).
         let p0 = rel(bump.alloc_raw::<1>(16) as usize);
         let p1 = rel(bump.alloc_raw::<1>(16) as usize);
-        assert!(p0 < mid, "1-я (левая) ниже середины");
-        assert!(p1 >= mid, "2-я (правая) выше середины");
-        assert!(p0 < p1, "стороны не должны пересекаться");
+        assert!(
+            p0 < mid,
+            "1-РЎРЏ (Р В»Р ВµР Р†Р В°РЎРЏ) Р Р…Р С‘Р В¶Р Вµ РЎРѓР ВµРЎР‚Р ВµР Т‘Р С‘Р Р…РЎвЂ№"
+        );
+        assert!(
+            p1 >= mid,
+            "2-РЎРЏ (Р С—РЎР‚Р В°Р Р†Р В°РЎРЏ) Р Р†РЎвЂ№РЎв‚¬Р Вµ РЎРѓР ВµРЎР‚Р ВµР Т‘Р С‘Р Р…РЎвЂ№"
+        );
+        assert!(
+            p0 < p1,
+            "РЎРѓРЎвЂљР С•РЎР‚Р С•Р Р…РЎвЂ№ Р Р…Р Вµ Р Т‘Р С•Р В»Р В¶Р Р…РЎвЂ№ Р С—Р ВµРЎР‚Р ВµРЎРѓР ВµР С”Р В°РЎвЂљРЎРЉРЎРѓРЎРЏ"
+        );
         assert_eq!(bump.allocated_bytes(), 32);
 
         // после ещё двух аллокаций регионы остаются непересекающимися
         let p2 = rel(bump.alloc_raw::<1>(16) as usize);
         let p3 = rel(bump.alloc_raw::<1>(16) as usize);
-        assert!(p2 < p0, "3-я (левая) ещё ниже 1-й");
-        assert!(p3 > p1, "4-я (правая) ещё выше 2-й");
+        assert!(
+            p2 < p0,
+            "3-РЎРЏ (Р В»Р ВµР Р†Р В°РЎРЏ) Р ВµРЎвЂ°РЎвЂ Р Р…Р С‘Р В¶Р Вµ 1-Р в„–"
+        );
+        assert!(
+            p3 > p1,
+            "4-РЎРЏ (Р С—РЎР‚Р В°Р Р†Р В°РЎРЏ) Р ВµРЎвЂ°РЎвЂ Р Р†РЎвЂ№РЎв‚¬Р Вµ 2-Р в„–"
+        );
         assert_eq!(bump.allocated_bytes(), 64);
     }
 
     #[test]
     fn forward_oom_panics() {
         let (_arena, bump) = make_one(BumpDir::Forward, 64);
-        let _ = bump.alloc_raw::<1>(64); // ровно заполняет
+        let _ = bump.alloc_raw::<1>(64); // РЎР‚Р С•Р Р†Р Р…Р С• Р В·Р В°Р С—Р С•Р В»Р Р…РЎРЏР ВµРЎвЂљ
         let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             bump.alloc_raw::<1>(1);
         }));
-        assert!(res.is_err(), "ожидался OOM-panic");
+        assert!(res.is_err(), "Р С•Р В¶Р С‘Р Т‘Р В°Р В»РЎРѓРЎРЏ OOM-panic");
     }
 
     #[test]
@@ -2613,7 +3474,7 @@ mod tests {
         let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             bump.alloc_raw::<1>(1);
         }));
-        assert!(res.is_err(), "ожидался OOM-panic");
+        assert!(res.is_err(), "Р С•Р В¶Р С‘Р Т‘Р В°Р В»РЎРѓРЎРЏ OOM-panic");
     }
 
     #[test]
@@ -2624,7 +3485,7 @@ mod tests {
         }));
         assert!(
             res.is_err(),
-            "ожидался OOM-panic (середина даёт 0 свободных)"
+            "Р С•Р В¶Р С‘Р Т‘Р В°Р В»РЎРѓРЎРЏ OOM-panic (РЎРѓР ВµРЎР‚Р ВµР Т‘Р С‘Р Р…Р В° Р Т‘Р В°РЎвЂРЎвЂљ 0 РЎРѓР Р†Р С•Р В±Р С•Р Т‘Р Р…РЎвЂ№РЎвЂ¦)"
         );
     }
 
@@ -2636,7 +3497,10 @@ mod tests {
         bump.reset();
         assert_eq!(bump.allocated_bytes(), 0);
         let p1 = bump.alloc_raw::<1>(16);
-        assert_eq!(p0, p1, "после reset первая аллокация по тому же адресу");
+        assert_eq!(
+            p0, p1,
+            "Р С—Р С•РЎРѓР В»Р Вµ reset Р С—Р ВµРЎР‚Р Р†Р В°РЎРЏ Р В°Р В»Р В»Р С•Р С”Р В°РЎвЂ Р С‘РЎРЏ Р С—Р С• РЎвЂљР С•Р СРЎС“ Р В¶Р Вµ Р В°Р Т‘РЎР‚Р ВµРЎРѓРЎС“"
+        );
     }
 
     #[test]
@@ -2658,7 +3522,10 @@ mod tests {
         for _ in 0..10 {
             let _ = bump.alloc_raw::<8>(100);
             let now = bump.allocated_bytes();
-            assert!(now > prev, "allocated_bytes должен расти");
+            assert!(
+                now > prev,
+                "allocated_bytes Р Т‘Р С•Р В»Р В¶Р ВµР Р… РЎР‚Р В°РЎРѓРЎвЂљР С‘"
+            );
             prev = now;
         }
     }
@@ -2668,9 +3535,9 @@ mod tests {
         for dir in [BumpDir::Forward, BumpDir::Backward, BumpDir::MiddleOut] {
             let (_arena, bump) = make_one(dir, 1 << 16);
             let _ = bump.alloc_raw::<8>(1024);
-            bump.prefault_local(); // на заполненном регионе
+            bump.prefault_local(); // Р Р…Р В° Р В·Р В°Р С—Р С•Р В»Р Р…Р ВµР Р…Р Р…Р С•Р С РЎР‚Р ВµР С–Р С‘Р С•Р Р…Р Вµ
             bump.reset();
-            bump.prefault_local(); // и на пустом
+            bump.prefault_local(); // Р С‘ Р Р…Р В° Р С—РЎС“РЎРѓРЎвЂљР С•Р С
         }
     }
 
@@ -2688,14 +3555,14 @@ mod tests {
             &bump,
         );
         v.push::<{ core::mem::align_of::<ArenaString>() }>(
-            ArenaString::from_str_in("строка", &bump),
+            ArenaString::from_str_in("РЎРѓРЎвЂљРЎР‚Р С•Р С”Р В°", &bump),
             &bump,
         );
         let slice = v.as_slice();
         assert_eq!(slice.len(), 3);
         assert_eq!(slice[0].deref(), "hello");
         assert_eq!(slice[1].deref(), "world");
-        assert_eq!(slice[2].deref(), "строка");
+        assert_eq!(slice[2].deref(), "РЎРѓРЎвЂљРЎР‚Р С•Р С”Р В°");
     }
 
     #[test]
@@ -2716,7 +3583,7 @@ mod tests {
     #[test]
     fn neighbors_alternate_directions() {
         let arena = SharedArena::new(4096 * 4);
-        let bumps = arena.split_alternating(4);
+        let bumps = split_alt_raw(&arena, 4);
         assert_eq!(bumps[0].dir, BumpDir::Backward);
         assert_eq!(bumps[1].dir, BumpDir::Forward);
         assert_eq!(bumps[2].dir, BumpDir::Backward);
@@ -2731,24 +3598,31 @@ mod tests {
     #[test]
     fn neighbors_meet_at_boundary() {
         let arena = SharedArena::new(8192);
-        let bumps = arena.split_alternating(2);
+        let bumps = split_alt_raw(&arena, 2);
         let (b0, b1) = (&bumps[0], &bumps[1]);
         let boundary = b0.ptr as usize + b0.len;
         assert_eq!(boundary, b1.ptr as usize);
 
         // b0 — Backward: первая аллокация упирается в правый край чанка (к границе).
         let p0 = b0.alloc_raw::<1>(64) as usize;
-        assert_eq!(p0, boundary - 64, "Backward стартует у границы");
+        assert_eq!(
+            p0,
+            boundary - 64,
+            "Backward РЎРѓРЎвЂљР В°РЎР‚РЎвЂљРЎС“Р ВµРЎвЂљ РЎС“ Р С–РЎР‚Р В°Р Р…Р С‘РЎвЂ РЎвЂ№"
+        );
 
         // b1 — Forward: первая аллокация — само начало чанка (у той же границы).
         let p1 = b1.alloc_raw::<1>(64) as usize;
-        assert_eq!(p1, boundary, "Forward стартует ровно у границы");
+        assert_eq!(
+            p1, boundary,
+            "Forward РЎРѓРЎвЂљР В°РЎР‚РЎвЂљРЎС“Р ВµРЎвЂљ РЎР‚Р С•Р Р†Р Р…Р С• РЎС“ Р С–РЎР‚Р В°Р Р…Р С‘РЎвЂ РЎвЂ№"
+        );
     }
 
     #[test]
     fn split_with_middleout_starts_at_middle() {
         let arena = SharedArena::new(4096);
-        let bumps = arena.split_with(1, BumpDir::MiddleOut);
+        let bumps = split_with_raw(&arena, 1, BumpDir::MiddleOut);
         let b = &bumps[0];
         assert_eq!(b.lo.load(Ordering::Relaxed), 0);
         assert_eq!(b.hi.load(Ordering::Relaxed), 0);
@@ -2759,11 +3633,14 @@ mod tests {
     #[test]
     fn pair_shares_combined_region() {
         let arena = SharedArena::new(8192);
-        let bumps = arena.split_paired(2);
+        let bumps = split_pair_raw(&arena, 2);
         assert_eq!(bumps[0].dir, BumpDir::Backward);
         assert_eq!(bumps[1].dir, BumpDir::Forward);
         // Оба указывают на ОДИН объединённый регион в 2*chunk_size.
-        assert_eq!(bumps[0].ptr, bumps[1].ptr, "пара делит один регион");
+        assert_eq!(
+            bumps[0].ptr, bumps[1].ptr,
+            "Р С—Р В°РЎР‚Р В° Р Т‘Р ВµР В»Р С‘РЎвЂљ Р С•Р Т‘Р С‘Р Р… РЎР‚Р ВµР С–Р С‘Р С•Р Р…"
+        );
         assert_eq!(bumps[0].len, 8192);
         assert_eq!(bumps[1].len, 8192);
         assert!(bumps[0].neighbor_idx.is_some());
@@ -2773,30 +3650,45 @@ mod tests {
     #[test]
     fn pair_fills_toward_middle_without_overlap() {
         let arena = SharedArena::new(8192);
-        let bumps = arena.split_paired(2);
+        let bumps = split_pair_raw(&arena, 2);
         let (even, odd) = (&bumps[0], &bumps[1]); // Backward / Forward
         let base = arena.alloc.ptr as usize;
 
         // odd растёт в своей нижней половине [0, 4096), even — в верхней [4096, 8192).
         let o0 = odd.alloc_raw::<1>(1000) as usize;
         let o1 = odd.alloc_raw::<1>(1000) as usize;
-        assert_eq!(o0, base, "Forward стартует с начала региона");
-        assert_eq!(o1, base + 1000, "Forward растёт вверх");
+        assert_eq!(
+            o0, base,
+            "Forward РЎРѓРЎвЂљР В°РЎР‚РЎвЂљРЎС“Р ВµРЎвЂљ РЎРѓ Р Р…Р В°РЎвЂЎР В°Р В»Р В° РЎР‚Р ВµР С–Р С‘Р С•Р Р…Р В°"
+        );
+        assert_eq!(
+            o1,
+            base + 1000,
+            "Forward РЎР‚Р В°РЎРѓРЎвЂљРЎвЂРЎвЂљ Р Р†Р Р†Р ВµРЎР‚РЎвЂ¦"
+        );
 
         let e0 = even.alloc_raw::<1>(1000) as usize;
         let e1 = even.alloc_raw::<1>(1000) as usize;
-        assert_eq!(e0, base + 8192 - 1000, "Backward стартует с конца региона");
-        assert_eq!(e1, base + 8192 - 2000, "Backward растёт вниз");
+        assert_eq!(
+            e0,
+            base + 8192 - 1000,
+            "Backward РЎРѓРЎвЂљР В°РЎР‚РЎвЂљРЎС“Р ВµРЎвЂљ РЎРѓ Р С”Р С•Р Р…РЎвЂ Р В° РЎР‚Р ВµР С–Р С‘Р С•Р Р…Р В°"
+        );
+        assert_eq!(
+            e1,
+            base + 8192 - 2000,
+            "Backward РЎР‚Р В°РЎРѓРЎвЂљРЎвЂРЎвЂљ Р Р†Р Р…Р С‘Р В·"
+        );
 
         // Собственные половины не пересекаются (середина — граница).
         assert!(e1 + 1000 <= base + 8192);
         assert!(
             o1 + 1000 <= base + 4096,
-            "odd не выходит за середину своей половины"
+            "odd Р Р…Р Вµ Р Р†РЎвЂ№РЎвЂ¦Р С•Р Т‘Р С‘РЎвЂљ Р В·Р В° РЎРѓР ВµРЎР‚Р ВµР Т‘Р С‘Р Р…РЎС“ РЎРѓР Р†Р С•Р ВµР в„– Р С—Р С•Р В»Р С•Р Р†Р С‘Р Р…РЎвЂ№"
         );
         assert!(
             e0 >= base + 4096,
-            "even не выходит за середину своей половины"
+            "even Р Р…Р Вµ Р Р†РЎвЂ№РЎвЂ¦Р С•Р Т‘Р С‘РЎвЂљ Р В·Р В° РЎРѓР ВµРЎР‚Р ВµР Т‘Р С‘Р Р…РЎС“ РЎРѓР Р†Р С•Р ВµР в„– Р С—Р С•Р В»Р С•Р Р†Р С‘Р Р…РЎвЂ№"
         );
     }
 
@@ -2805,23 +3697,26 @@ mod tests {
         // even почти ничего не берёт, odd забирает свою половину и
         // продолжает в смежную свободную половину even (заём памяти соседа).
         let arena = SharedArena::new(8192);
-        let bumps = arena.split_paired(2);
+        let bumps = split_pair_raw(&arena, 2);
         let (even, odd) = (&bumps[0], &bumps[1]);
         let base = arena.alloc.ptr as usize;
 
-        let _ = even.alloc_raw::<1>(16); // even занял кроху сверху: [8176, 8192)
-        let _ = odd.alloc_raw::<1>(4096); // odd заполнил свою половину [0, 4096)
+        let _ = even.alloc_raw::<1>(16); // even Р В·Р В°Р Р…РЎРЏР В» Р С”РЎР‚Р С•РЎвЂ¦РЎС“ РЎРѓР Р†Р ВµРЎР‚РЎвЂ¦РЎС“: [8176, 8192)
+        let _ = odd.alloc_raw::<1>(4096); // odd Р В·Р В°Р С—Р С•Р В»Р Р…Р С‘Р В» РЎРѓР Р†Р С•РЎР‹ Р С—Р С•Р В»Р С•Р Р†Р С‘Р Р…РЎС“ [0, 4096)
         // Теперь odd занимает у even свободную половину [4096, 8176).
         let borrowed = odd.alloc_raw::<1>(4000) as usize;
         assert_eq!(
             borrowed,
             base + 4176,
-            "заём — в половине соседа, смежной к середине"
+            "Р В·Р В°РЎвЂР С РІР‚вЂќ Р Р† Р С—Р С•Р В»Р С•Р Р†Р С‘Р Р…Р Вµ РЎРѓР С•РЎРѓР ВµР Т‘Р В°, РЎРѓР СР ВµР В¶Р Р…Р С•Р в„– Р С” РЎРѓР ВµРЎР‚Р ВµР Т‘Р С‘Р Р…Р Вµ"
         );
-        assert!(borrowed >= base + 4096, "в половине even");
+        assert!(
+            borrowed >= base + 4096,
+            "Р Р† Р С—Р С•Р В»Р С•Р Р†Р С‘Р Р…Р Вµ even"
+        );
         assert!(
             borrowed + 4000 <= base + 8192 - 16,
-            "не задевает 16 байт even"
+            "Р Р…Р Вµ Р В·Р В°Р Т‘Р ВµР Р†Р В°Р ВµРЎвЂљ 16 Р В±Р В°Р в„–РЎвЂљ even"
         );
     }
 
@@ -2830,23 +3725,23 @@ mod tests {
         // odd занимает низ своей половины, even доходит до середины, затем even
         // заимствует смежную свободную половину odd через счётчик соседа.
         let arena = SharedArena::new(8192);
-        let bumps = arena.split_paired(2);
+        let bumps = split_pair_raw(&arena, 2);
         let (even, odd) = (&bumps[0], &bumps[1]);
         let base = arena.alloc.ptr as usize;
 
         let _ = odd.alloc_raw::<1>(1000); // odd: [0, 1000)
-        let _ = even.alloc_raw::<1>(4096); // even заполнил свою половину [4096, 8192)
+        let _ = even.alloc_raw::<1>(4096); // even Р В·Р В°Р С—Р С•Р В»Р Р…Р С‘Р В» РЎРѓР Р†Р С•РЎР‹ Р С—Р С•Р В»Р С•Р Р†Р С‘Р Р…РЎС“ [4096, 8192)
         // even упирается в середину и берёт 100 байт из свободной части odd [1000, 4096).
         let borrowed = even.alloc_raw::<1>(100) as usize;
         assert_eq!(
             borrowed,
             base + 1000,
-            "заём — в смежной свободной половине соседа"
+            "Р В·Р В°РЎвЂР С РІР‚вЂќ Р Р† РЎРѓР СР ВµР В¶Р Р…Р С•Р в„– РЎРѓР Р†Р С•Р В±Р С•Р Т‘Р Р…Р С•Р в„– Р С—Р С•Р В»Р С•Р Р†Р С‘Р Р…Р Вµ РЎРѓР С•РЎРѓР ВµР Т‘Р В°"
         );
         assert_eq!(
             odd.lo.load(Ordering::Relaxed),
             1100,
-            "счётчик соседа расширен займом"
+            "РЎРѓРЎвЂЎРЎвЂРЎвЂљРЎвЂЎР С‘Р С” РЎРѓР С•РЎРѓР ВµР Т‘Р В° РЎР‚Р В°РЎРѓРЎв‚¬Р С‘РЎР‚Р ВµР Р… Р В·Р В°Р в„–Р СР С•Р С"
         );
         // не пересекается с данными odd [0,1000) и even [4096,8192)
         assert!(borrowed >= base + 1000);
@@ -2858,8 +3753,8 @@ mod tests {
         // Два потока одновременно: чётный (even) забирает больше своей половины
         // и заимствует у нечётного (odd) через lock-free CAS, нечётный — в своей
         // половине. Проверяем, что ни один не затёр данные другого.
-        let arena = SharedArena::new(arena_scale(2 * 1024 * 1024)); // 2 MB: половина = 1 MB
-        let bumps = arena.split_paired(2);
+        let arena = SharedArena::new(arena_scale(2 * 1024 * 1024)); // 2 MB: Р С—Р С•Р В»Р С•Р Р†Р С‘Р Р…Р В° = 1 MB
+        let bumps = split_pair_raw(&arena, 2);
 
         std::thread::scope(|s| {
             // even: 200_000 * 8 = 1.6 MB > своей половины (1 MB) -> заимствует 0.6 MB.
@@ -2872,7 +3767,7 @@ mod tests {
                     ptrs.push(p);
                 }
                 for (j, p) in ptrs.iter().enumerate() {
-                    assert_eq!(unsafe { **p }, 0xA000 + j, "even: данные затёрты соседом");
+                    assert_eq!(unsafe { **p }, 0xA000 + j, "even: Р Т‘Р В°Р Р…Р Р…РЎвЂ№Р Вµ Р В·Р В°РЎвЂљРЎвЂРЎР‚РЎвЂљРЎвЂ№ РЎРѓР С•РЎРѓР ВµР Т‘Р С•Р С");
                 }
             });
             // odd: 50_000 * 8 = 0.4 MB < своей половины (1 MB), свою не покидает.
@@ -2885,7 +3780,7 @@ mod tests {
                     ptrs.push(p);
                 }
                 for (j, p) in ptrs.iter().enumerate() {
-                    assert_eq!(unsafe { **p }, 0xB000 + j, "odd: данные затёрты соседом");
+                    assert_eq!(unsafe { **p }, 0xB000 + j, "odd: Р Т‘Р В°Р Р…Р Р…РЎвЂ№Р Вµ Р В·Р В°РЎвЂљРЎвЂРЎР‚РЎвЂљРЎвЂ№ РЎРѓР С•РЎРѓР ВµР Т‘Р С•Р С");
                 }
             });
         });
@@ -2898,8 +3793,8 @@ mod tests {
         // 2 потока, индекс 0 — донор (0 % 2 == 0). Донор остаётся пустым, а
         // поток 1 переполняет свой чанк и должен забрать блок с высокой стороны
         // региона донора (противоположной заполнению Forward-донора низом).
-        let arena = SharedArena::new(arena_scale(2 * 1024 * 1024)); // 1 MB на потока
-        let bumps = arena.split_donors(2, 2);
+        let arena = SharedArena::new(arena_scale(2 * 1024 * 1024)); // 1 MB Р Р…Р В° Р С—Р С•РЎвЂљР С•Р С”Р В°
+        let bumps = split_don_raw(&arena, 2, 2);
         let (donor, needy) = (&bumps[0], &bumps[1]);
         assert!(donor.can_give);
         assert!(!needy.can_give);
@@ -2915,12 +3810,19 @@ mod tests {
         let d_start = donor.ptr as usize;
         let d_end = d_start + donor.len;
         let last = *ptrs.last().unwrap() as usize;
-        assert!(last >= d_start && last < d_end, "блок взят не у донора");
+        assert!(
+            last >= d_start && last < d_end,
+            "Р В±Р В»Р С•Р С” Р Р†Р В·РЎРЏРЎвЂљ Р Р…Р Вµ РЎС“ Р Т‘Р С•Р Р…Р С•РЎР‚Р В°"
+        );
         // Счётчик донора расширился с высокой стороны.
         assert!(donor.hi.load(Ordering::Relaxed) > 0);
         // Данные не затёрты.
         for (j, p) in ptrs.iter().enumerate() {
-            assert_eq!(unsafe { **p }, 0xC000 + j, "данные затёрты донором/соседом");
+            assert_eq!(
+                unsafe { **p },
+                0xC000 + j,
+                "Р Т‘Р В°Р Р…Р Р…РЎвЂ№Р Вµ Р В·Р В°РЎвЂљРЎвЂРЎР‚РЎвЂљРЎвЂ№ Р Т‘Р С•Р Р…Р С•РЎР‚Р С•Р С/РЎРѓР С•РЎРѓР ВµР Т‘Р С•Р С"
+            );
         }
         // У донора своя память свободна (lo не трогали).
         assert_eq!(donor.lo.load(Ordering::Relaxed), 0);
@@ -2932,7 +3834,7 @@ mod tests {
         // выделяется новый чанк «где-то в памяти» (grow_fallback). Проверяем, что
         // он находится ВНЕ основной арены и данные живы; Drop освобождает его.
         let arena = SharedArena::new(arena_scale(1 << 20));
-        let bumps = arena.split_donors(4, 0);
+        let bumps = split_don_raw(&arena, 4, 0);
         let needy = &bumps[1];
         assert!(!bumps.iter().any(|b| b.can_give));
 
@@ -2949,7 +3851,10 @@ mod tests {
         let outside = ptrs
             .iter()
             .any(|&p| (p as usize) < arena_start || (p as usize) >= arena_end);
-        assert!(outside, "ожидался fallback-чанк вне арены");
+        assert!(
+            outside,
+            "Р С•Р В¶Р С‘Р Т‘Р В°Р В»РЎРѓРЎРЏ fallback-РЎвЂЎР В°Р Р…Р С” Р Р†Р Р…Р Вµ Р В°РЎР‚Р ВµР Р…РЎвЂ№"
+        );
         for (j, p) in ptrs.iter().enumerate() {
             assert_eq!(unsafe { **p }, 0xD000 + j);
         }
@@ -2964,12 +3869,13 @@ mod tests {
         // 5 потоков, доноры — индексы 0 и 2 (every = 2). Явно задаём приоритеты
         // так, чтобы у донора 0 он БЫЛ ВЫШЕ, чем у донора 2. Значит донор 2
         // (низкий приоритет) должен использоваться первым.
-        let arena = SharedArena::new(arena_scale(5 * 1024 * 1024)); // 1 MB на поток
+        let arena = SharedArena::new(arena_scale(5 * 1024 * 1024)); // 1 MB Р Р…Р В° Р С—Р С•РЎвЂљР С•Р С”
         let mut prio = vec![0u32; 5];
-        prio[0] = 100; // высокий
-        prio[2] = 1; // низкий (минимальный среди доноров 0,2,4)
-        prio[4] = 50; // средний
-        let bumps = arena.split_donors_with(
+        prio[0] = 100; // Р Р†РЎвЂ№РЎРѓР С•Р С”Р С‘Р в„–
+        prio[2] = 1; // Р Р…Р С‘Р В·Р С”Р С‘Р в„– (Р СР С‘Р Р…Р С‘Р СР В°Р В»РЎРЉР Р…РЎвЂ№Р в„– РЎРѓРЎР‚Р ВµР Т‘Р С‘ Р Т‘Р С•Р Р…Р С•РЎР‚Р С•Р Р† 0,2,4)
+        prio[4] = 50; // РЎРѓРЎР‚Р ВµР Т‘Р Р…Р С‘Р в„–
+        let bumps = split_don_with_raw(
+            &arena,
             5,
             DonorPolicy {
                 kind: DonorListKind::Static,
@@ -2994,7 +3900,7 @@ mod tests {
         let in_d2 = last >= d2.ptr as usize && last < d2.ptr as usize + d2.len;
         assert!(
             in_d2 && !in_d0,
-            "первым должен взяться низкоприоритетный донор 2"
+            "Р С—Р ВµРЎР‚Р Р†РЎвЂ№Р С Р Т‘Р С•Р В»Р В¶Р ВµР Р… Р Р†Р В·РЎРЏРЎвЂљРЎРЉРЎРѓРЎРЏ Р Р…Р С‘Р В·Р С”Р С•Р С—РЎР‚Р С‘Р С•РЎР‚Р С‘РЎвЂљР ВµРЎвЂљР Р…РЎвЂ№Р в„– Р Т‘Р С•Р Р…Р С•РЎР‚ 2"
         );
         for (j, p) in ptrs.iter().enumerate() {
             assert_eq!(unsafe { **p }, 0xE000 + j);
@@ -3005,9 +3911,9 @@ mod tests {
 
     #[test]
     fn donors_orx_add_then_remove() {
-        let arena = SharedArena::new(arena_scale(2 * 1024 * 1024)); // 1 MB на поток, 2 потока
+        let arena = SharedArena::new(arena_scale(2 * 1024 * 1024)); // 1 MB Р Р…Р В° Р С—Р С•РЎвЂљР С•Р С”, 2 Р С—Р С•РЎвЂљР С•Р С”Р В°
         // Изначально доноров нет (every = 0).
-        let bumps = arena.split_donors_with(2, DonorPolicy::orx(0));
+        let bumps = split_don_with_raw(&arena, 2, DonorPolicy::orx(0));
         let needy = &bumps[1];
         let donor0 = &bumps[0];
         let a_start = arena.alloc.ptr as usize;
@@ -3015,7 +3921,7 @@ mod tests {
 
         // Добавляем донора 0 в рантайме.
         assert!(needy.add_donor(0, 0));
-        assert!(!needy.add_donor(0, 0)); // уже есть — повторно не добавляем (индекс тот же)
+        assert!(!needy.add_donor(0, 0)); // РЎС“Р В¶Р Вµ Р ВµРЎРѓРЎвЂљРЎРЉ РІР‚вЂќ Р С—Р С•Р Р†РЎвЂљР С•РЎР‚Р Р…Р С• Р Р…Р Вµ Р Т‘Р С•Р В±Р В°Р Р†Р В»РЎРЏР ВµР С (Р С‘Р Р…Р Т‘Р ВµР С”РЎРѓ РЎвЂљР С•РЎвЂљ Р В¶Р Вµ)
 
         // Переполняем needy: должен взять у добавленного донора 0.
         let mut ptrs: Vec<*mut usize> = Vec::with_capacity(count_scale(200_000));
@@ -3027,7 +3933,7 @@ mod tests {
         let last = *ptrs.last().unwrap() as usize;
         assert!(
             last >= donor0.ptr as usize && last < donor0.ptr as usize + donor0.len,
-            "блок должен быть взят у динамически добавленного донора 0"
+            "Р В±Р В»Р С•Р С” Р Т‘Р С•Р В»Р В¶Р ВµР Р… Р В±РЎвЂ№РЎвЂљРЎРЉ Р Р†Р В·РЎРЏРЎвЂљ РЎС“ Р Т‘Р С‘Р Р…Р В°Р СР С‘РЎвЂЎР ВµРЎРѓР С”Р С‘ Р Т‘Р С•Р В±Р В°Р Р†Р В»Р ВµР Р…Р Р…Р С•Р С–Р С• Р Т‘Р С•Р Р…Р С•РЎР‚Р В° 0"
         );
         for (j, p) in ptrs.iter().enumerate() {
             assert_eq!(unsafe { **p }, 0xF000 + j);
@@ -3035,7 +3941,7 @@ mod tests {
 
         // Удаляем донора 0 — теперь заём невозможен, пойдёт fallback вне арены.
         assert!(needy.remove_donor(0));
-        assert!(!needy.remove_donor(0)); // уже удалён
+        assert!(!needy.remove_donor(0)); // РЎС“Р В¶Р Вµ РЎС“Р Т‘Р В°Р В»РЎвЂР Р…
         let extra: Vec<*mut usize> = (0..2000)
             .map(|j| {
                 let p = needy.alloc_raw::<8>(8) as *mut usize;
@@ -3048,7 +3954,7 @@ mod tests {
             .all(|&p| (p as usize) < a_start || (p as usize) >= a_end);
         assert!(
             all_outside,
-            "после удаления донора должен быть fallback вне арены"
+            "Р С—Р С•РЎРѓР В»Р Вµ РЎС“Р Т‘Р В°Р В»Р ВµР Р…Р С‘РЎРЏ Р Т‘Р С•Р Р…Р С•РЎР‚Р В° Р Т‘Р С•Р В»Р В¶Р ВµР Р… Р В±РЎвЂ№РЎвЂљРЎРЉ fallback Р Р†Р Р…Р Вµ Р В°РЎР‚Р ВµР Р…РЎвЂ№"
         );
     }
 
@@ -3057,7 +3963,7 @@ mod tests {
     #[test]
     fn donors_boxcar_add_then_remove() {
         let arena = SharedArena::new(arena_scale(2 * 1024 * 1024));
-        let bumps = arena.split_donors_with(2, DonorPolicy::boxcar(0));
+        let bumps = split_don_with_raw(&arena, 2, DonorPolicy::boxcar(0));
         let needy = &bumps[1];
         let donor0 = &bumps[0];
         let a_start = arena.alloc.ptr as usize;
@@ -3089,7 +3995,7 @@ mod tests {
             .all(|&p| (p as usize) < a_start || (p as usize) >= a_end);
         assert!(
             all_outside,
-            "после удаления донора должен быть fallback вне арены"
+            "Р С—Р С•РЎРѓР В»Р Вµ РЎС“Р Т‘Р В°Р В»Р ВµР Р…Р С‘РЎРЏ Р Т‘Р С•Р Р…Р С•РЎР‚Р В° Р Т‘Р С•Р В»Р В¶Р ВµР Р… Р В±РЎвЂ№РЎвЂљРЎРЉ fallback Р Р†Р Р…Р Вµ Р В°РЎР‚Р ВµР Р…РЎвЂ№"
         );
     }
 
@@ -3100,9 +4006,10 @@ mod tests {
         let arena = SharedArena::new(arena_scale(5 * 1024 * 1024));
         let mut prio = vec![0u32; 5];
         prio[0] = 100;
-        prio[2] = 1; // низкий (минимальный среди доноров 0,2,4)
-        prio[4] = 50; // средний
-        let bumps = arena.split_donors_with(
+        prio[2] = 1; // Р Р…Р С‘Р В·Р С”Р С‘Р в„– (Р СР С‘Р Р…Р С‘Р СР В°Р В»РЎРЉР Р…РЎвЂ№Р в„– РЎРѓРЎР‚Р ВµР Т‘Р С‘ Р Т‘Р С•Р Р…Р С•РЎР‚Р С•Р Р† 0,2,4)
+        prio[4] = 50; // РЎРѓРЎР‚Р ВµР Т‘Р Р…Р С‘Р в„–
+        let bumps = split_don_with_raw(
+            &arena,
             5,
             DonorPolicy {
                 kind: DonorListKind::Orx,
@@ -3126,7 +4033,7 @@ mod tests {
         let in_d2 = last >= d2.ptr as usize && last < d2.ptr as usize + d2.len;
         assert!(
             in_d2 && !in_d0,
-            "orx+prio: первым берётся низкоприоритетный донор 2"
+            "orx+prio: Р С—Р ВµРЎР‚Р Р†РЎвЂ№Р С Р В±Р ВµРЎР‚РЎвЂРЎвЂљРЎРѓРЎРЏ Р Р…Р С‘Р В·Р С”Р С•Р С—РЎР‚Р С‘Р С•РЎР‚Р С‘РЎвЂљР ВµРЎвЂљР Р…РЎвЂ№Р в„– Р Т‘Р С•Р Р…Р С•РЎР‚ 2"
         );
         for (j, p) in ptrs.iter().enumerate() {
             assert_eq!(unsafe { **p }, 0x9000 + j);
@@ -3140,9 +4047,10 @@ mod tests {
         let arena = SharedArena::new(arena_scale(5 * 1024 * 1024));
         let mut prio = vec![0u32; 5];
         prio[0] = 100;
-        prio[2] = 1; // низкий (минимальный среди доноров 0,2,4)
-        prio[4] = 50; // средний
-        let bumps = arena.split_donors_with(
+        prio[2] = 1; // Р Р…Р С‘Р В·Р С”Р С‘Р в„– (Р СР С‘Р Р…Р С‘Р СР В°Р В»РЎРЉР Р…РЎвЂ№Р в„– РЎРѓРЎР‚Р ВµР Т‘Р С‘ Р Т‘Р С•Р Р…Р С•РЎР‚Р С•Р Р† 0,2,4)
+        prio[4] = 50; // РЎРѓРЎР‚Р ВµР Т‘Р Р…Р С‘Р в„–
+        let bumps = split_don_with_raw(
+            &arena,
             5,
             DonorPolicy {
                 kind: DonorListKind::Boxcar,
@@ -3166,7 +4074,7 @@ mod tests {
         let in_d2 = last >= d2.ptr as usize && last < d2.ptr as usize + d2.len;
         assert!(
             in_d2 && !in_d0,
-            "boxcar+prio: первым берётся низкоприоритетный донор 2"
+            "boxcar+prio: Р С—Р ВµРЎР‚Р Р†РЎвЂ№Р С Р В±Р ВµРЎР‚РЎвЂРЎвЂљРЎРѓРЎРЏ Р Р…Р С‘Р В·Р С”Р С•Р С—РЎР‚Р С‘Р С•РЎР‚Р С‘РЎвЂљР ВµРЎвЂљР Р…РЎвЂ№Р в„– Р Т‘Р С•Р Р…Р С•РЎР‚ 2"
         );
         for (j, p) in ptrs.iter().enumerate() {
             assert_eq!(unsafe { **p }, 0x8000 + j);
@@ -3179,7 +4087,7 @@ mod tests {
     fn donors_miri_smoke() {
         // static: забор с высокой стороны донора (маленькая арена -> переполнение)
         let arena = SharedArena::new(32 * 1024);
-        let bumps = arena.split_donors(2, 2);
+        let bumps = split_don_raw(&arena, 2, 2);
         let (donor, needy) = (&bumps[0], &bumps[1]);
         let mut ptrs: Vec<*mut usize> = Vec::with_capacity(3_000);
         for j in 0..3_000usize {
@@ -3195,12 +4103,12 @@ mod tests {
         let d_end = d_start + donor.len;
         assert!(
             last >= d_start && last < d_end,
-            "static: блок взят не у донора"
+            "static: Р В±Р В»Р С•Р С” Р Р†Р В·РЎРЏРЎвЂљ Р Р…Р Вµ РЎС“ Р Т‘Р С•Р Р…Р С•РЎР‚Р В°"
         );
 
         // orx: динамическое удаление -> fallback вне арены
         let arena2 = SharedArena::new(32 * 1024);
-        let bumps2 = arena2.split_donors_with(2, DonorPolicy::orx(0));
+        let bumps2 = split_don_with_raw(&arena2, 2, DonorPolicy::orx(0));
         let needy2 = &bumps2[1];
         needy2.remove_donor(0);
         let extra: Vec<*mut usize> = (0..3_000)
@@ -3213,5 +4121,191 @@ mod tests {
         for (j, p) in extra.iter().enumerate() {
             assert_eq!(unsafe { **p }, 0xD000 + j);
         }
+    }
+
+    // ===================== Р В Р В°Р В·Р В±Р С‘Р ВµР Р…Р С‘Р Вµ (split) Р С‘ Р С”Р С•Р Р…Р Р†Р ВµРЎР‚РЎРѓР С‘РЎРЏ =====================
+
+    #[test]
+    fn split_produces_disjoint_subregions() {
+        let (_arena, bump) = make_one(BumpDir::Forward, arena_scale(4096));
+        let base = bump.ptr as usize;
+        let total = bump.len;
+        let children = bump.split(3, BumpDir::Forward);
+        assert_eq!(children.len(), 3);
+        let mut seen: Vec<(usize, usize)> = children
+            .iter()
+            .map(|c| (c.ptr as usize, c.ptr as usize + c.len))
+            .collect();
+        seen.sort();
+        for w in seen.windows(2) {
+            assert!(
+                w[0].1 <= w[1].0,
+                "РЎвЂЎР В°РЎРѓРЎвЂљР С‘ РЎР‚Р ВµР С–Р С‘Р С•Р Р…Р В° Р С—Р ВµРЎР‚Р ВµРЎРѓР ВµР С”Р В°РЎР‹РЎвЂљРЎРѓРЎРЏ"
+            );
+        }
+        assert_eq!(seen[0].0, base);
+        assert_eq!(seen.last().unwrap().1, base + total);
+        for c in &children {
+            assert!(
+                c.neighbor_idx.is_none(),
+                "Р Т‘Р С•РЎвЂЎР ВµРЎР‚Р Р…Р С‘Р в„– bump Р Р…Р Вµ Р Т‘Р С•Р В»Р В¶Р ВµР Р… Р В±РЎвЂ№РЎвЂљРЎРЉ Р С—Р В°РЎР‚Р С•Р в„–"
+            );
+            assert!(
+                matches!(c.donor_reg, DonorReg::None),
+                "Р Т‘Р С•РЎвЂЎР ВµРЎР‚Р Р…Р С‘Р в„– bump Р Р…Р Вµ Р Т‘Р С•Р Р…Р С•РЎР‚"
+            );
+            // Р С™Р В°Р В¶Р Т‘РЎвЂ№Р в„– Р Т‘Р С•РЎвЂЎР ВµРЎР‚Р Р…Р С‘Р в„– bump Р Р†РЎвЂ№Р Т‘Р ВµР В»РЎРЏР ВµРЎвЂљ Р Р…Р ВµР В·Р В°Р Р†Р С‘РЎРѓР С‘Р СР С• Р С‘Р В· РЎРѓР Р†Р С•Р ВµР С–Р С• Р С”РЎС“РЎРѓР С”Р В°.
+            let p = c.alloc_raw::<8>(8);
+            assert!(p as usize >= c.ptr as usize && p as usize + 8 <= c.ptr as usize + c.len);
+        }
+    }
+
+    #[test]
+    fn split_by_sizes_rem_goes_to_last() {
+        let (_arena, bump) = make_one(BumpDir::Forward, arena_scale(4096));
+        let sizes = [16usize, 32, 64];
+        let base = bump.ptr as usize;
+        let children = bump.split_by_sizes(&sizes, BumpDir::Forward);
+        assert_eq!(children.len(), 3);
+        assert_eq!(children[0].len, 16);
+        assert_eq!(children[1].len, 32);
+        assert!(
+            children[2].len >= 64,
+            "Р С•РЎРѓРЎвЂљР В°РЎвЂљР С•Р С” Р Т‘Р С•Р В»Р В¶Р ВµР Р… Р Т‘Р С•РЎРѓРЎвЂљР В°РЎвЂљРЎРЉРЎРѓРЎРЏ Р С—Р С•РЎРѓР В»Р ВµР Т‘Р Р…Р ВµР СРЎС“"
+        );
+        assert_eq!(children[0].ptr as usize, base);
+        assert_eq!(children[1].ptr as usize, base + 16);
+        assert_eq!(children[2].ptr as usize, base + 16 + 32);
+        assert!(children[0].ptr as usize + children[0].len <= children[1].ptr as usize);
+        assert!(children[1].ptr as usize + children[1].len <= children[2].ptr as usize);
+    }
+
+    #[test]
+    fn split_donors_by_sizes_borrow_from_sibling() {
+        let (_arena, bump) = make_one(BumpDir::Forward, arena_scale(4096));
+        // [1024, 1024] РІР‚вЂќ Р Р†РЎвЂљР С•РЎР‚Р С•Р в„– РЎвЂЎР В°Р Р…Р С” Р В±Р ВµРЎР‚РЎвЂРЎвЂљ Р С•РЎРѓРЎвЂљР В°РЎвЂљР С•Р С” РЎР‚Р ВµР С–Р С‘Р С•Р Р…Р В°; Р С•Р В±Р В° РІР‚вЂќ Р Т‘Р С•Р Р…Р С•РЎР‚РЎвЂ№.
+        let children = bump.split_donors_by_sizes(&[1024usize, 1024], BumpDir::Forward);
+        assert_eq!(children.len(), 2);
+        let (d0, needy) = (&children[0], &children[1]);
+        assert!(matches!(d0.donor_reg, DonorReg::Orx(_)));
+        assert!(matches!(needy.donor_reg, DonorReg::Orx(_)));
+        // Р В Р ВµР ВµРЎРѓРЎвЂљРЎР‚ Р С—РЎР‚Р ВµР Т‘Р В·Р В°Р С—Р С•Р В»Р Р…Р ВµР Р…: Р Т‘Р С•Р Р…Р С•РЎР‚ 0 РЎС“Р В¶Р Вµ Р В·Р В°РЎР‚Р ВµР С–Р С‘РЎРѓРЎвЂљРЎР‚Р С‘РЎР‚Р С•Р Р†Р В°Р Р… РЎС“ needy (Р Р…Р Вµ Р Т‘РЎС“Р В±Р В»Р С‘РЎР‚РЎС“Р ВµРЎвЂљРЎРѓРЎРЏ).
+        assert!(
+            !needy.add_donor(0, 0),
+            "Р Т‘Р С•Р Р…Р С•РЎР‚ 0 РЎС“Р В¶Р Вµ Р Р† Р С•Р В±РЎвЂ°Р ВµР С РЎР‚Р ВµР ВµРЎРѓРЎвЂљРЎР‚Р Вµ"
+        );
+        // Р СћРЎРЏР В¶РЎвЂР В»Р В°РЎРЏ РЎвЂЎР В°РЎРѓРЎвЂљРЎРЉ (РЎР‚Р ВµР В°Р В»РЎРЉР Р…Р В°РЎРЏ Р В·Р В°РЎвЂР С РЎС“ Р Т‘Р С•Р Р…Р С•РЎР‚Р В°) РІР‚вЂќ РЎвЂљР С•Р В»РЎРЉР С”Р С• Р Р†Р Р…Р Вµ Miri; Р С—Р С•Р Т‘ Miri
+        // Р С—РЎР‚Р С•Р Р†Р ВµРЎР‚РЎРЏР ВµР С РЎРѓР В°Р СРЎС“ РЎРѓР Р†РЎРЏР В·Р С”РЎС“ Р Р†РЎвЂ№РЎв‚¬Р Вµ (Р СР В°Р В»Р ВµР Р…РЎРЉР С”Р С•Р в„– Р В°РЎР‚Р ВµР Р…РЎвЂ№ Р Т‘Р В»РЎРЏ Р С—Р ВµРЎР‚Р ВµР С—Р С•Р В»Р Р…Р ВµР Р…Р С‘РЎРЏ Р Р…Р Вµ РЎвЂ¦Р Р†Р В°РЎвЂљР С‘РЎвЂљ).
+        #[cfg(not(miri))]
+        {
+            let mut borrowed_any = false;
+            for _ in 0..2000usize {
+                let p = needy.alloc_raw::<8>(8) as *mut usize;
+                let a = p as usize;
+                if a >= d0.ptr as usize && a < d0.ptr as usize + d0.len {
+                    borrowed_any = true;
+                }
+            }
+            assert!(
+                borrowed_any,
+                "needy Р Т‘Р С•Р В»Р В¶Р ВµР Р… Р В·Р В°Р Р…РЎРЏРЎвЂљРЎРЉ Р С—Р В°Р СРЎРЏРЎвЂљРЎРЉ РЎС“ Р Т‘Р С•Р Р…Р С•РЎР‚Р В°-РЎРѓР С•РЎРѓР ВµР Т‘Р В°"
+            );
+        }
+    }
+
+    #[test]
+    fn split_local_zones_alloc_and_reset_independently() {
+        let (_arena, bump) = make_one(BumpDir::Forward, arena_scale(4096));
+        let zones = bump.split_local(3, BumpDir::Forward);
+        assert_eq!(zones.len(), 3);
+        let mut firsts: Vec<*mut u8> = Vec::with_capacity(3);
+        for z in &zones {
+            // Р С™Р В°Р В¶Р Т‘Р В°РЎРЏ Р В·Р С•Р Р…Р В° Р Р†РЎвЂ№Р Т‘Р ВµР В»РЎРЏР ВµРЎвЂљ Р С‘Р В· РЎРѓР Р†Р С•Р ВµР С–Р С• Р С”РЎС“РЎРѓР С”Р В°.
+            let p = z.alloc::<8>(16);
+            firsts.push(p);
+            assert!(p as usize >= z.inner.ptr as usize);
+            assert!(p as usize + 16 <= z.inner.ptr as usize + z.inner.len);
+        }
+        // Р РЋР В±РЎР‚Р С•РЎРѓ Р Р†Р С•Р В·Р Р†РЎР‚Р В°РЎвЂ°Р В°Р ВµРЎвЂљ РЎРѓРЎвЂЎРЎвЂРЎвЂљРЎвЂЎР С‘Р С”Р С‘ Р Р† Р Р…Р С•Р В»РЎРЉ РІР‚вЂќ Р В·Р С•Р Р…Р В° РЎРѓР Р…Р С•Р Р†Р В° Р Р†РЎвЂ№Р Т‘Р В°РЎвЂРЎвЂљ РЎРѓР В°Р СРЎвЂ№Р в„– Р С—Р ВµРЎР‚Р Р†РЎвЂ№Р в„– Р В°Р Т‘РЎР‚Р ВµРЎРѓ.
+        zones[0].reset();
+        let again = zones[0].alloc::<8>(16);
+        assert_eq!(
+            again, firsts[0],
+            "Р С—Р С•РЎРѓР В»Р Вµ reset Р В·Р С•Р Р…Р В° РЎРѓР Р…Р С•Р Р†Р В° Р С•РЎвЂљР Т‘Р В°РЎвЂРЎвЂљ Р Р…Р В°РЎвЂЎР В°Р В»Р С•"
+        );
+    }
+
+    #[test]
+    fn zone_split_into_threads_use_in_threads() {
+        let (_arena, bump) = make_one(BumpDir::Forward, arena_scale(4096));
+        let bump = CachePadded::into_inner(bump);
+        let zone = bump.into_zone();
+        // Р вЂ”Р С•Р Р…Р В° РІвЂ вЂ™ Send-Р С—Р С•РЎвЂљР С•Р С”Р С‘: РЎР‚Р В°Р В·Р Т‘Р В°РЎвЂР С, РЎР‚Р В°Р В·Р Р…Р С•РЎРѓР С‘Р С Р С—Р С• Р С—Р С•РЎвЂљР С•Р С”Р В°Р С, Р С”Р В°Р В¶Р Т‘РЎвЂ№Р в„– Р С—Р С‘РЎв‚¬Р ВµРЎвЂљ.
+        let threads = zone.split_into_threads(3);
+        assert_eq!(threads.len(), 3);
+        let handles: Vec<_> = threads
+            .into_iter()
+            .map(|tb| {
+                std::thread::spawn(move || {
+                    let p = tb.alloc_uninit_slice::<u64, 8>(1) as *mut u64;
+                    unsafe { *p = 0xABCD };
+                    let _ = tb;
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn into_zone_into_thread_roundtrip_preserves_state() {
+        let (_arena, bump) = make_one(BumpDir::Forward, arena_scale(4096));
+        let bump = CachePadded::into_inner(bump);
+        let _p0 = bump.alloc_raw::<8>(16);
+        let p1 = bump.alloc_raw::<8>(16);
+        let used = bump.allocated_bytes();
+        assert_eq!(used, 32);
+        // Р Р† Р В·Р С•Р Р…РЎС“
+        let zone = bump.into_zone();
+        assert_eq!(
+            zone.allocated_bytes(),
+            used,
+            "Р В·Р С•Р Р…Р В° Р Р…Р В°РЎРѓР В»Р ВµР Т‘РЎС“Р ВµРЎвЂљ РЎРѓРЎвЂЎРЎвЂРЎвЂљРЎвЂЎР С‘Р С”Р С‘ bump'Р В°"
+        );
+        let p2 = zone.alloc::<8>(16);
+        assert!(
+            p2 as usize > p1 as usize,
+            "Р В·Р С•Р Р…Р В° Р С—РЎР‚Р С•Р Т‘Р С•Р В»Р В¶Р В°Р ВµРЎвЂљ РЎР‚Р В°РЎРѓРЎвЂљР С‘ Р С•РЎвЂљ РЎвЂљР С•Р С–Р С• Р В¶Р Вµ РЎвЂћРЎР‚Р С•Р Р…РЎвЂљР С‘РЎР‚Р В°"
+        );
+        // Р С•Р В±РЎР‚Р В°РЎвЂљР Р…Р С• Р Р† ThreadBump
+        let tb = zone.into_thread();
+        assert_eq!(
+            tb.allocated_bytes(),
+            48,
+            "ThreadBump Р Р…Р В°РЎРѓР В»Р ВµР Т‘РЎС“Р ВµРЎвЂљ РЎРѓРЎвЂЎРЎвЂРЎвЂљРЎвЂЎР С‘Р С”Р С‘ Р В·Р С•Р Р…РЎвЂ№"
+        );
+        let p3 = tb.alloc_raw::<8>(16);
+        assert!(p3 as usize > p2 as usize);
+    }
+
+    #[test]
+    fn split_local_by_sizes_preserves_order() {
+        let (_arena, bump) = make_one(BumpDir::Forward, arena_scale(4096));
+        let zones = bump.split_local_by_sizes(&[64usize, 128], BumpDir::Forward);
+        assert_eq!(zones.len(), 2);
+        assert_eq!(zones[0].inner.len, 64);
+        assert!(
+            zones[1].inner.len >= 128,
+            "Р С•РЎРѓРЎвЂљР В°РЎвЂљР С•Р С” РЎС“РЎвЂ¦Р С•Р Т‘Р С‘РЎвЂљ Р С—Р С•РЎРѓР В»Р ВµР Т‘Р Р…Р ВµР в„– Р В·Р С•Р Р…Р Вµ"
+        );
+        assert_eq!(
+            zones[1].inner.ptr as usize,
+            zones[0].inner.ptr as usize + 64,
+            "Р Р†РЎвЂљР С•РЎР‚Р В°РЎРЏ Р В·Р С•Р Р…Р В° Р Р…Р В°РЎвЂЎР С‘Р Р…Р В°Р ВµРЎвЂљРЎРѓРЎРЏ РЎРѓРЎР‚Р В°Р В·РЎС“ Р С—Р С•РЎРѓР В»Р Вµ Р С—Р ВµРЎР‚Р Р†Р С•Р в„–"
+        );
+        let p = zones[0].alloc::<8>(32);
+        assert!(p as usize >= zones[0].inner.ptr as usize);
+        assert!(p as usize + 32 <= zones[0].inner.ptr as usize + zones[0].inner.len);
     }
 }
