@@ -1153,21 +1153,83 @@ impl Drop for ThreadBump {
 /// вызов `align_of::<T>()` в аргументе const-generic запрещён компилятором,
 /// а через ассоциированную константу — разрешён).
 impl ThreadBump {
+    // ===== Кодировка `MODE` для полностью мономорфных версий аллокатора =====
+    // Вся runtime-конфигурация направления/пары/доноров, влияющая на hot-path
+    // `alloc_raw`, упакована в один compile-time `const MODE: u32`. Мономорфные
+    // версии (`alloc_raw_m`, `ArenaVec_m`, `ArenaString_m`, `arena_bench_impl`)
+    // получают MODE как const-генерик, поэтому в их коде нет ни одного
+    // runtime-ветвления по `dir`/`neighbor_idx`/`donor_reg` — компилятор
+    // убирает мёртвые ветки на этапе компиляции.
+    const MODE_DIR_FORWARD: u32 = 0;
+    const MODE_DIR_BACKWARD: u32 = 1;
+    const MODE_DIR_MIDDLEOUT: u32 = 2;
+    const MODE_DIR_MASK: u32 = 0b11;
+    const MODE_PAIR: u32 = 1 << 2;
+    #[allow(dead_code)]
+    const MODE_DONOR_NONE: u32 = 0 << 3;
+    const MODE_DONOR_STATIC: u32 = 1 << 3;
+    const MODE_DONOR_ORX: u32 = 2 << 3;
+    const MODE_DONOR_BOXCAR: u32 = 3 << 3;
+    const MODE_DONOR_MASK: u32 = 0b11 << 3;
+    const MODE_PRIO: u32 = 1 << 5;
+
     // inner-loop аллокатора: не инструментируем (весь цикл меряется `measure_block!`).
+    //
+    // Обёртка разворачивается в вызов специализации по направлению: DIR —
+    // const generic, поэтому `match DIR` в alloc_raw_dir разворачивается на
+    // этапе компиляции, мёртвые ветки исчезают и hot-loop получается компактным
+    // (меньше давление на I-cache). Публичный alloc_raw::<ALIGN> не меняется.
     #[inline(always)]
     fn alloc_raw<const ALIGN: usize>(&self, size: usize) -> *mut u8 {
+        match self.dir {
+            BumpDir::Forward => self.alloc_raw_dir::<ALIGN, { BumpDir::Forward as u8 }>(size),
+            BumpDir::Backward => self.alloc_raw_dir::<ALIGN, { BumpDir::Backward as u8 }>(size),
+            BumpDir::MiddleOut => self.alloc_raw_dir::<ALIGN, { BumpDir::MiddleOut as u8 }>(size),
+        }
+    }
+
+    #[inline(always)]
+    fn alloc_raw_dir<const ALIGN: usize, const DIR: u8>(&self, size: usize) -> *mut u8 {
         // `lo` — байт выделено с левого края (для Backward/MiddleOut семантика
         // своя, см. ниже). `hi` — байт выделено с правого края.
         // ALIGN — константа времени компиляции (задаётся в точке вызова,
         // см. alloc_uninit_slice), поэтому маска выравнивания считается на этапе
         // компиляции, а не прокидывается через аргумент в рантайме.
-        let (off, new_lo, new_hi, pf) = match self.dir {
+        // DIR — const generic, поэтому `match dir` ниже разворачивается на
+        // этапе компиляции: мёртвые ветки направлений исчезают из hot-loop.
+        let dir = match DIR {
+            0 => BumpDir::Forward,
+            1 => BumpDir::Backward,
+            _ => BumpDir::MiddleOut,
+        };
+        let (off, new_lo, new_hi, pf) = match dir {
             // Forward: растём от начала чанка вверх. В режиме пары собственная
             // половина — нижняя [0, mid); середина региона `mid = len/2`.
             //
             // Обновление `lo` делаем через CAS, потому что тот же счётчик
             // параллельно может расширять сосед (заём памяти), см. `try_borrow`.
             BumpDir::Forward => {
+                // Быстрый путь: bump без пары и без доноров — этот поток
+                // единственный владелец `lo`, поэтому CAS-цикл не нужен
+                // (relaxed load+store быстрее lock-prefixed cmpxchg).
+                if self.neighbor_idx.is_none() && matches!(self.donor_reg, DonorReg::None) {
+                    let cur = self.lo.load(Ordering::Relaxed);
+                    let off = (cur + ALIGN - 1) & !(ALIGN - 1);
+                    let end = off + size;
+                    if end <= self.len {
+                        self.lo.store(end, Ordering::Relaxed);
+                        let p = unsafe { self.ptr.add(off) };
+                        prefetch_write(unsafe { self.ptr.add(off + size) });
+                        return p;
+                    }
+                    panic!(
+                        "Arena OOM: need {} at offset {}, free {} (cap {})",
+                        size,
+                        off,
+                        self.len - self.lo.load(Ordering::Relaxed),
+                        self.len
+                    );
+                }
                 let mid = if self.neighbor_idx.is_some() {
                     self.len / 2
                 } else {
@@ -1214,6 +1276,18 @@ impl ThreadBump {
             // половина — верхняя [mid, len). Обновление `hi` — через CAS
             // (тот же счётчик параллельно может расширять сосед-заёмщик).
             BumpDir::Backward => {
+                // Быстрый путь: без пары и доноров — единственный владелец `hi`.
+                if self.neighbor_idx.is_none() && matches!(self.donor_reg, DonorReg::None) {
+                    let cur = self.hi.load(Ordering::Relaxed);
+                    let off = (self.len - cur - size) & !(ALIGN - 1);
+                    let new_hi = self.len - off;
+                    self.hi.store(new_hi, Ordering::Relaxed);
+                    let p = unsafe { self.ptr.add(off) };
+                    if off >= size {
+                        prefetch_write(unsafe { self.ptr.add(off - size) });
+                    }
+                    return p;
+                }
                 let mid = if self.neighbor_idx.is_some() {
                     self.len / 2
                 } else {
@@ -1313,6 +1387,191 @@ impl ThreadBump {
         // фронтир противоположной стороны (туда пойдёт следующая аллокация).
         prefetch_write(pf);
         p
+    }
+
+    // ============ Полностью мономорфные версии аллокатора ============
+    // `alloc_raw_m` — без единого runtime-ветвления по dir/neighbor_idx/
+    // donor_reg: вся конфигурация задана `const MODE`. Мёртвые ветви (dir,
+    // pair, доноры) выкидываются на этапе компиляции, hot-loop получается
+    // максимально компактным. Используется мономорфными бенч-путами
+    // (`ArenaVec_m`/`ArenaString_m`/`arena_bench_impl`). Старые версии
+    // (`alloc_raw`, `alloc_raw_dir`) остаются нетронутыми и для общих путей.
+    #[inline(always)]
+    fn alloc_raw_m<const ALIGN: usize, const MODE: u32>(&self, size: usize) -> *mut u8 {
+        // `let`-привязки к const-generic `MODE` — константы времени компиляции:
+        // const-fold через инлайнинг, мёртвые ветки выкидываются.
+        let pair = MODE & ThreadBump::MODE_PAIR != 0;
+        let donor = (MODE & ThreadBump::MODE_DONOR_MASK) >> 3;
+        let dir = MODE & ThreadBump::MODE_DIR_MASK;
+        match dir {
+            ThreadBump::MODE_DIR_FORWARD => {
+                if !pair && donor == 0 {
+                    // Полный fast path: единственный владелец `lo` — ни CAS, ни
+                    // try_borrow/donor-веток, только load+store.
+                    let cur = self.lo.load(Ordering::Relaxed);
+                    let off = (cur + ALIGN - 1) & !(ALIGN - 1);
+                    let end = off + size;
+                    if end <= self.len {
+                        self.lo.store(end, Ordering::Relaxed);
+                        let p = unsafe { self.ptr.add(off) };
+                        prefetch_write(unsafe { self.ptr.add(off + size) });
+                        return p;
+                    }
+                    panic!(
+                        "Arena OOM: need {} at offset {}, free {} (cap {})",
+                        size,
+                        off,
+                        self.len - self.lo.load(Ordering::Relaxed),
+                        self.len
+                    );
+                }
+                let mid = if pair { self.len / 2 } else { self.len };
+                loop {
+                    let cur = self.lo.load(Ordering::Relaxed);
+                    let off = (cur + ALIGN - 1) & !(ALIGN - 1);
+                    let end = off + size;
+                    if end <= mid {
+                        if self
+                            .lo
+                            .compare_exchange_weak(cur, end, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                        {
+                            let p = unsafe { self.ptr.add(off) };
+                            prefetch_write(unsafe { self.ptr.add(off + size) });
+                            return p;
+                        }
+                    } else if pair {
+                        if let Some(p) = self.try_borrow::<ALIGN>(size) {
+                            return p;
+                        }
+                        if donor != 0 {
+                            if let Some(p) = self.try_take_from_donors::<ALIGN>(size) {
+                                return p;
+                            }
+                            return self.grow_fallback::<ALIGN>(size);
+                        }
+                        panic!(
+                            "Arena OOM: need {} at offset {}, free {} (cap {})",
+                            size,
+                            off,
+                            mid - self.lo.load(Ordering::Relaxed),
+                            self.len
+                        );
+                    } else {
+                        // !pair с donor != 0 (случай !pair && donor==0 вернулся выше).
+                        if let Some(p) = self.try_take_from_donors::<ALIGN>(size) {
+                            return p;
+                        }
+                        return self.grow_fallback::<ALIGN>(size);
+                    }
+                }
+            }
+            ThreadBump::MODE_DIR_BACKWARD => {
+                if !pair && donor == 0 {
+                    let cur = self.hi.load(Ordering::Relaxed);
+                    let off = (self.len - cur - size) & !(ALIGN - 1);
+                    let new_hi = self.len - off;
+                    self.hi.store(new_hi, Ordering::Relaxed);
+                    let p = unsafe { self.ptr.add(off) };
+                    if off >= size {
+                        prefetch_write(unsafe { self.ptr.add(off - size) });
+                    }
+                    return p;
+                }
+                let mid = if pair { self.len / 2 } else { 0 };
+                loop {
+                    let cur = self.hi.load(Ordering::Relaxed);
+                    let off = (self.len - cur - size) & !(ALIGN - 1);
+                    if off >= mid {
+                        let new_hi = self.len - off;
+                        if self
+                            .hi
+                            .compare_exchange_weak(
+                                cur,
+                                new_hi,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            )
+                            .is_ok()
+                        {
+                            let p = unsafe { self.ptr.add(off) };
+                            if off >= size {
+                                prefetch_write(unsafe { self.ptr.add(off - size) });
+                            }
+                            return p;
+                        }
+                    } else if pair {
+                        if let Some(p) = self.try_borrow::<ALIGN>(size) {
+                            return p;
+                        }
+                        if donor != 0 {
+                            if let Some(p) = self.try_take_from_donors::<ALIGN>(size) {
+                                return p;
+                            }
+                            return self.grow_fallback::<ALIGN>(size);
+                        }
+                        panic!(
+                            "Arena OOM: need {} bytes, only {} free (cap {})",
+                            size,
+                            self.len - cur - mid,
+                            self.len
+                        );
+                    } else {
+                        if let Some(p) = self.try_take_from_donors::<ALIGN>(size) {
+                            return p;
+                        }
+                        return self.grow_fallback::<ALIGN>(size);
+                    }
+                }
+            }
+            _ => {
+                let mid = self.len / 2;
+                let side = self.toggle.get();
+                self.toggle.set(!side);
+                if !side {
+                    let base = mid - self.lo.load(Ordering::Relaxed);
+                    if size > base {
+                        panic!(
+                            "Arena OOM: need {} at offset {}, free {} (cap {})",
+                            size,
+                            mid - self.lo.load(Ordering::Relaxed),
+                            base,
+                            self.len
+                        );
+                    }
+                    let off = (base - size) & !(ALIGN - 1);
+                    let new_lo = mid - off;
+                    let new_hi = self.hi.load(Ordering::Relaxed);
+                    let pf = unsafe { self.ptr.add(mid + new_hi + size) };
+                    self.lo.store(new_lo, Ordering::Relaxed);
+                    self.hi.store(new_hi, Ordering::Relaxed);
+                    let p = unsafe { self.ptr.add(off) };
+                    prefetch_write(pf);
+                    p
+                } else {
+                    let base = mid + self.hi.load(Ordering::Relaxed);
+                    let off = (base + ALIGN - 1) & !(ALIGN - 1);
+                    let end = off + size;
+                    if end > self.len {
+                        panic!(
+                            "Arena OOM: need {} at offset {}, free {} (cap {})",
+                            size,
+                            off,
+                            self.len - end,
+                            self.len
+                        );
+                    }
+                    let new_lo = self.lo.load(Ordering::Relaxed);
+                    let new_hi = off + size - mid;
+                    let pf = unsafe { self.ptr.add(mid.wrapping_sub(new_lo + size)) };
+                    self.lo.store(new_lo, Ordering::Relaxed);
+                    self.hi.store(new_hi, Ordering::Relaxed);
+                    let p = unsafe { self.ptr.add(off) };
+                    prefetch_write(pf);
+                    p
+                }
+            }
+        }
     }
 
     /// Попытка «занять» память у соседа объединённого региона, когда в своей
@@ -1645,6 +1904,17 @@ impl ThreadBump {
         // ALIGN прокинут как const generic из точки вызова (см. ArenaVec),
         // поэтому выравнивание известно на этапе компиляции.
         self.alloc_raw::<ALIGN>(size) as *mut T
+    }
+
+    /// Мономорфная версия `alloc_uninit_slice`: MODE — compile-time конфигурация
+    /// (dir + pair + доноры), без runtime-диспетчеризации в hot-loop.
+    #[inline(always)]
+    fn alloc_uninit_slice_m<T, const ALIGN: usize, const MODE: u32>(&self, count: usize) -> *mut T {
+        if count == 0 {
+            return ptr::null_mut();
+        }
+        let size = count * core::mem::size_of::<T>();
+        self.alloc_raw_m::<ALIGN, MODE>(size) as *mut T
     }
 
     #[hotpath::measure]
@@ -2410,6 +2680,62 @@ impl<T> ArenaVec<T> {
         self.cap = new_cap;
     }
 
+    // ===== Мономорфные версии (конфигурируются compile-time `MODE`) =====
+    #[inline(always)]
+    fn with_capacity_in_m<const ALIGN: usize, const MODE: u32>(
+        capacity: usize,
+        bump: &ThreadBump,
+    ) -> Self {
+        if capacity == 0 {
+            return Self {
+                ptr: ptr::null_mut(),
+                len: 0,
+                cap: 0,
+            };
+        }
+        let ptr = bump.alloc_uninit_slice_m::<T, ALIGN, MODE>(capacity);
+        Self {
+            ptr,
+            len: 0,
+            cap: capacity,
+        }
+    }
+
+    #[inline(always)]
+    fn push_m<const ALIGN: usize, const MODE: u32>(&mut self, value: T, bump: &ThreadBump) {
+        if self.len == self.cap {
+            self.grow_m::<ALIGN, MODE>(bump);
+        }
+        unsafe {
+            self.ptr.add(self.len).write(value);
+        }
+        self.len += 1;
+    }
+
+    fn from_slice_in_m<const ALIGN: usize, const MODE: u32>(slice: &[T], bump: &ThreadBump) -> Self
+    where
+        T: Copy,
+    {
+        let len = slice.len();
+        let ptr = bump.alloc_uninit_slice_m::<T, ALIGN, MODE>(len);
+        unsafe {
+            ptr::copy_nonoverlapping(slice.as_ptr(), ptr, len);
+        }
+        Self { ptr, len, cap: len }
+    }
+
+    fn grow_m<const ALIGN: usize, const MODE: u32>(&mut self, bump: &ThreadBump) {
+        let new_cap = if self.cap == 0 { 4 } else { self.cap * 2 };
+        let new_ptr = bump.alloc_uninit_slice_m::<T, ALIGN, MODE>(new_cap);
+        if self.len > 0 {
+            unsafe {
+                ptr::copy_nonoverlapping(self.ptr, new_ptr, self.len);
+            }
+        }
+        self.ptr = new_ptr;
+        self.cap = new_cap;
+    }
+
     /// Возвращает срез элементов (безопасно, если len > 0)
     fn as_slice(&self) -> &[T] {
         if self.len == 0 {
@@ -2440,6 +2766,13 @@ impl ArenaString {
     fn from_str_in(s: &str, bump: &ThreadBump) -> Self {
         // элемент строки — u8, выравнивание = 1
         let vec = ArenaVec::from_slice_in::<1>(s.as_bytes(), bump);
+        Self { vec }
+    }
+
+    /// Мономорфная версия `from_str_in` (compile-time `MODE`).
+    #[inline(always)]
+    fn from_str_in_m<const MODE: u32>(s: &str, bump: &ThreadBump) -> Self {
+        let vec = ArenaVec::from_slice_in_m::<1, MODE>(s.as_bytes(), bump);
         Self { vec }
     }
 }
@@ -2761,6 +3094,176 @@ fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
     });
 }
 
+/// Полностью мономорфная версия `arena_bench`: конфигурация (направление,
+/// пара/доноры) задана `const MODE`, поэтому ни `match layout`, ни
+/// runtime-диспетчеризация в hot-loop нет. Старый `arena_bench` остаётся для
+/// общих/динамических путей.
+#[inline(always)]
+fn arena_run_thread<const MODE: u32, const FULL: bool>(bump: &ThreadBump) {
+    hotpath::measure_block!("prefault", {
+        bump.prefault_local(); // first-touch Р Р† Р В»Р С•Р С”Р В°Р В»РЎРЉР Р…Р С•Р в„– NUMA-Р Р…Р С•Р Т‘Р Вµ
+    });
+    let (vcap, outer, inner) = if FULL {
+        (40000, 200, 200)
+    } else {
+        (10000, 100, 100)
+    };
+    for _ in 0..3 {
+        hotpath::measure_block!("alloc", {
+            let mut vectr: ArenaVec<ArenaVec<ArenaString>> = ArenaVec::with_capacity_in_m::<
+                { core::mem::align_of::<ArenaVec<ArenaString>>() },
+                MODE,
+            >(vcap, bump);
+            for _ in 0..outer {
+                for _ in 0..inner {
+                    let mut vec: ArenaVec<ArenaString> = ArenaVec::with_capacity_in_m::<
+                        { core::mem::align_of::<ArenaString>() },
+                        MODE,
+                    >(400, bump);
+                    for _ in 0..100 {
+                        vec.push_m::<{ core::mem::align_of::<ArenaString>() }, MODE>(
+                            ArenaString::from_str_in_m::<MODE>("stroka", bump),
+                            bump,
+                        );
+                    }
+                    vectr.push_m::<{ core::mem::align_of::<ArenaVec<ArenaString>>() }, MODE>(
+                        vec, bump,
+                    );
+                }
+            }
+            core::hint::black_box(&vectr);
+            drop(vectr);
+        });
+        hotpath::measure_block!("reset", {
+            bump.reset();
+        });
+    }
+}
+
+fn arena_bench_impl<const MODE: u32, const FULL: bool>(chunk_size: usize, smt: bool) {
+    let core_ids = get_cores(smt);
+    let total_capacity = chunk_size * core_ids.len();
+    let arena = SharedArena::new(total_capacity);
+    let bumps = make_split::<MODE>(&arena, core_ids.len());
+    std::thread::scope(|s| {
+        for (core_id, i) in core_ids.iter().zip(0..bumps.len()) {
+            let core = *core_id;
+            let bump = &bumps[i];
+            s.spawn(move || {
+                core_affinity::set_for_current(core);
+                arena_run_thread::<MODE, FULL>(bump);
+            });
+        }
+    });
+}
+
+fn make_split<'a, const MODE: u32>(arena: &'a SharedArena, n: usize) -> Split<'a> {
+    let pair = MODE & ThreadBump::MODE_PAIR != 0;
+    let donorkind = (MODE & ThreadBump::MODE_DONOR_MASK) >> 3;
+    let prio = MODE & ThreadBump::MODE_PRIO != 0;
+    let dir = match MODE & ThreadBump::MODE_DIR_MASK {
+        ThreadBump::MODE_DIR_BACKWARD => BumpDir::Backward,
+        ThreadBump::MODE_DIR_MIDDLEOUT => BumpDir::MiddleOut,
+        _ => BumpDir::Forward,
+    };
+    if pair {
+        arena.split_paired_safe(n)
+    } else if donorkind != 0 {
+        let policy = match (donorkind, prio) {
+            (1, false) => DonorPolicy::static_(4),
+            (1, true) => DonorPolicy::static_(4).with_priority(),
+            (2, false) => DonorPolicy::orx(4),
+            (2, true) => DonorPolicy::orx(4).with_priority(),
+            (3, false) => DonorPolicy::boxcar(4),
+            (3, true) => DonorPolicy::boxcar(4).with_priority(),
+            _ => unreachable!(),
+        };
+        arena.split_donors_with_safe(n, policy)
+    } else {
+        arena.split_with_safe(n, dir)
+    }
+}
+
+// ===== Готовые значения MODE для мономорфных бенч-версий по всем типам shared =====
+// (Направление + пара + вид доноров/приоритет задаются compile-time.)
+const MODE_FWD: u32 = ThreadBump::MODE_DIR_FORWARD;
+const MODE_BWD: u32 = ThreadBump::MODE_DIR_BACKWARD;
+const MODE_MO: u32 = ThreadBump::MODE_DIR_MIDDLEOUT;
+
+const MODE_PAIR_FWD: u32 = ThreadBump::MODE_PAIR | ThreadBump::MODE_DIR_FORWARD;
+
+const MODE_DONORS_STATIC: u32 = ThreadBump::MODE_DONOR_STATIC | ThreadBump::MODE_DIR_FORWARD;
+const MODE_DONORS_STATIC_PRIO: u32 = MODE_DONORS_STATIC | ThreadBump::MODE_PRIO;
+const MODE_DONORS_ORX: u32 = ThreadBump::MODE_DONOR_ORX | ThreadBump::MODE_DIR_FORWARD;
+const MODE_DONORS_ORX_PRIO: u32 = MODE_DONORS_ORX | ThreadBump::MODE_PRIO;
+const MODE_DONORS_BOXCAR: u32 = ThreadBump::MODE_DONOR_BOXCAR | ThreadBump::MODE_DIR_FORWARD;
+const MODE_DONORS_BOXCAR_PRIO: u32 = MODE_DONORS_BOXCAR | ThreadBump::MODE_PRIO;
+
+/// Neighbors: чётные — Backward, нечётные — Forward (заполняют общую границу
+/// навстречу). ПОЛНОСТЬЮ мономорфный путь: per-thread направление зашито
+/// константно через два отдельных runner-инстанцирования.
+fn arena_bench_neighbors_impl<const FULL: bool>(chunk_size: usize, smt: bool) {
+    let core_ids = get_cores(smt);
+    let total_capacity = chunk_size * core_ids.len();
+    let arena = SharedArena::new(total_capacity);
+    let bumps = arena.split_alternating_safe(core_ids.len());
+    std::thread::scope(|s| {
+        for (core_id, i) in core_ids.iter().zip(0..bumps.len()) {
+            let core = *core_id;
+            let bump = &bumps[i];
+            s.spawn(move || {
+                core_affinity::set_for_current(core);
+                if i % 2 == 0 {
+                    arena_run_thread::<MODE_BWD, FULL>(bump);
+                } else {
+                    arena_run_thread::<MODE_FWD, FULL>(bump);
+                }
+            });
+        }
+    });
+}
+
+/// `full` — объём работы (FULL или LIGHT).
+macro_rules! mono_bench_wrappers {
+    ($($full_tot:ident: $name:ident = $mode:expr;)*) => {
+        $(
+            pub fn $name(chunk_size: usize, smt: bool) {
+                arena_bench_impl::<$mode, { $full_tot }>(chunk_size, smt);
+            }
+        )*
+    };
+}
+
+mono_bench_wrappers! {
+    true: arena_m_full_forward = MODE_FWD;
+    true: arena_m_full_backward = MODE_BWD;
+    true: arena_m_full_middleout = MODE_MO;
+    true: arena_m_full_pair = MODE_PAIR_FWD;
+    true: arena_m_full_donors = MODE_DONORS_STATIC;
+    true: arena_m_full_donors_prio = MODE_DONORS_STATIC_PRIO;
+    true: arena_m_full_donors_orx = MODE_DONORS_ORX;
+    true: arena_m_full_donors_orx_prio = MODE_DONORS_ORX_PRIO;
+    true: arena_m_full_donors_boxcar = MODE_DONORS_BOXCAR;
+    true: arena_m_full_donors_boxcar_prio = MODE_DONORS_BOXCAR_PRIO;
+    false: arena_m_light_forward = MODE_FWD;
+    false: arena_m_light_backward = MODE_BWD;
+    false: arena_m_light_middleout = MODE_MO;
+    false: arena_m_light_pair = MODE_PAIR_FWD;
+    false: arena_m_light_donors = MODE_DONORS_STATIC;
+    false: arena_m_light_donors_prio = MODE_DONORS_STATIC_PRIO;
+    false: arena_m_light_donors_orx = MODE_DONORS_ORX;
+    false: arena_m_light_donors_orx_prio = MODE_DONORS_ORX_PRIO;
+    false: arena_m_light_donors_boxcar = MODE_DONORS_BOXCAR;
+    false: arena_m_light_donors_boxcar_prio = MODE_DONORS_BOXCAR_PRIO;
+}
+
+pub fn arena_m_full_neighbors(chunk_size: usize, smt: bool) {
+    arena_bench_neighbors_impl::<true>(chunk_size, smt);
+}
+pub fn arena_m_light_neighbors(chunk_size: usize, smt: bool) {
+    arena_bench_neighbors_impl::<false>(chunk_size, smt);
+}
+
 pub fn arena_full(chunk_size: usize, smt: bool) {
     arena_bench(
         chunk_size,
@@ -2967,6 +3470,66 @@ fn verbose_enabled() -> bool {
     std::env::var("R3_VERBOSE").is_ok()
 }
 
+/// Какую версию бенчмарка «shared arena» гонять: полностью мономорфную
+/// (`alloc_raw_m`, `arena_m_*`), с runtime-диспетчером (`arena_bench`,
+/// `arena_full`/`arena_light`/...), или обе подряд. Выбирается переменной
+/// окружения `R3_BENCH_STYLE=mono|dispatch|both` (по умолчанию `both`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum BenchStyle {
+    Mono,
+    Dispatch,
+    Both,
+}
+
+fn bench_style() -> BenchStyle {
+    match std::env::var("R3_BENCH_STYLE").as_deref() {
+        Ok("mono") => BenchStyle::Mono,
+        Ok("dispatch") => BenchStyle::Dispatch,
+        _ => BenchStyle::Both,
+    }
+}
+
+/// Запустить один бенч-вариант арены с нужным стилем (mono/dispatch/both) и
+/// вернуть медиану времени. `print_name` — как пометить строку.
+fn run_arena_variant<M: Fn(usize, bool) -> (), D: Fn(usize, bool) -> ()>(
+    style: BenchStyle,
+    label: &str,
+    mono: M,
+    dispatch: D,
+    chunk: usize,
+    smt: bool,
+) {
+    let bench = |f: &dyn Fn(usize, bool) -> ()| {
+        (0..10)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                f(chunk, smt);
+                start.elapsed().as_micros()
+            })
+            .collect::<Vec<u128>>()
+    };
+    match style {
+        BenchStyle::Mono => {
+            let t = bench(&|c, s| mono(c, s));
+            println!("  {:<12} mono     : {} Р’Вµs", label, median(&t));
+        }
+        BenchStyle::Dispatch => {
+            let t = bench(&|c, s| dispatch(c, s));
+            println!("  {:<12} dispatch : {} Р’Вµs", label, median(&t));
+        }
+        BenchStyle::Both => {
+            let t_mono = bench(&|c, s| mono(c, s));
+            let t_disp = bench(&|c, s| dispatch(c, s));
+            println!(
+                "  {:<12} mono {:>6} Р’Вµs | dispatch {:>6} Р’Вµs",
+                label,
+                median(&t_mono),
+                median(&t_disp)
+            );
+        }
+    }
+}
+
 fn get_cores(smt: bool) -> Vec<core_affinity::CoreId> {
     let all = core_affinity::get_core_ids().unwrap();
     if smt {
@@ -3137,61 +3700,194 @@ fn run_directional_benchmarks(smt: bool, pgo_full_arena: usize, pgo_light_arena:
     };
     println!("\n########## Directional Arena: {} ##########\n", mode_str);
 
-    let full_variants: &[(&str, fn(usize, bool))] = &[
-        ("Forward", |c, s| arena_full_dir(c, s, BumpDir::Forward)),
-        ("Backward", |c, s| arena_full_dir(c, s, BumpDir::Backward)),
-        ("MiddleOut", |c, s| arena_full_dir(c, s, BumpDir::MiddleOut)),
-        ("Neighbors", |c, s| arena_full_neighbors(c, s)),
-        ("Pair", |c, s| arena_full_pair(c, s)),
-        ("Donors", |c, s| arena_full_donors(c, s)),
-        ("DonorsPrio", |c, s| arena_full_donors_prio(c, s)),
-        ("DonorsOrx", |c, s| arena_full_donors_orx(c, s)),
-        ("DonorsOrxPrio", |c, s| arena_full_donors_orx_prio(c, s)),
-        ("DonorsBoxcar", |c, s| arena_full_donors_boxcar(c, s)),
-        ("DonorsBoxcarPrio", |c, s| {
-            arena_full_donors_boxcar_prio(c, s)
-        }),
-    ];
-    println!("=== Directional FULL ({}) ===", mode_str);
-    for (name, f) in full_variants {
-        let t: Vec<u128> = (0..10)
-            .map(|_| {
-                let start = std::time::Instant::now();
-                f(pgo_full_arena, smt);
-                start.elapsed().as_micros()
-            })
-            .collect();
-        println!("  {:<10}: {} Р’Вµs", name, median(&t));
-    }
+    let style = bench_style();
+    println!(
+        "=== Directional FULL ({}) — style {:?} ===",
+        mode_str, style
+    );
 
-    let light_variants: &[(&str, fn(usize, bool))] = &[
-        ("Forward", |c, s| arena_light_dir(c, s, BumpDir::Forward)),
-        ("Backward", |c, s| arena_light_dir(c, s, BumpDir::Backward)),
-        ("MiddleOut", |c, s| {
-            arena_light_dir(c, s, BumpDir::MiddleOut)
-        }),
-        ("Neighbors", |c, s| arena_light_neighbors(c, s)),
-        ("Pair", |c, s| arena_light_pair(c, s)),
-        ("Donors", |c, s| arena_light_donors(c, s)),
-        ("DonorsPrio", |c, s| arena_light_donors_prio(c, s)),
-        ("DonorsOrx", |c, s| arena_light_donors_orx(c, s)),
-        ("DonorsOrxPrio", |c, s| arena_light_donors_orx_prio(c, s)),
-        ("DonorsBoxcar", |c, s| arena_light_donors_boxcar(c, s)),
-        ("DonorsBoxcarPrio", |c, s| {
-            arena_light_donors_boxcar_prio(c, s)
-        }),
-    ];
-    println!("=== Directional LIGHT ({}) ===", mode_str);
-    for (name, f) in light_variants {
-        let t: Vec<u128> = (0..10)
-            .map(|_| {
-                let start = std::time::Instant::now();
-                f(pgo_light_arena, smt);
-                start.elapsed().as_micros()
-            })
-            .collect();
-        println!("  {:<10}: {} Р’Вµs", name, median(&t));
-    }
+    run_arena_variant(
+        style,
+        "Forward",
+        arena_m_full_forward,
+        |c, s| arena_full_dir(c, s, BumpDir::Forward),
+        pgo_full_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "Backward",
+        arena_m_full_backward,
+        |c, s| arena_full_dir(c, s, BumpDir::Backward),
+        pgo_full_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "MiddleOut",
+        arena_m_full_middleout,
+        |c, s| arena_full_dir(c, s, BumpDir::MiddleOut),
+        pgo_full_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "Neighbors",
+        arena_m_full_neighbors,
+        arena_full_neighbors,
+        pgo_full_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "Pair",
+        arena_m_full_pair,
+        arena_full_pair,
+        pgo_full_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "Donors",
+        arena_m_full_donors,
+        arena_full_donors,
+        pgo_full_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "DonorsPrio",
+        arena_m_full_donors_prio,
+        arena_full_donors_prio,
+        pgo_full_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "DonorsOrx",
+        arena_m_full_donors_orx,
+        arena_full_donors_orx,
+        pgo_full_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "DonorsOrxPrio",
+        arena_m_full_donors_orx_prio,
+        arena_full_donors_orx_prio,
+        pgo_full_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "DonorsBoxcar",
+        arena_m_full_donors_boxcar,
+        arena_full_donors_boxcar,
+        pgo_full_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "DonorsBoxcarPrio",
+        arena_m_full_donors_boxcar_prio,
+        arena_full_donors_boxcar_prio,
+        pgo_full_arena,
+        smt,
+    );
+
+    println!(
+        "=== Directional LIGHT ({}) — style {:?} ===",
+        mode_str, style
+    );
+
+    run_arena_variant(
+        style,
+        "Forward",
+        arena_m_light_forward,
+        |c, s| arena_light_dir(c, s, BumpDir::Forward),
+        pgo_light_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "Backward",
+        arena_m_light_backward,
+        |c, s| arena_light_dir(c, s, BumpDir::Backward),
+        pgo_light_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "MiddleOut",
+        arena_m_light_middleout,
+        |c, s| arena_light_dir(c, s, BumpDir::MiddleOut),
+        pgo_light_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "Neighbors",
+        arena_m_light_neighbors,
+        arena_light_neighbors,
+        pgo_light_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "Pair",
+        arena_m_light_pair,
+        arena_light_pair,
+        pgo_light_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "Donors",
+        arena_m_light_donors,
+        arena_light_donors,
+        pgo_light_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "DonorsPrio",
+        arena_m_light_donors_prio,
+        arena_light_donors_prio,
+        pgo_light_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "DonorsOrx",
+        arena_m_light_donors_orx,
+        arena_light_donors_orx,
+        pgo_light_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "DonorsOrxPrio",
+        arena_m_light_donors_orx_prio,
+        arena_light_donors_orx_prio,
+        pgo_light_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "DonorsBoxcar",
+        arena_m_light_donors_boxcar,
+        arena_light_donors_boxcar,
+        pgo_light_arena,
+        smt,
+    );
+    run_arena_variant(
+        style,
+        "DonorsBoxcarPrio",
+        arena_m_light_donors_boxcar_prio,
+        arena_light_donors_boxcar_prio,
+        pgo_light_arena,
+        smt,
+    );
 }
 
 fn run_benchmarks(
@@ -3208,7 +3904,45 @@ fn run_benchmarks(
     };
     println!("\n########## Бенч: {} ##########\n", mode_str);
 
-    // Прогрев
+    let style = bench_style();
+    // Default-Forward арена: mono (`arena_m_*_forward`) vs dispatch (`arena_*`).
+    // Возвращает (mono_us, dispatch_us) — по стилю заполняет нужные.
+    let arena_mesure =
+        |chunk: usize, mono: fn(usize, bool), dispatch: fn(usize, bool)| -> (u128, u128) {
+            let m = (0..10)
+                .map(|_| {
+                    let s = std::time::Instant::now();
+                    mono(chunk, smt);
+                    s.elapsed().as_micros()
+                })
+                .collect::<Vec<_>>();
+            let d = (0..10)
+                .map(|_| {
+                    let s = std::time::Instant::now();
+                    dispatch(chunk, smt);
+                    s.elapsed().as_micros()
+                })
+                .collect::<Vec<_>>();
+            (median(&m), median(&d))
+        };
+    let arena_full_res = |chunk: usize| {
+        let (m, d) = arena_mesure(chunk, arena_m_full_forward, arena_full);
+        match style {
+            BenchStyle::Mono => (m, m),
+            BenchStyle::Dispatch => (d, d),
+            BenchStyle::Both => (m, d),
+        }
+    };
+    let arena_light_res = |chunk: usize| {
+        let (m, d) = arena_mesure(chunk, arena_m_light_forward, arena_light);
+        match style {
+            BenchStyle::Mono => (m, m),
+            BenchStyle::Dispatch => (d, d),
+            BenchStyle::Both => (m, d),
+        }
+    };
+
+    // Прогрев (гоняем выбранный стиль как минимум один раз).
     for _ in 0..5 {
         mimm(smt);
         mimm_light(smt);
@@ -3220,7 +3954,7 @@ fn run_benchmarks(
         arena_light(pgo_light_arena, smt);
     }
 
-    println!("=== FULL VERSION ({}) ===", mode_str);
+    println!("=== FULL VERSION ({}) — style {:?} ===", mode_str, style);
     for round in 0..3 {
         let mimm_times: Vec<u128> = (0..10)
             .map(|_| {
@@ -3243,25 +3977,38 @@ fn run_benchmarks(
                 start.elapsed().as_micros()
             })
             .collect();
-        let arena_times: Vec<u128> = (0..10)
-            .map(|_| {
-                let start = std::time::Instant::now();
-                arena_full(pgo_full_arena, smt);
-                start.elapsed().as_micros()
-            })
-            .collect();
+        let (arena_mono_us, arena_disp_us) = arena_full_res(pgo_full_arena);
 
-        println!(
-            "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena = {} Р’Вµs",
-            round + 1,
-            median(&mimm_times),
-            median(&bump_times),
-            median(&shared_times),
-            median(&arena_times)
-        );
+        match style {
+            BenchStyle::Mono => println!(
+                "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena(mono) = {} Р’Вµs",
+                round + 1,
+                median(&mimm_times),
+                median(&bump_times),
+                median(&shared_times),
+                arena_mono_us
+            ),
+            BenchStyle::Dispatch => println!(
+                "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena(dispatch) = {} Р’Вµs",
+                round + 1,
+                median(&mimm_times),
+                median(&bump_times),
+                median(&shared_times),
+                arena_disp_us
+            ),
+            BenchStyle::Both => println!(
+                "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena mono|dispatch = {}|{} Р’Вµs",
+                round + 1,
+                median(&mimm_times),
+                median(&bump_times),
+                median(&shared_times),
+                arena_mono_us,
+                arena_disp_us
+            ),
+        }
     }
 
-    println!("\n=== LIGHT VERSION ({}) ===", mode_str);
+    println!("\n=== LIGHT VERSION ({}) — style {:?} ===", mode_str, style);
     for round in 0..3 {
         let mimm_times: Vec<u128> = (0..10)
             .map(|_| {
@@ -3284,22 +4031,35 @@ fn run_benchmarks(
                 start.elapsed().as_micros()
             })
             .collect();
-        let arena_times: Vec<u128> = (0..10)
-            .map(|_| {
-                let start = std::time::Instant::now();
-                arena_light(pgo_light_arena, smt);
-                start.elapsed().as_micros()
-            })
-            .collect();
+        let (arena_mono_us, arena_disp_us) = arena_light_res(pgo_light_arena);
 
-        println!(
-            "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena = {} Р’Вµs",
-            round + 1,
-            median(&mimm_times),
-            median(&bump_times),
-            median(&shared_times),
-            median(&arena_times)
-        );
+        match style {
+            BenchStyle::Mono => println!(
+                "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena(mono) = {} Р’Вµs",
+                round + 1,
+                median(&mimm_times),
+                median(&bump_times),
+                median(&shared_times),
+                arena_mono_us
+            ),
+            BenchStyle::Dispatch => println!(
+                "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena(dispatch) = {} Р’Вµs",
+                round + 1,
+                median(&mimm_times),
+                median(&bump_times),
+                median(&shared_times),
+                arena_disp_us
+            ),
+            BenchStyle::Both => println!(
+                "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena mono|dispatch = {}|{} Р’Вµs",
+                round + 1,
+                median(&mimm_times),
+                median(&bump_times),
+                median(&shared_times),
+                arena_mono_us,
+                arena_disp_us
+            ),
+        }
     }
 }
 

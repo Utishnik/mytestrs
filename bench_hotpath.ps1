@@ -11,12 +11,16 @@
 #   powershell -File bench_hotpath.ps1 -Out custom.json       # custom report filename
 #   powershell -File bench_hotpath.ps1 -Prefetch              # + win-prefetch-pages
 #   powershell -File bench_hotpath.ps1 -Capture               # discard bench stdout
+#   powershell -File bench_hotpath.ps1 -Style mono            # arena: mono-only (R3_BENCH_STYLE=mono)
+#   powershell -File bench_hotpath.ps1 -Style dispatch        # arena: dispatch-only
+#   powershell -File bench_hotpath.ps1 -Style both            # arena: mono + dispatch (default)
 param(
     [switch]$Prefetch,
     [switch]$Json,
     [string]$Out = "",
     [switch]$Capture,
-    [switch]$Divan
+    [switch]$Divan,
+    [ValidateSet('mono', 'dispatch', 'both')][string]$Style = 'both'
 )
 
 $ErrorActionPreference = "Stop"
@@ -58,7 +62,8 @@ if ($Divan) {
 }
 
 $bin = ".\target\release\r3.exe"
-Write-Host "===== Running hotpath benchmark =====" -ForegroundColor Cyan
+$env:R3_BENCH_STYLE = $Style
+Write-Host "===== Running hotpath benchmark (style=$Style) =====" -ForegroundColor Cyan
 if ($Capture) {
     & $bin *> $null
 } else {

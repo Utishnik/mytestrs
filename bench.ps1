@@ -8,8 +8,10 @@
 #   powershell -File bench.ps1 3
 #   powershell -File bench.ps1 4
 #   powershell -File bench.ps1 all
+#   powershell -File bench.ps1 -Style mono/dispatch/both   # arena version to run (default: both)
 param(
-    [ValidateSet(1, 2, 3, 4, 'all')]$mode = 1
+    [ValidateSet(1, 2, 3, 4, 'all')]$mode = 1,
+    [ValidateSet('mono', 'dispatch', 'both')][string]$Style = 'both'
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,6 +29,7 @@ foreach ($m in $modes) {
     & powershell -File build.ps1 -mode $m
 
     $bin = BinFor $m
-    Write-Host "===== Running benchmark (mode $m) =====" -ForegroundColor Cyan
+    Write-Host "===== Running benchmark (mode $m, style=$Style) =====" -ForegroundColor Cyan
+    $env:R3_BENCH_STYLE = $Style
     & $bin | Tee-Object -FilePath "bench_mode$m.log"
 }
