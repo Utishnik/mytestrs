@@ -721,10 +721,14 @@ impl SharedArena {
                 if i % 2 == 0 {
                     // Чётный — ведущий чанк пары: общий регион [2k*cs, 2k*cs+2cs).
                     let pair_start = (i / 2) * 2 * chunk_size;
+                    // Регион пары не должен выходить за пределы арены: `chunk_size`
+                    // округляется вверх до 16, поэтому последняя пара/одиночный
+                    // чанк могут иначе выступать за `total` (OOB под Miri).
+                    let region_len = (total - pair_start).min(2 * chunk_size);
                     let combined_len = if i + 1 < num_threads {
-                        2 * chunk_size
+                        region_len
                     } else {
-                        chunk_size
+                        region_len.min(chunk_size)
                     };
                     CachePadded::new(ThreadBump {
                         ptr: unsafe { base.add(pair_start) },
@@ -753,11 +757,14 @@ impl SharedArena {
                     })
                 } else {
                     // Нечётный — тот же самый объединённый регион пары, что и у
-                    // чётного (i-1), заполняется слева направо.
+                    // чётного (i-1), заполняется слева направо. Длина должна
+                    // совпадать с длиной чётного партнёра, чтобы граница `mid`
+                    // пары была общей (иначе адреса расходятся и может быть OOB).
                     let pair_start = ((i - 1) / 2) * 2 * chunk_size;
+                    let region_len = (total - pair_start).min(2 * chunk_size);
                     CachePadded::new(ThreadBump {
                         ptr: unsafe { base.add(pair_start) },
-                        len: 2 * chunk_size,
+                        len: region_len,
                         lo: AtomicUsize::new(0),
                         hi: AtomicUsize::new(0),
                         toggle: Cell::new(false),
@@ -934,9 +941,13 @@ impl SharedArena {
             .map(|i| {
                 #[cfg(test)]
                 let can_give = policy.every > 0 && i % policy.every == 0;
+                // Длина последнего чанка ограничена концом арены: `chunk_size`
+                // округляется вверх до 16, поэтому иначе он мог бы выйти за
+                // `total` (OOB под Miri).
+                let chunk_len = ((i + 1) * chunk_size).min(total) - i * chunk_size;
                 CachePadded::new(ThreadBump {
                     ptr: unsafe { base.add(i * chunk_size) },
-                    len: chunk_size,
+                    len: chunk_len,
                     lo: AtomicUsize::new(0),
                     hi: AtomicUsize::new(0),
                     toggle: Cell::new(false),
@@ -5476,6 +5487,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn cov_typed_arena_concurrent_cas_retry() {
         use std::sync::{Arc, Barrier};
         // Один большой первичный регион: все потоки мапятся на region 0 и
@@ -5679,6 +5691,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn cov_pair_cas_contention() {
         // Много потоков бьют по одному и тому же bump'у пары одновременно → CAS
         // retry в alloc_raw_m (Forward 1257, Backward 1322).
@@ -5705,6 +5718,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn cov_donor_take_cas_contention() {
         // Доноры 0,2 (every=2) остаются пустыми; заёмщики 1,3 переполняют свои
         // регионы и одновременно берут у общих доноров 0 и 2 → CAS retry в
@@ -5736,6 +5750,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn cov_neighbor_borrow_cas_contention() {
         // Пара: оба собственные половины заполнены; переполнение одного соседа
         // заставляет несколько потоков одновременно заимствовать у общего соседа
