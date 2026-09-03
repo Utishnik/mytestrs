@@ -5487,21 +5487,27 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     fn cov_typed_arena_concurrent_cas_retry() {
         use std::sync::{Arc, Barrier};
         // Один большой первичный регион: все потоки мапятся на region 0 и
         // одновременно бьют по одному и тому же счётчику `used` → CAS retry
         // (typed_arena.rs:158) срабатывает наверняка.
         let arena = Arc::new(Arena::<u64>::with_regions(1, 200_000));
-        let barrier = Arc::new(Barrier::new(8));
+        // Под Miri логику CAS-retry даёт даже пара потоков с малым числом
+        // аллокаций: сокращаем потоки и итерации, но держим конкуренцию за
+        // общий счётчик `used`.
+        #[cfg(not(miri))]
+        let (threads, iters) = (8, 10_000u64);
+        #[cfg(miri)]
+        let (threads, iters) = (4, 100u64);
+        let barrier = Arc::new(Barrier::new(threads));
         std::thread::scope(|s| {
-            for _ in 0..8 {
+            for _ in 0..threads {
                 let a = arena.clone();
                 let b = barrier.clone();
                 s.spawn(move || {
                     b.wait();
-                    for i in 0..10_000u64 {
+                    for i in 0..iters {
                         let v = a.alloc(i);
                         unsafe { std::ptr::write_volatile(v as *mut u64, i) };
                     }
@@ -5691,24 +5697,28 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     fn cov_pair_cas_contention() {
         // Много потоков бьют по одному и тому же bump'у пары одновременно → CAS
         // retry в alloc_raw_m (Forward 1257, Backward 1322).
         use std::sync::{Arc, Barrier};
         let arena = SharedArena::new(arena_scale(1 << 18));
         let v = split_pair_raw(&arena, 2);
-        // Общий регион пары = arena_scale(1<<18). 8 потоков х 200 х 2 аллокации
-        // по 64 B ~= arena_scale(1<<18)/... — не переполняем, но устойчиво
-        // соперничаем за общий счётчик (CAS retry в обоих bump'ах пары).
-        let barrier = Arc::new(Barrier::new(8));
+        // Общий регион пары = arena_scale(1<<18). Потоки с 64-B аллокациями
+        // соперничают за общий счётчик (CAS retry в обоих bump'ах пары).
+        // Под Miri арена сжимается в 100 раз, поэтому и итерации масштабируем,
+        // чтобы уложиться в регион, не теряя конкуренции за счётчик.
+        #[cfg(not(miri))]
+        let (threads, iters) = (8, 200usize);
+        #[cfg(miri)]
+        let (threads, iters) = (4, 6usize);
+        let barrier = Arc::new(Barrier::new(threads));
         let (even, odd) = (&v[0], &v[1]);
         std::thread::scope(|s| {
-            for _ in 0..8 {
+            for _ in 0..threads {
                 let br = barrier.clone();
                 s.spawn(move || {
                     br.wait();
-                    for _ in 0..200 {
+                    for _ in 0..iters {
                         let _ = odd.alloc_raw::<1>(64);
                         let _ = even.alloc_raw::<1>(64);
                     }
@@ -5718,7 +5728,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     fn cov_donor_take_cas_contention() {
         // Доноры 0,2 (every=2) остаются пустыми; заёмщики 1,3 переполняют свои
         // регионы и одновременно берут у общих доноров 0 и 2 → CAS retry в
@@ -5741,7 +5750,13 @@ mod tests {
                         let _ = b.alloc_raw::<1>(16);
                     }
                     // Затем заимствуем у общих доноров (конкуренция за CAS).
-                    for _ in 0..2000 {
+                    // Под Miri арена сжата в 100 раз — масштабируем число
+                    // заимствований, чтобы не выйти за донорские регионы.
+                    #[cfg(not(miri))]
+                    let borrows = 2000usize;
+                    #[cfg(miri)]
+                    let borrows = 20usize;
+                    for _ in 0..borrows {
                         let _ = b.alloc_raw::<1>(16);
                     }
                 });
@@ -5750,7 +5765,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     fn cov_neighbor_borrow_cas_contention() {
         // Пара: оба собственные половины заполнены; переполнение одного соседа
         // заставляет несколько потоков одновременно заимствовать у общего соседа
@@ -5762,14 +5776,18 @@ mod tests {
         let cs = arena_scale(1 << 18) / 2;
         // Заполняем собственную половину v[0] (Backward) полностью.
         let _ = v[0].alloc_raw::<1>(cs);
-        let barrier = Arc::new(Barrier::new(8));
+        #[cfg(not(miri))]
+        let (threads, iters) = (8usize, 200usize);
+        #[cfg(miri)]
+        let (threads, iters) = (4usize, 6usize);
+        let barrier = Arc::new(Barrier::new(threads));
         let (even, odd) = (&v[0], &v[1]);
         std::thread::scope(|s| {
-            for _ in 0..8 {
+            for _ in 0..threads {
                 let br = barrier.clone();
                 s.spawn(move || {
                     br.wait();
-                    for _ in 0..200 {
+                    for _ in 0..iters {
                         let _ = even.alloc_raw::<1>(64); // заимствование у odd (Forward)
                     }
                 });
@@ -5780,14 +5798,18 @@ mod tests {
         let a2 = SharedArena::new(arena_scale(1 << 18));
         let w = split_pair_raw(&a2, 2);
         let _ = w[1].alloc_raw::<1>(cs); // собственная половина Forward полна
+        #[cfg(not(miri))]
+        let (threads, iters) = (8usize, 200usize);
+        #[cfg(miri)]
+        let (threads, iters) = (4usize, 6usize);
         let (even2, odd2) = (&w[0], &w[1]);
-        let b2 = Arc::new(Barrier::new(8));
+        let b2 = Arc::new(Barrier::new(threads));
         std::thread::scope(|s| {
-            for _ in 0..8 {
+            for _ in 0..threads {
                 let br = b2.clone();
                 s.spawn(move || {
                     br.wait();
-                    for _ in 0..200 {
+                    for _ in 0..iters {
                         let _ = odd2.alloc_raw::<1>(64); // заимствование у even2 (Backward)
                     }
                 });
