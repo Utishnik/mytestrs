@@ -1237,12 +1237,10 @@ impl ThreadBump {
                         prefetch_write(unsafe { self.ptr.add(off + size) });
                         return p;
                     }
+                    let free = self.len - self.lo.load(Ordering::Relaxed);
                     panic!(
                         "Arena OOM: need {} at offset {}, free {} (cap {})",
-                        size,
-                        off,
-                        self.len - self.lo.load(Ordering::Relaxed),
-                        self.len
+                        size, off, free, self.len
                     );
                 }
                 let mid = if self.neighbor_idx.is_some() {
@@ -1294,6 +1292,14 @@ impl ThreadBump {
                 // Быстрый путь: без пары и доноров — единственный владелец `hi`.
                 if self.neighbor_idx.is_none() && matches!(self.donor_reg, DonorReg::None) {
                     let cur = self.hi.load(Ordering::Relaxed);
+                    if size > self.len - cur {
+                        panic!(
+                            "Arena OOM: need {} bytes, only {} free (cap {})",
+                            size,
+                            self.len - cur,
+                            self.len
+                        );
+                    }
                     let off = (self.len - cur - size) & !(ALIGN - 1);
                     let new_hi = self.len - off;
                     self.hi.store(new_hi, Ordering::Relaxed);
@@ -1310,28 +1316,37 @@ impl ThreadBump {
                 };
                 loop {
                     let cur = self.hi.load(Ordering::Relaxed);
-                    let off = (self.len - cur - size) & !(ALIGN - 1);
-                    if off >= mid {
-                        let new_hi = self.len - off;
-                        if self
-                            .hi
-                            .compare_exchange_weak(
-                                cur,
-                                new_hi,
-                                Ordering::Relaxed,
-                                Ordering::Relaxed,
-                            )
-                            .is_ok()
-                        {
-                            // Backward-заполнение идёт вниз: префетчим следующий
-                            // блок (по меньшему адресу), в который будем писать.
-                            let p = unsafe { self.ptr.add(off) };
-                            if off >= size {
-                                prefetch_write(unsafe { self.ptr.add(off - size) });
+                    if cur < self.len && size <= self.len - cur {
+                        // Только если `cur + size` помещается: иначе `off` ниже
+                        // переполняется (в release — молча), и CAS записал бы
+                        // обёрнутый `new_hi` за границы чанка.
+                        let off = (self.len - cur - size) & !(ALIGN - 1);
+                        if off >= mid {
+                            let new_hi = self.len - off;
+                            if self
+                                .hi
+                                .compare_exchange_weak(
+                                    cur,
+                                    new_hi,
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                )
+                                .is_ok()
+                            {
+                                // Backward-заполнение идёт вниз: префетчим следующий
+                                // блок (по меньшему адресу), в который будем писать.
+                                let p = unsafe { self.ptr.add(off) };
+                                if off >= size {
+                                    prefetch_write(unsafe { self.ptr.add(off - size) });
+                                }
+                                return p;
                             }
-                            return p;
+                            continue;
                         }
-                    } else if let Some(p) = self.try_borrow::<ALIGN>(size) {
+                    }
+                    // Своя половина (или весь регион) закончилась: попытка занять
+                    // у соседа, иначе у доноров, иначе новый чанк / OOM.
+                    if let Some(p) = self.try_borrow::<ALIGN>(size) {
                         return p;
                     } else if !matches!(self.donor_reg, DonorReg::None) {
                         if let Some(p) = self.try_take_from_donors::<ALIGN>(size) {
@@ -1355,25 +1370,28 @@ impl ThreadBump {
                 self.toggle.set(!side);
                 if !side {
                     // левая сторона: занята [mid - lo, mid), растёт вниз
-                    let base = mid - self.lo.load(Ordering::Relaxed);
+                    let lo = self.lo.load(Ordering::Relaxed);
+                    let hi = self.hi.load(Ordering::Relaxed);
+                    let base = mid - lo;
                     if size > base {
                         panic!(
                             "Arena OOM: need {} at offset {}, free {} (cap {})",
                             size,
-                            mid - self.lo.load(Ordering::Relaxed),
+                            mid - lo,
                             base,
                             self.len
                         );
                     }
                     let off = (base - size) & !(ALIGN - 1);
                     let new_lo = mid - off;
-                    let new_hi = self.hi.load(Ordering::Relaxed);
                     // следующая аллокация пойдёт в правую половину
-                    let pf = unsafe { self.ptr.add(mid + new_hi + size) };
-                    (off, new_lo, new_hi, pf)
+                    let pf = unsafe { self.ptr.add(mid + hi + size) };
+                    (off, new_lo, hi, pf)
                 } else {
                     // правая сторона: занята [mid, mid + hi), растёт вверх
-                    let base = mid + self.hi.load(Ordering::Relaxed);
+                    let lo = self.lo.load(Ordering::Relaxed);
+                    let hi = self.hi.load(Ordering::Relaxed);
+                    let base = mid + hi;
                     let off = (base + ALIGN - 1) & !(ALIGN - 1);
                     let end = off + size;
                     if end > self.len {
@@ -1385,11 +1403,10 @@ impl ThreadBump {
                             self.len
                         );
                     }
-                    let new_lo = self.lo.load(Ordering::Relaxed);
                     let new_hi = off + size - mid;
                     // следующая аллокация пойдёт в левую половину
-                    let pf = unsafe { self.ptr.add(mid.wrapping_sub(new_lo + size)) };
-                    (off, new_lo, new_hi, pf)
+                    let pf = unsafe { self.ptr.add(mid.wrapping_sub(lo + size)) };
+                    (off, lo, new_hi, pf)
                 }
             }
         };
@@ -1485,6 +1502,14 @@ impl ThreadBump {
             ThreadBump::MODE_DIR_BACKWARD => {
                 if !pair && donor == 0 {
                     let cur = self.hi.load(Ordering::Relaxed);
+                    if size > self.len - cur {
+                        panic!(
+                            "Arena OOM: need {} bytes, only {} free (cap {})",
+                            size,
+                            self.len - cur,
+                            self.len
+                        );
+                    }
                     let off = (self.len - cur - size) & !(ALIGN - 1);
                     let new_hi = self.len - off;
                     self.hi.store(new_hi, Ordering::Relaxed);
@@ -1497,47 +1522,47 @@ impl ThreadBump {
                 let mid = if pair { self.len / 2 } else { 0 };
                 loop {
                     let cur = self.hi.load(Ordering::Relaxed);
-                    let off = (self.len - cur - size) & !(ALIGN - 1);
-                    if off >= mid {
-                        let new_hi = self.len - off;
-                        if self
-                            .hi
-                            .compare_exchange_weak(
-                                cur,
-                                new_hi,
-                                Ordering::Relaxed,
-                                Ordering::Relaxed,
-                            )
-                            .is_ok()
-                        {
-                            let p = unsafe { self.ptr.add(off) };
-                            if off >= size {
-                                prefetch_write(unsafe { self.ptr.add(off - size) });
-                            }
-                            return p;
-                        }
-                    } else if pair {
-                        if let Some(p) = self.try_borrow::<ALIGN>(size) {
-                            return p;
-                        }
-                        if donor != 0 {
-                            if let Some(p) = self.try_take_from_donors::<ALIGN>(size) {
+                    if cur < self.len && size <= self.len - cur {
+                        // Не переполняемся: иначе `off` в release оборачивается
+                        // в огромное значение, и CAS записал бы мусор за чанк.
+                        let off = (self.len - cur - size) & !(ALIGN - 1);
+                        if off >= mid {
+                            let new_hi = self.len - off;
+                            if self
+                                .hi
+                                .compare_exchange_weak(
+                                    cur,
+                                    new_hi,
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                )
+                                .is_ok()
+                            {
+                                let p = unsafe { self.ptr.add(off) };
+                                if off >= size {
+                                    prefetch_write(unsafe { self.ptr.add(off - size) });
+                                }
                                 return p;
                             }
-                            return self.grow_fallback::<ALIGN>(size);
+                            continue;
                         }
-                        panic!(
-                            "Arena OOM: need {} bytes, only {} free (cap {})",
-                            size,
-                            self.len - cur - mid,
-                            self.len
-                        );
-                    } else {
+                    }
+                    // Своя половина (или весь регион) закончилась: сосед/доноры/новый чанк.
+                    if let Some(p) = self.try_borrow::<ALIGN>(size) {
+                        return p;
+                    }
+                    if donor != 0 {
                         if let Some(p) = self.try_take_from_donors::<ALIGN>(size) {
                             return p;
                         }
                         return self.grow_fallback::<ALIGN>(size);
                     }
+                    panic!(
+                        "Arena OOM: need {} bytes, only {} free (cap {})",
+                        size,
+                        self.len - cur - mid,
+                        self.len
+                    );
                 }
             }
             _ => {
@@ -1545,27 +1570,30 @@ impl ThreadBump {
                 let side = self.toggle.get();
                 self.toggle.set(!side);
                 if !side {
-                    let base = mid - self.lo.load(Ordering::Relaxed);
+                    let lo = self.lo.load(Ordering::Relaxed);
+                    let hi = self.hi.load(Ordering::Relaxed);
+                    let base = mid - lo;
                     if size > base {
                         panic!(
                             "Arena OOM: need {} at offset {}, free {} (cap {})",
                             size,
-                            mid - self.lo.load(Ordering::Relaxed),
+                            mid - lo,
                             base,
                             self.len
                         );
                     }
                     let off = (base - size) & !(ALIGN - 1);
                     let new_lo = mid - off;
-                    let new_hi = self.hi.load(Ordering::Relaxed);
-                    let pf = unsafe { self.ptr.add(mid + new_hi + size) };
+                    let pf = unsafe { self.ptr.add(mid + hi + size) };
                     self.lo.store(new_lo, Ordering::Relaxed);
-                    self.hi.store(new_hi, Ordering::Relaxed);
+                    self.hi.store(hi, Ordering::Relaxed);
                     let p = unsafe { self.ptr.add(off) };
                     prefetch_write(pf);
                     p
                 } else {
-                    let base = mid + self.hi.load(Ordering::Relaxed);
+                    let lo = self.lo.load(Ordering::Relaxed);
+                    let hi = self.hi.load(Ordering::Relaxed);
+                    let base = mid + hi;
                     let off = (base + ALIGN - 1) & !(ALIGN - 1);
                     let end = off + size;
                     if end > self.len {
@@ -1577,10 +1605,9 @@ impl ThreadBump {
                             self.len
                         );
                     }
-                    let new_lo = self.lo.load(Ordering::Relaxed);
                     let new_hi = off + size - mid;
-                    let pf = unsafe { self.ptr.add(mid.wrapping_sub(new_lo + size)) };
-                    self.lo.store(new_lo, Ordering::Relaxed);
+                    let pf = unsafe { self.ptr.add(mid.wrapping_sub(lo + size)) };
+                    self.lo.store(lo, Ordering::Relaxed);
                     self.hi.store(new_hi, Ordering::Relaxed);
                     let p = unsafe { self.ptr.add(off) };
                     prefetch_write(pf);
@@ -1637,6 +1664,11 @@ impl ThreadBump {
             // из его свободной части [mid, len - hi_even), смежной с серединой.
             loop {
                 let cur = nb_ref.hi.load(Ordering::Relaxed);
+                // Осторожно с переполнением: `cur + size > len` делает `off`
+                // ниже огромным (в release — молча), и CAS записал бы мусор.
+                if cur >= self.len || size > self.len - cur {
+                    return None;
+                }
                 let off = (self.len - cur - size) & !(ALIGN - 1);
                 if off < mid {
                     return None;
