@@ -16,15 +16,21 @@
 #   ./bench.sh all
 #   ./bench.sh 1 "" rustfs     # общий бенч на mimalloc v3.5.3
 #   ./bench.sh 1 "" both       # прямое сравнение
+#   ./bench.sh 1 "" mimalloc --quick   # мелкий бенч: только FULL/LIGHT × SMT/NO SMT
 set -euo pipefail
 
 MODE="${1:-1}"
 STYLE="${2:-}"
 ALLOCATOR="${3:-mimalloc}"
+QUICK="${4:-}"
 TRIPLE="$(rustc --print host-tuple)"
 
 if [ -n "$STYLE" ]; then
     export R3_BENCH_STYLE="$STYLE"
+fi
+
+if [ "$QUICK" = "--quick" ]; then
+    export R3_BENCH_QUICK=1
 fi
 
 case "$ALLOCATOR" in

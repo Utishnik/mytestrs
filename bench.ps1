@@ -16,10 +16,12 @@
 #   powershell -File bench.ps1 -Style mono/dispatch/both   # arena version to run (default: both)
 #   powershell -File bench.ps1 1 -Allocator rustfs         # общий бенч на mimalloc v3.5.3
 #   powershell -File bench.ps1 1 -Allocator both           # прямое сравнение
+#   powershell -File bench.ps1 1 -Quick                    # мелкий бенч: только FULL/LIGHT × SMT/NO SMT
 param(
     [ValidateSet(1, 2, 3, 4, 'all')]$mode = 1,
     [ValidateSet('mono', 'dispatch', 'both')][string]$Style = 'both',
-    [ValidateSet('mimalloc', 'rustfs', 'both')][string]$Allocator = 'mimalloc'
+    [ValidateSet('mimalloc', 'rustfs', 'both')][string]$Allocator = 'mimalloc',
+    [switch]$Quick
 )
 
 $ErrorActionPreference = "Stop"
@@ -44,8 +46,13 @@ foreach ($a in $allocators) {
         & powershell -File build.ps1 -mode $m -package $package
 
         $bin = BinFor $m $a
-        Write-Host "===== Running benchmark (mode $m, style=$Style, allocator=$a) =====" -ForegroundColor Cyan
+        Write-Host "===== Running benchmark (mode $m, style=$Style, allocator=$a$(if ($Quick) { ', quick' })) =====" -ForegroundColor Cyan
         $env:R3_BENCH_STYLE = $Style
+        if ($Quick) {
+            $env:R3_BENCH_QUICK = "1"
+        } else {
+            Remove-Item Env:R3_BENCH_QUICK -ErrorAction SilentlyContinue
+        }
         if ($a -eq 'rustfs') {
             $env:R3_ALLOCATOR_LABEL = "rustfs-mimalloc (mimalloc v3.5.3)"
         } else {

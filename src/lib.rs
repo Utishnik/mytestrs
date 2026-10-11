@@ -3567,14 +3567,13 @@ pub fn arena_light_donors_boxcar_prio(chunk_size: usize, smt: bool) {
 // ============================================================
 
 /// Потолок PGO-размера чанка: чанков столько, сколько бенч-потоков, и суммарно
-/// они не должны занимать больше половины физической памяти (вторая половина —
-/// системе и остальным процессам). Без этого ограничения на 16-поточной машине
-/// с 13 GB RAM PGO выдавал чанки по 750 MB, и суммарный commit charge одного
-/// прогона доходил до 12 GB (борьба с pagefile).
+/// они занимают до 80% физической памяти (остальное — системе и остальным
+/// процессам): `phys * 0.8 / threads`. На 16-поточной машине с 13 GB RAM без
+/// ограничения PGO выдавал чанки по 750 MB и commit charge доходил до 12 GB.
 fn pgo_chunk_cap() -> usize {
     let threads = num_cpus::get().max(1);
     let phys = platform::physical_memory_bytes();
-    (phys / (threads * 2)).max(64 * 1024 * 1024)
+    phys.saturating_mul(4) / (threads * 5)
 }
 
 /// Округление вверх до мегабайта.
@@ -3838,6 +3837,14 @@ pub fn run() {
     println!("PGO arena light: {} MB", pgo_light_arena / (1024 * 1024));
     println!();
 
+    // Быстрый режим (R3_BENCH_QUICK): только базовые FULL/LIGHT × SMT/NO SMT
+    // (mimm, bump, shared, arena), без directional-стратегий
+    // (Forward/Backward/MiddleOut/Neighbors/Pair/Donors/...).
+    let quick = std::env::var("R3_BENCH_QUICK").is_ok();
+    if quick {
+        println!("Режим: QUICK (без directional-стратегий)\n");
+    }
+
     run_benchmarks(
         true,
         pgo_full_bump,
@@ -3853,8 +3860,10 @@ pub fn run() {
         pgo_light_arena,
     );
 
-    run_directional_benchmarks(true, pgo_full_arena, pgo_light_arena);
-    run_directional_benchmarks(false, pgo_full_arena, pgo_light_arena);
+    if !quick {
+        run_directional_benchmarks(true, pgo_full_arena, pgo_light_arena);
+        run_directional_benchmarks(false, pgo_full_arena, pgo_light_arena);
+    }
 }
 
 /// Быстрый, но репрезентативный прогон горячих путей аллокатора для сбора
