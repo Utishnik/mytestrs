@@ -1,0 +1,45 @@
+[package]
+name = "rustfs-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+autobenches = false
+
+[dependencies]
+r3 = { path = "..", default-features = false }
+rustfs-mimalloc = "0.5.6"
+divan = "0.1.21"
+hotpath = "0.24.0"
+
+[features]
+default = []
+hotpath = ["r3/hotpath", "hotpath/hotpath"]
+hotpath-cpu = ["r3/hotpath-cpu", "hotpath/hotpath-cpu"]
+win-prefetch-pages = ["r3/win-prefetch-pages"]
+
+[[bin]]
+name = "r3-rustfs"
+path = "src/main.rs"
+
+[[bench]]
+name = "benche"
+harness = false
+
+[[bench]]
+name = "alloc_bench"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+overflow-checks = false
+incremental = false
+
+[profile.bench]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

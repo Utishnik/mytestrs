@@ -19,6 +19,7 @@ fn pgo() -> (usize, usize, usize, usize) {
 
 #[hotpath::main]
 fn main() {
+    println!("Глобальный аллокатор: {}", allocator_label());
     pgo(); //прогреваем
     divan::main();
 }

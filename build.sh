@@ -7,18 +7,32 @@
 #   Mode 4: PGO + compile std/core for current CPU.
 #
 # Usage:
-#   ./build.sh 1
-#   ./build.sh 2
-#   ./build.sh 3
-#   ./build.sh 4
+#   ./build.sh 1 [r3|rustfs-bench]
+#   ./build.sh 2 [r3|rustfs-bench]
+#   ./build.sh 3 [r3|rustfs-bench]
+#   ./build.sh 4 [r3|rustfs-bench]
 set -euo pipefail
 
-BIN="r3"
+PACKAGE="${2:-r3}"
+case "$PACKAGE" in
+    r3)           PKG_DIR="";  BIN="r3" ;;
+    rustfs-bench) PKG_DIR="rustfs-bench"; BIN="r3-rustfs" ;;
+    *) echo "unknown package: $PACKAGE (use r3 or rustfs-bench)" >&2; exit 2 ;;
+esac
+
+if [ -n "$PKG_DIR" ]; then
+    MANIFEST_ARGS=(--manifest-path "${PKG_DIR}/Cargo.toml")
+    PKG_PREFIX="${PKG_DIR}/"
+else
+    MANIFEST_ARGS=()
+    PKG_PREFIX=""
+fi
+
 # Host triple, e.g. x86_64-unknown-linux-gnu. Pass --target explicitly so
 # build-std is the ONLY std provider (avoids the duplicate-core lang-item bug
 # when building for the host target).
 TRIPLE="$(rustc --print host-tuple)"
-PROFDIR="$(pwd)/pgo-data"
+PROFDIR="$(pwd)/pgo-data/${PKG_PREFIX%/}"
 
 ensure_components() {
     # These print "info:" to stderr; ignore failures (already installed, etc.).
@@ -38,9 +52,9 @@ mode="${1:-1}"
 
 case "$mode" in
     1)
-        echo "== Mode 1: normal release build =="
-        cargo build --release
-        OUT_BIN="./target/release/${BIN}"
+        echo "== Mode 1: normal release build (package ${PACKAGE}) =="
+        cargo build --release "${MANIFEST_ARGS[@]}"
+        OUT_BIN="./${PKG_PREFIX}target/release/${BIN}"
         ;;
 
     2)
@@ -48,22 +62,22 @@ case "$mode" in
         ensure_components
         # --target is required so build-std is the only std provider.
         export RUSTFLAGS="-C target-cpu=native"
-        cargo +nightly build -Zbuild-std --target "${TRIPLE}" --profile native
-        OUT_BIN="./target/${TRIPLE}/native/${BIN}"
+        cargo +nightly build -Zbuild-std --target "${TRIPLE}" --profile native "${MANIFEST_ARGS[@]}"
+        OUT_BIN="./${PKG_PREFIX}target/${TRIPLE}/native/${BIN}"
         ;;
 
     3)
-        echo "== Mode 3: PGO =="
+        echo "== Mode 3: PGO (package ${PACKAGE}) =="
         ensure_components
         rm -rf "${PROFDIR}"
         mkdir -p "${PROFDIR}"
 
         echo "-- PGO: build with profile-generate --"
         export RUSTFLAGS="-C profile-generate=${PROFDIR}"
-        cargo build --release
+        cargo build --release "${MANIFEST_ARGS[@]}"
 
         echo "-- PGO: training (fast representative workload via R3_PGO_TRAIN) --"
-        R3_PGO_TRAIN=1 ./target/release/${BIN}
+        R3_PGO_TRAIN=1 "./${PKG_PREFIX}target/release/${BIN}"
 
         echo "-- PGO: merge profiles --"
         PROF="$(get_llvm_profdata "")"
@@ -71,22 +85,22 @@ case "$mode" in
 
         echo "-- PGO: rebuild with profile-use --"
         export RUSTFLAGS="-C profile-use=${PROFDIR}/merged.profdata"
-        cargo build --release
-        OUT_BIN="./target/release/${BIN}"
+        cargo build --release "${MANIFEST_ARGS[@]}"
+        OUT_BIN="./${PKG_PREFIX}target/release/${BIN}"
         ;;
 
     4)
-        echo "== Mode 4: PGO + std/core for current CPU =="
+        echo "== Mode 4: PGO + std/core for current CPU (package ${PACKAGE}) =="
         ensure_components
         rm -rf "${PROFDIR}"
         mkdir -p "${PROFDIR}"
 
         echo "-- PGO+native: build with profile-generate (build-std, target-cpu=native) --"
         export RUSTFLAGS="-C target-cpu=native -C profile-generate=${PROFDIR}"
-        cargo +nightly build -Zbuild-std --target "${TRIPLE}" --profile native
+        cargo +nightly build -Zbuild-std --target "${TRIPLE}" --profile native "${MANIFEST_ARGS[@]}"
 
         echo "-- PGO+native: training --"
-        R3_PGO_TRAIN=1 "./target/${TRIPLE}/native/${BIN}"
+        R3_PGO_TRAIN=1 "./${PKG_PREFIX}target/${TRIPLE}/native/${BIN}"
 
         echo "-- PGO+native: merge profiles --"
         PROF="$(get_llvm_profdata "+nightly")"
@@ -94,8 +108,8 @@ case "$mode" in
 
         echo "-- PGO+native: rebuild with profile-use --"
         export RUSTFLAGS="-C target-cpu=native -C profile-use=${PROFDIR}/merged.profdata"
-        cargo +nightly build -Zbuild-std --target "${TRIPLE}" --profile native
-        OUT_BIN="./target/${TRIPLE}/native/${BIN}"
+        cargo +nightly build -Zbuild-std --target "${TRIPLE}" --profile native "${MANIFEST_ARGS[@]}"
+        OUT_BIN="./${PKG_PREFIX}target/${TRIPLE}/native/${BIN}"
         ;;
 
     *)

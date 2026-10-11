@@ -2,6 +2,7 @@
 name = "r3"
 version = "0.1.0"
 edition = "2024"
+autobenches = false
 
 [dependencies]
 allocation_hints = "0.1.0"
@@ -10,7 +11,7 @@ bumpalo = { version = "3.20", features = ["collections"] }
 core_affinity = "0.8.3"
 crossbeam-utils = "0.8.22"
 hotpath = { version = "0.24.0" }
-mimalloc = "0.1.52"
+mimalloc = { version = "0.1.52", optional = true }
 num_cpus = "1.17.0"
 spin = "0.9"
 orx-concurrent-vec = "4"
@@ -19,6 +20,8 @@ triomphe = "0.1"
 branches = { version = "0.5.0", features = ["prefetch"] }
 
 [features]
+default = ["alloc-mimalloc"]
+alloc-mimalloc = ["dep:mimalloc"]
 hotpath = ["hotpath/hotpath"]
 hotpath-cpu = ["hotpath/hotpath-cpu"]
 # Асинхронный prefetch страниц на Windows через PrefetchVirtualMemory.
@@ -43,6 +46,10 @@ divan = "0.1.21"
 
 [[bench]]
 name = "benche"
+harness = false
+
+[[bench]]
+name = "alloc_bench"
 harness = false
 
 [profile.release]

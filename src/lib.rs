@@ -2861,13 +2861,29 @@ pub use typed_arena::Arena;
 use bumpalo::Bump;
 use bumpalo::collections::String as BumpString;
 use bumpalo::collections::Vec as BumpVec;
-use mimalloc::MiMalloc;
 use spin::Mutex as SpinMutex;
 
+#[cfg(all(not(miri), feature = "alloc-mimalloc"))]
+use mimalloc::MiMalloc;
+
 // Под Miri mimalloc (FFI-аллокатор) не поддерживается — используем системный.
-#[cfg(not(miri))]
+#[cfg(all(not(miri), feature = "alloc-mimalloc"))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+#[cfg(feature = "alloc-mimalloc")]
+pub fn allocator_info() -> String {
+    "mimalloc crate (libmimalloc-sys, mimalloc v3.3.2)".to_string()
+}
+
+#[cfg(not(feature = "alloc-mimalloc"))]
+pub fn allocator_info() -> String {
+    "system".to_string()
+}
+
+pub fn allocator_label() -> String {
+    std::env::var("R3_ALLOCATOR_LABEL").unwrap_or_else(|_| allocator_info())
+}
 
 // --- MiMalloc ---
 #[cfg_attr(coverage, coverage(off))]
@@ -3691,6 +3707,7 @@ pub fn run() {
     let all_cores = core_affinity::get_core_ids().unwrap();
     println!("Логических ядер: {}", all_cores.len());
     println!("Физических ядер: {}", num_cpus::get_physical());
+    println!("Глобальный аллокатор: {}", allocator_label());
     println!();
 
     // PGO для bumpalo

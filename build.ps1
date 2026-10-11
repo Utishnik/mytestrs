@@ -1,4 +1,4 @@
-# Build presets for the `r3` crate.
+# Build presets for the `r3` crate (and optionally the `rustfs-bench` twin).
 #   Mode 1: normal release build (current, stable).
 #   Mode 2: like now, but std+core are compiled for the current CPU
 #           (-C target-cpu=native via -Zbuild-std, nightly).
@@ -10,13 +10,24 @@
 #   powershell -File build.ps1 -mode 2
 #   powershell -File build.ps1 -mode 3
 #   powershell -File build.ps1 -mode 4
+#   powershell -File build.ps1 -mode 1 -package rustfs-bench   # mimalloc v3.5.3
 param(
     [ValidateSet(1, 2, 3, 4)][int]$mode = 1,
     [string]$bin = "r3",
-    [string]$triple = "x86_64-pc-windows-msvc"
+    [string]$triple = "x86_64-pc-windows-msvc",
+    [ValidateSet('r3', 'rustfs-bench')][string]$package = 'r3'
 )
 
 $ErrorActionPreference = "Stop"
+
+$pkgDir = if ($package -eq 'rustfs-bench') { 'rustfs-bench' } else { '' }
+$binName = if ($package -eq 'rustfs-bench') { 'r3-rustfs' } else { $bin }
+$manifestArgs = if ($package -eq 'rustfs-bench') { @('--manifest-path', 'rustfs-bench\Cargo.toml') } else { @() }
+
+function TargetPath($rel) {
+    if ($pkgDir) { return ".\$pkgDir\$rel" }
+    return ".\$rel"
+}
 
 function Ensure-Components {
     # rustup prints "info:" to stderr; route through cmd so PowerShell
@@ -35,13 +46,13 @@ function Get-LlvmProfdata($toolchain) {
     return $p
 }
 
-$profDir = Join-Path $PWD "pgo-data"
+$profDir = if ($pkgDir) { Join-Path $PWD "pgo-data\$pkgDir" } else { Join-Path $PWD "pgo-data" }
 
 switch ($mode) {
     1 {
         Write-Host "== Mode 1: normal release build ==" -ForegroundColor Cyan
-        cargo build --release
-        $outBin = ".\target\release\$bin.exe"
+        cargo build --release @manifestArgs
+        $outBin = TargetPath "target\release\$binName.exe"
     }
 
     2 {
@@ -50,8 +61,8 @@ switch ($mode) {
         # --target is required so build-std is the ONLY std provider (avoids
         # duplicate core lang-item when building for the host target).
         $env:RUSTFLAGS = "-C target-cpu=native"
-        cargo +nightly build -Zbuild-std --target $triple --profile native
-        $outBin = ".\target\$triple\native\$bin.exe"
+        cargo +nightly build -Zbuild-std --target $triple --profile native @manifestArgs
+        $outBin = TargetPath "target\$triple\native\$binName.exe"
     }
 
     3 {
@@ -62,11 +73,11 @@ switch ($mode) {
 
         Write-Host "-- PGO: build with profile-generate --"
         $env:RUSTFLAGS = "-C profile-generate=$profDir"
-        cargo build --release
+        cargo build --release @manifestArgs
 
         Write-Host "-- PGO: training (fast representative workload via R3_PGO_TRAIN) --"
         $env:R3_PGO_TRAIN = "1"
-        & ".\target\release\$bin.exe"
+        & ".\$(if ($pkgDir) { "$pkgDir\" })target\release\$binName.exe"
         Remove-Item Env:R3_PGO_TRAIN
 
         Write-Host "-- PGO: merge profiles --"
@@ -75,8 +86,8 @@ switch ($mode) {
 
         Write-Host "-- PGO: rebuild with profile-use --"
         $env:RUSTFLAGS = "-C profile-use=$(Join-Path $profDir 'merged.profdata')"
-        cargo build --release
-        $outBin = ".\target\release\$bin.exe"
+        cargo build --release @manifestArgs
+        $outBin = TargetPath "target\release\$binName.exe"
     }
 
     4 {
@@ -87,21 +98,21 @@ switch ($mode) {
 
         Write-Host "-- PGO+native: build with profile-generate (build-std, target-cpu=native) --"
         $env:RUSTFLAGS = "-C target-cpu=native -C profile-generate=$profDir"
-        cargo +nightly build -Zbuild-std --target $triple --profile native
+        cargo +nightly build -Zbuild-std --target $triple --profile native @manifestArgs
 
         Write-Host "-- PGO+native: training --"
         $env:R3_PGO_TRAIN = "1"
-        & ".\target\$triple\native\$bin.exe"
+        & ".\$(if ($pkgDir) { "$pkgDir\" })target\$triple\native\$binName.exe"
         Remove-Item Env:R3_PGO_TRAIN
 
         Write-Host "-- PGO+native: merge profiles --"
         $prof = Get-LlvmProfdata "+nightly"
         & $prof merge -o (Join-Path $profDir "merged.profdata") "$profDir"
 
-        Write-Host "-- PGO+native: rebuild with profile-use --"
+        Write-Host "-- PGO+native: rebuild with profile-use (build-std, target-cpu=native) --"
         $env:RUSTFLAGS = "-C target-cpu=native -C profile-use=$(Join-Path $profDir 'merged.profdata')"
-        cargo +nightly build -Zbuild-std --target $triple --profile native
-        $outBin = ".\target\$triple\native\$bin.exe"
+        cargo +nightly build -Zbuild-std --target $triple --profile native @manifestArgs
+        $outBin = TargetPath "target\$triple\native\$binName.exe"
     }
 }
 
