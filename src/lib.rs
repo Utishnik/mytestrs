@@ -591,6 +591,37 @@ mod platform {
 //                  ЕДИНАЯ АРЕНА (КРОССПЛАТФОРМА)
 // ============================================================
 
+/// Шаг нарезки при равномерном сплите региона на `n` чанков.
+///
+/// База региона (`SharedArena` / родительский `ThreadBump`) всегда
+/// page-aligned (VirtualAlloc/mmap). Чтобы и старты дочерних чанков
+/// (`base + i*step`) были page-aligned — а значит регионы соседних
+/// потоков не делили страницу — шаг округляется ВНИЗ до кратного
+/// странице. Остаток (`total - (n-1)*step`) достаётся последнему
+/// чанку (он не меньше остальных). Для чанков меньше страницы
+/// (тестовые мелкие арены) сохраняем прежнее выравнивание по 16.
+fn split_chunk_step(total: usize, n: usize) -> usize {
+    let raw = total / n;
+    let page = platform::page_size();
+    if raw >= page {
+        (raw / page) * page
+    } else {
+        raw.next_multiple_of(16)
+    }
+}
+
+/// Шаг нарезки при сплите по заданному размеру региона: для регионов
+/// >= страницы округляем ВВЕРХ до кратного странице (старт следующего
+/// региона page-aligned); мелкие — прежнее выравнивание по 16.
+fn split_size_step(sz: usize) -> usize {
+    let page = platform::page_size();
+    if sz >= page {
+        sz.next_multiple_of(page)
+    } else {
+        sz.next_multiple_of(16)
+    }
+}
+
 struct SharedArena {
     alloc: RawAllocation,
 }
@@ -643,12 +674,10 @@ impl SharedArena {
     /// Разбить арену на `num_threads` непересекающихся чанков заданного
     /// направления заполнения. Для `MiddleOut` каждый чанк стартует из своей
     /// середины.
-    // Выравниваем размер чанка, чтобы старт каждого чанка (base + i*chunk_size)
     #[allow(dead_code)]
     pub unsafe fn split(&self, num_threads: usize) -> Vec<CachePadded<ThreadBump>> {
         unsafe { self.split_with(num_threads, BumpDir::Forward) }
     }
-    // оставался выровненным (иначе указатели доноров — UB под Tree Borrows).
 
     pub fn split_safe(&self, num_threads: usize) -> Split<'_> {
         self.split_with_safe(num_threads, BumpDir::Forward)
@@ -656,8 +685,9 @@ impl SharedArena {
     /// Чётные потоки заполняют свой чанк справа налево (`Backward`), нечётные —
     /// слева направо (`Forward`). Так соседние чанки «доходят» до общей границы
     /// навстречу друг другу (идея совместного использования памяти соседа).
-    // Выравниваем размер чанка, чтобы старт каждого чанка (base + i*chunk_size)
-    // оставался выровненным (иначе указатели доноров — UB под Tree Borrows).
+    // Шаг нарезки page-aligned (см. `split_chunk_step`): старт каждого чанка
+    // (base + i*chunk_size) на границе страницы, иначе указатели доноров —
+    // UB под Tree Borrows.
 
     /// Возвращаемый `Vec` не связан с временем жизни арены: bumps держат сырые
     /// указатели в регионе. Вызывающий обязан держать `self` живой и не дать
@@ -665,9 +695,9 @@ impl SharedArena {
     unsafe fn split_with(&self, num_threads: usize, dir: BumpDir) -> Vec<CachePadded<ThreadBump>> {
         let base = self.alloc.ptr;
         let total = self.alloc.size;
-        // Выравниваем размер чанка, чтобы старт каждого чанка (base + i*chunk_size)
-        // оставался выровненным (иначе указатели доноров — UB под Tree Borrows).
-        let chunk_size = (total / num_threads).next_multiple_of(16);
+        // Шаг нарезки page-aligned (см. `split_chunk_step`): старт каждого
+        // чанка на границе страницы, иначе указатели доноров — UB под Tree Borrows.
+        let chunk_size = split_chunk_step(total, num_threads);
 
         (0..num_threads)
             .map(|i| {
@@ -726,9 +756,9 @@ impl SharedArena {
     unsafe fn split_alternating(&self, num_threads: usize) -> Vec<CachePadded<ThreadBump>> {
         let base = self.alloc.ptr;
         let total = self.alloc.size;
-        // Выравниваем размер чанка, чтобы старт каждого чанка (base + i*chunk_size)
-        // оставался выровненным (иначе указатели доноров — UB под Tree Borrows).
-        let chunk_size = (total / num_threads).next_multiple_of(16);
+        // Шаг нарезки page-aligned (см. `split_chunk_step`): старт каждого
+        // чанка на границе страницы, иначе указатели доноров — UB под Tree Borrows.
+        let chunk_size = split_chunk_step(total, num_threads);
 
         (0..num_threads)
             .map(|i| {
@@ -789,9 +819,9 @@ impl SharedArena {
     unsafe fn split_paired(&self, num_threads: usize) -> Vec<CachePadded<ThreadBump>> {
         let base = self.alloc.ptr;
         let total = self.alloc.size;
-        // Выравниваем размер чанка, чтобы старт каждого чанка (base + i*chunk_size)
-        // оставался выровненным (иначе указатели доноров — UB под Tree Borrows).
-        let chunk_size = (total / num_threads).next_multiple_of(16);
+        // Шаг нарезки page-aligned (см. `split_chunk_step`): старт каждого
+        // чанка на границе страницы, иначе указатели доноров — UB под Tree Borrows.
+        let chunk_size = split_chunk_step(total, num_threads);
         let is_huge = self.alloc.is_huge;
 
         let mut bumps: Vec<CachePadded<ThreadBump>> = (0..num_threads)
@@ -799,9 +829,9 @@ impl SharedArena {
                 if i % 2 == 0 {
                     // Чётный — ведущий чанк пары: общий регион [2k*cs, 2k*cs+2cs).
                     let pair_start = (i / 2) * 2 * chunk_size;
-                    // Регион пары не должен выходить за пределы арены: `chunk_size`
-                    // округляется вверх до 16, поэтому последняя пара/одиночный
-                    // чанк могут иначе выступать за `total` (OOB под Miri).
+                    // Регион пары не должен выходить за пределы арены:
+                    // `chunk_size` округляется вниз до страницы, но защита
+                    // от OOB (Miri) остаётся.
                     let region_len = (total - pair_start).min(2 * chunk_size);
                     let combined_len = if i + 1 < num_threads {
                         region_len
@@ -948,9 +978,9 @@ impl SharedArena {
     ) -> Vec<CachePadded<ThreadBump>> {
         let base = self.alloc.ptr;
         let total = self.alloc.size;
-        // Выравниваем размер чанка, чтобы старт каждого чанка (base + i*chunk_size)
-        // оставался выровненным (иначе указатели доноров — UB под Tree Borrows).
-        let chunk_size = (total / num_threads).next_multiple_of(16);
+        // Шаг нарезки page-aligned (см. `split_chunk_step`): старт каждого
+        // чанка на границе страницы, иначе указатели доноров — UB под Tree Borrows.
+        let chunk_size = split_chunk_step(total, num_threads);
         let is_huge = self.alloc.is_huge;
 
         // Собираем записи о донорах в bump-скретч: служебные данные — не
@@ -1019,9 +1049,8 @@ impl SharedArena {
             .map(|i| {
                 #[cfg(test)]
                 let can_give = policy.every > 0 && i % policy.every == 0;
-                // Длина последнего чанка ограничена концом арены: `chunk_size`
-                // округляется вверх до 16, поэтому иначе он мог бы выйти за
-                // `total` (OOB под Miri).
+                // Длина последнего чанка ограничена концом арены (защита
+                // от OOB под Miri).
                 let chunk_len = ((i + 1) * chunk_size).min(total) - i * chunk_size;
                 CachePadded::new(ThreadBump {
                     ptr: unsafe { base.add(i * chunk_size) },
@@ -2137,7 +2166,7 @@ impl ThreadBump {
     pub fn split(&self, n: usize, dir: BumpDir) -> Vec<CachePadded<ThreadBump>> {
         let base = self.ptr;
         let total = self.len;
-        let chunk_size = (total / n).next_multiple_of(16);
+        let chunk_size = split_chunk_step(total, n);
         (0..n)
             .map(|i| {
                 let start = i * chunk_size;
@@ -2158,8 +2187,10 @@ impl ThreadBump {
     }
 
     /// Разбиение региона по заданным размерам (в байтах); остаток уходит
-    /// последней зоне. Каждый размер округляется вверх до
-    /// 16, чтобы старты чанков оставались выровненными (Tree Borrows).
+    /// последней зоне. Каждый размер округляется вверх до страницы, чтобы
+    /// старты чанков оставались выровненными (см. `split_size_step`).
+    /// Промежуточные границы прижимаются к `total`: если сумма округлённых
+    /// размеров превышает регион, лишние дети получают пустой регион.
     #[allow(dead_code)]
     pub fn split_by_sizes(&self, sizes: &[usize], dir: BumpDir) -> Vec<CachePadded<ThreadBump>> {
         assert!(sizes.len() > 0, "split_by_sizes: пустой список");
@@ -2169,8 +2200,12 @@ impl ThreadBump {
         let mut start = 0usize;
         let last = sizes.len() - 1;
         for (i, &sz) in sizes.iter().enumerate() {
-            let step = sz.next_multiple_of(16);
-            let end = if i == last { total } else { start + step };
+            let step = split_size_step(sz);
+            let end = if i == last {
+                total
+            } else {
+                (start + step).min(total)
+            };
             children.push(CachePadded::new(Self::child_bump(
                 unsafe { base.add(start) },
                 end - start,
@@ -2190,7 +2225,7 @@ impl ThreadBump {
     pub fn split_donors(&self, n: usize, dir: BumpDir) -> Vec<CachePadded<ThreadBump>> {
         let base = self.ptr;
         let total = self.len;
-        let chunk_size = (total / n).next_multiple_of(16);
+        let chunk_size = split_chunk_step(total, n);
         let shared: Arc<OrxVec<Donor>> = Arc::new(OrxVec::new());
         let mut children: Vec<CachePadded<ThreadBump>> = Vec::with_capacity(n);
         for i in 0..n {
@@ -2236,8 +2271,12 @@ impl ThreadBump {
         let mut start = 0usize;
         let last = sizes.len() - 1;
         for (i, &sz) in sizes.iter().enumerate() {
-            let step = sz.next_multiple_of(16);
-            let end = if i == last { total } else { start + step };
+            let step = split_size_step(sz);
+            let end = if i == last {
+                total
+            } else {
+                (start + step).min(total)
+            };
             children.push(CachePadded::new(Self::child_bump_donor(
                 unsafe { base.add(start) },
                 end - start,
@@ -2263,7 +2302,7 @@ impl ThreadBump {
     pub fn split_local(&self, n: usize, dir: BumpDir) -> Vec<ZoneBump<'static>> {
         let base = self.ptr;
         let total = self.len;
-        let chunk_size = (total / n).next_multiple_of(16);
+        let chunk_size = split_chunk_step(total, n);
         (0..n)
             .map(|i| {
                 let start = i * chunk_size;
@@ -2293,8 +2332,12 @@ impl ThreadBump {
         let mut start = 0usize;
         let last = sizes.len() - 1;
         for (i, &sz) in sizes.iter().enumerate() {
-            let step = sz.next_multiple_of(16);
-            let end = if i == last { total } else { start + step };
+            let step = split_size_step(sz);
+            let end = if i == last {
+                total
+            } else {
+                (start + step).min(total)
+            };
             zones.push(Self::make_zone(
                 unsafe { base.add(start) },
                 end - start,
@@ -2577,7 +2620,7 @@ impl ZoneBump<'static> {
     pub fn split(&self, n: usize) -> Vec<ZoneBump<'static>> {
         let d = &self.inner;
         let total = d.len;
-        let chunk_size = (total / n).next_multiple_of(16);
+        let chunk_size = split_chunk_step(total, n);
         (0..n)
             .map(|i| {
                 let start = i * chunk_size;
@@ -2607,8 +2650,12 @@ impl ZoneBump<'static> {
         let mut start = 0usize;
         let last = sizes.len() - 1;
         for (i, &sz) in sizes.iter().enumerate() {
-            let step = sz.next_multiple_of(16);
-            let end = if i == last { total } else { start + step };
+            let step = split_size_step(sz);
+            let end = if i == last {
+                total
+            } else {
+                (start + step).min(total)
+            };
             zones.push(ZoneBump::from_region(
                 unsafe { d.ptr.add(start) },
                 end - start,
@@ -2626,7 +2673,7 @@ impl ZoneBump<'static> {
     pub fn split_into_threads(&self, n: usize) -> Vec<CachePadded<ThreadBump>> {
         let d = &self.inner;
         let total = d.len;
-        let chunk_size = (total / n).next_multiple_of(16);
+        let chunk_size = split_chunk_step(total, n);
         (0..n)
             .map(|i| {
                 let start = i * chunk_size;
@@ -2659,8 +2706,12 @@ impl ZoneBump<'static> {
         let mut start = 0usize;
         let last = sizes.len() - 1;
         for (i, &sz) in sizes.iter().enumerate() {
-            let step = sz.next_multiple_of(16);
-            let end = if i == last { total } else { start + step };
+            let step = split_size_step(sz);
+            let end = if i == last {
+                total
+            } else {
+                (start + step).min(total)
+            };
             out.push(CachePadded::new(ThreadBump::child_bump(
                 unsafe { d.ptr.add(start) },
                 end - start,
@@ -2879,16 +2930,27 @@ use bumpalo::collections::Vec as BumpVec;
 use spin::Mutex as SpinMutex;
 
 #[cfg(all(not(miri), feature = "alloc-mimalloc"))]
-use mimalloc::MiMalloc;
+use rustfs_mimalloc::MiMalloc;
 
 // Под Miri mimalloc (FFI-аллокатор) не поддерживается — используем системный.
 #[cfg(all(not(miri), feature = "alloc-mimalloc"))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-#[cfg(feature = "alloc-mimalloc")]
+#[cfg(all(not(miri), feature = "alloc-mimalloc"))]
 pub fn allocator_info() -> String {
-    "mimalloc crate (libmimalloc-sys, mimalloc v3.3.2)".to_string()
+    let v = MiMalloc::version();
+    format!(
+        "rustfs-mimalloc (mimalloc v{}.{}.{})",
+        v / 10000,
+        (v / 100) % 100,
+        v % 100
+    )
+}
+
+#[cfg(all(miri, feature = "alloc-mimalloc"))]
+pub fn allocator_info() -> String {
+    "rustfs-mimalloc (mimalloc v3.5.3; под Miri не активен)".to_string()
 }
 
 #[cfg(not(feature = "alloc-mimalloc"))]
@@ -4588,6 +4650,43 @@ mod tests {
         );
     }
 
+    // Под Miri `alloc_normal` идёт через std::alloc (align 16, не страница) —
+    // проверка page-alignment регионов имеет смысл только в нативном режиме.
+    #[cfg(not(miri))]
+    #[test]
+    fn split_regions_are_page_aligned() {
+        // Старт каждого региона (кроме, возможно, последнего — у него
+        // забирает остаток) кратен странице: регионы соседних потоков
+        // не делят страницу.
+        let page = platform::page_size();
+        let arena = SharedArena::new(page * 8);
+        let base = arena.alloc.ptr as usize;
+        assert_eq!(base % page, 0, "база арены page-aligned");
+
+        for (label, bumps) in [
+            ("split_with", split_with_raw(&arena, 4, BumpDir::Forward)),
+            ("split_alt", split_alt_raw(&arena, 4)),
+            ("split_pair", split_pair_raw(&arena, 4)),
+            ("split_donors", split_don_raw(&arena, 4, 2)),
+        ] {
+            for (i, b) in bumps.iter().enumerate() {
+                let off = b.ptr as usize - base;
+                assert_eq!(
+                    off % page,
+                    0,
+                    "{label}: регион {i} стартует не на границе страницы (off={off})"
+                );
+            }
+        }
+
+        // ThreadBump::split / ZoneBump-сплиты page-aligned тоже.
+        let bumps = split_with_raw(&arena, 1, BumpDir::Forward);
+        for c in bumps[0].split(3, BumpDir::Forward) {
+            let off = c.ptr as usize - base;
+            assert_eq!(off % page, 0, "ThreadBump::split: off={off}");
+        }
+    }
+
     #[test]
     fn pair_odd_can_use_evens_half_when_even_idle() {
         // even почти ничего не берёт, odd забирает свою половину и
@@ -5059,6 +5158,29 @@ mod tests {
         assert_eq!(children[2].ptr as usize, base + 16 + 32);
         assert!(children[0].ptr as usize + children[0].len <= children[1].ptr as usize);
         assert!(children[1].ptr as usize + children[1].len <= children[2].ptr as usize);
+    }
+
+    /// Регрессия: сумма page-округлённых размеров больше региона — промежуточные
+    /// границы прижимаются к `total`, ни один регион не выходит за базу+длину
+    /// арены, а у последнего ребёнка нет underflow (`end - start`).
+    #[test]
+    fn split_by_sizes_sum_exceeds_total_is_clamped() {
+        let (_arena, bump) = make_one(BumpDir::Forward, arena_scale(4096));
+        let base = bump.ptr as usize;
+        let total = bump.len;
+        // Каждый размер page-округляется вверх; сумма шагов заведомо > total.
+        let sizes = [3000usize, 3000, 3000];
+        let children = bump.split_by_sizes(&sizes, BumpDir::Forward);
+        assert_eq!(children.len(), 3);
+        let mut prev_end = base;
+        for (i, c) in children.iter().enumerate() {
+            assert!(
+                c.ptr as usize >= base && c.ptr as usize + c.len <= base + total,
+                "ребёнок {i} вышел за границы региона"
+            );
+            assert!(c.ptr as usize >= prev_end, "регионы пересекаются");
+            prev_end = c.ptr as usize + c.len;
+        }
     }
 
     #[test]

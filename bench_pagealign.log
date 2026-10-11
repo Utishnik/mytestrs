@@ -1,0 +1,27 @@
+﻿╨Ы╨╛╨│╨╕╤З╨╡╤Б╨║╨╕╤Е ╤П╨┤╨╡╤А: 16
+╨д╨╕╨╖╨╕╤З╨╡╤Б╨║╨╕╤Е ╤П╨┤╨╡╤А: 8
+╨У╨╗╨╛╨▒╨░╨╗╤М╨╜╤Л╨╣ ╨░╨╗╨╗╨╛╨║╨░╤В╨╛╤А: rustfs-mimalloc (mimalloc v3.5.3)
+╨б╤В╤А╨░╨╜╨╕╤Ж╤Л: 4 KB / huge pages 2 MB: ╨╜╨╡╤В
+
+PGO bump full: 428 MB
+PGO bump light: 141 MB
+
+PGO arena full: 428 MB
+PGO arena light: 113 MB
+
+
+########## ╨С╨╡╨╜╤З: SMT (all logical cores) ##########
+
+=== FULL VERSION (SMT (all logical cores)) тАФ style Both ===
+Round 1: MIMALOC = 1453570 ╨атАЩ╨Т┬╡s, Bump = 2334666 ╨атАЩ╨Т┬╡s, SharedBump = 3686956 ╨атАЩ╨Т┬╡s, Arena mono|dispatch = 1793555|1691283 ╨атАЩ╨Т┬╡s
+Round 2: MIMALOC = 1259526 ╨атАЩ╨Т┬╡s, Bump = 2743690 ╨атАЩ╨Т┬╡s, SharedBump = 3761170 ╨атАЩ╨Т┬╡s, Arena mono|dispatch = 1885814|1852543 ╨атАЩ╨Т┬╡s
+Round 3: MIMALOC = 1381405 ╨атАЩ╨Т┬╡s, Bump = 2885383 ╨атАЩ╨Т┬╡s, SharedBump = 3666518 ╨атАЩ╨Т┬╡s, Arena mono|dispatch = 1887788|1795307 ╨атАЩ╨Т┬╡s
+
+=== LIGHT VERSION (SMT (all logical cores)) тАФ style Both ===
+Round 1: MIMALOC = 335267 ╨атАЩ╨Т┬╡s, Bump = 312560 ╨атАЩ╨Т┬╡s, SharedBump = 1173349 ╨атАЩ╨Т┬╡s, Arena mono|dispatch = 510250|482523 ╨атАЩ╨Т┬╡s
+Round 2: MIMALOC = 357225 ╨атАЩ╨Т┬╡s, Bump = 298806 ╨атАЩ╨Т┬╡s, SharedBump = 966473 ╨атАЩ╨Т┬╡s, Arena mono|dispatch = 500999|455780 ╨атАЩ╨Т┬╡s
+Round 3: MIMALOC = 356004 ╨атАЩ╨Т┬╡s, Bump = 295040 ╨атАЩ╨Т┬╡s, SharedBump = 1118824 ╨атАЩ╨Т┬╡s, Arena mono|dispatch = 491370|496337 ╨атАЩ╨Т┬╡s
+
+########## ╨С╨╡╨╜╤З: NO SMT (physical cores only) ##########
+
+=== FULL VERSION (NO SMT (physical cores only)) тАФ style Both ===

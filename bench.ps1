@@ -3,8 +3,8 @@
 # benchmark suite). Logs each run to bench_mode<N>.log.
 #
 # Allocator selection:
-#   -Allocator mimalloc  (default) — `mimalloc` crate, mimalloc v3.3.2 (пакет r3)
-#   -Allocator rustfs              — `rustfs-mimalloc`, mimalloc v3.5.3 (пакет rustfs-bench)
+#   -Allocator mimalloc  (default) — пакет r3, глобальный аллокатор rustfs-mimalloc (mimalloc v3.5.3)
+#   -Allocator rustfs              — пакет rustfs-bench (та же rustfs-mimalloc v3.5.3, отдельный бинарь)
 #   -Allocator both                — обе конфигурации подряд
 #
 # Usage:

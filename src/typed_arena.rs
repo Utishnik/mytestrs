@@ -84,10 +84,16 @@ impl<T> Arena<T> {
     /// `per_region_bytes` байт.
     fn with_regions_bytes(regions: usize, per_region_bytes: usize) -> Self {
         // Гарантируем, что первичные регионы разбиваются корректно при ЛЮБОМ
-        // числе регионов/размерах: делаем размер каждого чанка кратным 16 и
-        // общий размер = chunk * regions. Иначе `split_with` при мелких аренах
-        // даёт перекрывающиеся/выпадающие чанки.
-        let chunk = per_region_bytes.next_multiple_of(16).max(16);
+        // числе регионов/размерах и что старт каждого региона page-aligned:
+        // для регионов >= страницы округляем чанк вверх до кратного странице,
+        // для мелких — до кратного 16 (иначе `split_with` при мелких аренах
+        // даёт перекрывающиеся/выпадающие чанки).
+        let page = platform::page_size();
+        let chunk = if per_region_bytes >= page {
+            per_region_bytes.next_multiple_of(page)
+        } else {
+            per_region_bytes.next_multiple_of(16).max(16)
+        };
         let actual_total = chunk * regions;
         let arena = SharedArena::new(actual_total);
         // Один первичный регион на поток, направление Forward.
