@@ -76,7 +76,7 @@ impl Clone for Donor {
 /// (без счётчика weak-ссылок).
 #[derive(Clone)]
 enum DonorReg {
-    /// Режим доноров не активен (переполнение ведёт к OOM-панике).
+    /// Режим доноров не активен (переполнение уходит в fallback-чанк).
     None,
     /// Статичный список: заполняется один раз при старте и не меняется
     /// (данные — в bump-буфере, на который указывает `donor_static_ptr`).
@@ -161,7 +161,9 @@ mod platform {
         TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
     };
     use windows_sys::Win32::System::Memory::*;
-    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    use windows_sys::Win32::System::SystemInformation::{
+        GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
+    };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     /// Включаем SeLockMemoryPrivilege ("Lock pages in memory"), если она
@@ -337,6 +339,45 @@ mod platform {
         2 * 1024 * 1024
     }
 
+    /// Физическая оперативная память системы в байтах (без учёта pagefile).
+    /// Используется PGO-функциями как потолок размера чанка, чтобы суммарный
+    /// commit charge чанков всех потоков не превышал RAM (иначе на 13 GB
+    /// машине с 16 потоками бенч уходил в pagefile).
+    pub fn physical_memory_bytes() -> usize {
+        if cfg!(miri) {
+            // Под Miri ограничение физической памяти не моделируем.
+            return usize::MAX;
+        }
+        static PHYS: OnceLock<usize> = OnceLock::new();
+        *PHYS.get_or_init(|| unsafe {
+            let mut status: MEMORYSTATUSEX = core::mem::zeroed();
+            status.dwLength = core::mem::size_of::<MEMORYSTATUSEX>() as u32;
+            if GlobalMemoryStatusEx(&mut status) != 0 && status.ullTotalPhys > 0 {
+                status.ullTotalPhys as usize
+            } else {
+                // Скромный дефолт: лучше ограничить чанк, чем задуть систему.
+                8 * 1024 * 1024 * 1024
+            }
+        })
+    }
+
+    /// Проба: получается ли выделить large page (обычно 2 MB). Результат
+    /// кешируется: без `SeLockMemoryPrivilege` VirtualAlloc(MEM_LARGE_PAGES)
+    /// всегда падает, так что одна проба за процесс достаточна.
+    pub fn large_pages_available() -> bool {
+        if cfg!(miri) {
+            return false;
+        }
+        static HUGE_OK: OnceLock<bool> = OnceLock::new();
+        *HUGE_OK.get_or_init(|| match try_alloc_huge(huge_page_size()) {
+            Some(a) => {
+                free(a);
+                true
+            }
+            None => false,
+        })
+    }
+
     /// На Windows large pages выделяются физически сразу в VirtualAlloc —
     /// demand paging для них отсутствует, prefault не нужен.
     pub fn large_pages_precommitted() -> bool {
@@ -470,6 +511,43 @@ mod platform {
                 }
             }
             2 * 1024 * 1024
+        })
+    }
+
+    /// Физическая оперативная память системы в байтах (без учёта swap).
+    /// Используется PGO-функциями как потолок размера чанка, чтобы суммарный
+    /// commit charge чанков всех потоков не превышал RAM.
+    pub fn physical_memory_bytes() -> usize {
+        if cfg!(miri) {
+            // Под Miri ограничение физической памяти не моделируем.
+            return usize::MAX;
+        }
+        static PHYS: OnceLock<usize> = OnceLock::new();
+        *PHYS.get_or_init(|| unsafe {
+            let pages = libc::sysconf(libc::_SC_PHYS_PAGES);
+            let page = libc::sysconf(libc::_SC_PAGESIZE);
+            if pages > 0 && page > 0 {
+                (pages as usize).saturating_mul(page as usize)
+            } else {
+                // Скромный дефолт: лучше ограничить чанк, чем задуть систему.
+                8 * 1024 * 1024 * 1024
+            }
+        })
+    }
+
+    /// Проба: получается ли выделить huge page (MAP_HUGETLB / Hugepagesize).
+    /// Результат кешируется — одна проба за процесс достаточна.
+    pub fn large_pages_available() -> bool {
+        if cfg!(miri) {
+            return false;
+        }
+        static HUGE_OK: OnceLock<bool> = OnceLock::new();
+        *HUGE_OK.get_or_init(|| match try_alloc_huge(huge_page_size()) {
+            Some(a) => {
+                free(a);
+                true
+            }
+            None => false,
         })
     }
 
@@ -1237,11 +1315,7 @@ impl ThreadBump {
                         prefetch_write(unsafe { self.ptr.add(off + size) });
                         return p;
                     }
-                    let free = self.len - self.lo.load(Ordering::Relaxed);
-                    panic!(
-                        "Arena OOM: need {} at offset {}, free {} (cap {})",
-                        size, off, free, self.len
-                    );
+                    return self.grow_fallback::<ALIGN>(size);
                 }
                 let mid = if self.neighbor_idx.is_some() {
                     self.len / 2
@@ -1275,13 +1349,7 @@ impl ThreadBump {
                         }
                         return self.grow_fallback::<ALIGN>(size);
                     } else {
-                        panic!(
-                            "Arena OOM: need {} at offset {}, free {} (cap {})",
-                            size,
-                            off,
-                            mid - self.lo.load(Ordering::Relaxed),
-                            self.len
-                        );
+                        return self.grow_fallback::<ALIGN>(size);
                     }
                 }
             }
@@ -1292,13 +1360,9 @@ impl ThreadBump {
                 // Быстрый путь: без пары и доноров — единственный владелец `hi`.
                 if self.neighbor_idx.is_none() && matches!(self.donor_reg, DonorReg::None) {
                     let cur = self.hi.load(Ordering::Relaxed);
-                    if size > self.len - cur {
-                        panic!(
-                            "Arena OOM: need {} bytes, only {} free (cap {})",
-                            size,
-                            self.len - cur,
-                            self.len
-                        );
+                    let free = self.len.saturating_sub(cur);
+                    if size > free {
+                        return self.grow_fallback::<ALIGN>(size);
                     }
                     let off = (self.len - cur - size) & !(ALIGN - 1);
                     let new_hi = self.len - off;
@@ -1345,7 +1409,7 @@ impl ThreadBump {
                         }
                     }
                     // Своя половина (или весь регион) закончилась: попытка занять
-                    // у соседа, иначе у доноров, иначе новый чанк / OOM.
+                    // у соседа, иначе у доноров, иначе новый чанк.
                     if let Some(p) = self.try_borrow::<ALIGN>(size) {
                         return p;
                     } else if !matches!(self.donor_reg, DonorReg::None) {
@@ -1354,12 +1418,7 @@ impl ThreadBump {
                         }
                         return self.grow_fallback::<ALIGN>(size);
                     } else {
-                        panic!(
-                            "Arena OOM: need {} bytes, only {} free (cap {})",
-                            size,
-                            self.len - cur - mid,
-                            self.len
-                        );
+                        return self.grow_fallback::<ALIGN>(size);
                     }
                 }
             }
@@ -1372,15 +1431,9 @@ impl ThreadBump {
                     // левая сторона: занята [mid - lo, mid), растёт вниз
                     let lo = self.lo.load(Ordering::Relaxed);
                     let hi = self.hi.load(Ordering::Relaxed);
-                    let base = mid - lo;
+                    let base = mid.saturating_sub(lo);
                     if size > base {
-                        panic!(
-                            "Arena OOM: need {} at offset {}, free {} (cap {})",
-                            size,
-                            mid - lo,
-                            base,
-                            self.len
-                        );
+                        return self.grow_fallback::<ALIGN>(size);
                     }
                     let off = (base - size) & !(ALIGN - 1);
                     let new_lo = mid - off;
@@ -1395,13 +1448,7 @@ impl ThreadBump {
                     let off = (base + ALIGN - 1) & !(ALIGN - 1);
                     let end = off + size;
                     if end > self.len {
-                        panic!(
-                            "Arena OOM: need {} at offset {}, free {} (cap {})",
-                            size,
-                            off,
-                            self.len - end,
-                            self.len
-                        );
+                        return self.grow_fallback::<ALIGN>(size);
                     }
                     let new_hi = off + size - mid;
                     // следующая аллокация пойдёт в левую половину
@@ -1450,13 +1497,11 @@ impl ThreadBump {
                         prefetch_write(unsafe { self.ptr.add(off + size) });
                         return p;
                     }
-                    panic!(
-                        "Arena OOM: need {} at offset {}, free {} (cap {})",
-                        size,
-                        off,
-                        self.len - self.lo.load(Ordering::Relaxed),
-                        self.len
-                    );
+                    // Mono-путь бенча: при нехватке региона не паникуем, а
+                    // берём дополнительный чанк (иначе directional middle-out
+                    // падает при чётном числе аллокаций в итерации, см.
+                    // profile_arena_chunk_size_full).
+                    return self.grow_fallback::<ALIGN>(size);
                 }
                 let mid = if pair { self.len / 2 } else { self.len };
                 loop {
@@ -1481,15 +1526,8 @@ impl ThreadBump {
                             if let Some(p) = self.try_take_from_donors::<ALIGN>(size) {
                                 return p;
                             }
-                            return self.grow_fallback::<ALIGN>(size);
                         }
-                        panic!(
-                            "Arena OOM: need {} at offset {}, free {} (cap {})",
-                            size,
-                            off,
-                            mid - self.lo.load(Ordering::Relaxed),
-                            self.len
-                        );
+                        return self.grow_fallback::<ALIGN>(size);
                     } else {
                         // !pair с donor != 0 (случай !pair && donor==0 вернулся выше).
                         if let Some(p) = self.try_take_from_donors::<ALIGN>(size) {
@@ -1502,13 +1540,8 @@ impl ThreadBump {
             ThreadBump::MODE_DIR_BACKWARD => {
                 if !pair && donor == 0 {
                     let cur = self.hi.load(Ordering::Relaxed);
-                    if size > self.len - cur {
-                        panic!(
-                            "Arena OOM: need {} bytes, only {} free (cap {})",
-                            size,
-                            self.len - cur,
-                            self.len
-                        );
+                    if size > self.len.saturating_sub(cur) {
+                        return self.grow_fallback::<ALIGN>(size);
                     }
                     let off = (self.len - cur - size) & !(ALIGN - 1);
                     let new_hi = self.len - off;
@@ -1555,14 +1588,8 @@ impl ThreadBump {
                         if let Some(p) = self.try_take_from_donors::<ALIGN>(size) {
                             return p;
                         }
-                        return self.grow_fallback::<ALIGN>(size);
                     }
-                    panic!(
-                        "Arena OOM: need {} bytes, only {} free (cap {})",
-                        size,
-                        self.len - cur - mid,
-                        self.len
-                    );
+                    return self.grow_fallback::<ALIGN>(size);
                 }
             }
             _ => {
@@ -1574,13 +1601,7 @@ impl ThreadBump {
                     let hi = self.hi.load(Ordering::Relaxed);
                     let base = mid - lo;
                     if size > base {
-                        panic!(
-                            "Arena OOM: need {} at offset {}, free {} (cap {})",
-                            size,
-                            mid - lo,
-                            base,
-                            self.len
-                        );
+                        return self.grow_fallback::<ALIGN>(size);
                     }
                     let off = (base - size) & !(ALIGN - 1);
                     let new_lo = mid - off;
@@ -1597,13 +1618,7 @@ impl ThreadBump {
                     let off = (base + ALIGN - 1) & !(ALIGN - 1);
                     let end = off + size;
                     if end > self.len {
-                        panic!(
-                            "Arena OOM: need {} at offset {}, free {} (cap {})",
-                            size,
-                            off,
-                            self.len - end,
-                            self.len
-                        );
+                        return self.grow_fallback::<ALIGN>(size);
                     }
                     let new_hi = off + size - mid;
                     let pf = unsafe { self.ptr.add(mid.wrapping_sub(lo + size)) };
@@ -1631,7 +1646,7 @@ impl ThreadBump {
     ///
     /// TODO (пока заглушка): дальше — поиск по БОЛЕЕ ДАЛЬНИМ соседям, а если и у
     /// них мало осталось — аллокация нового чанка. Сейчас при неудаче у соседа
-    /// возвращаем `None` (вызывающий паникует с OOM).
+    /// возвращаем `None` (вызывающий берёт fallback-чанк).
     #[inline(always)]
     fn try_borrow<const ALIGN: usize>(&self, size: usize) -> Option<*mut u8> {
         let idx = self.neighbor_idx?;
@@ -3489,6 +3504,22 @@ pub fn arena_light_donors_boxcar_prio(chunk_size: usize, smt: bool) {
 //                        PGO
 // ============================================================
 
+/// Потолок PGO-размера чанка: чанков столько, сколько бенч-потоков, и суммарно
+/// они не должны занимать больше половины физической памяти (вторая половина —
+/// системе и остальным процессам). Без этого ограничения на 16-поточной машине
+/// с 13 GB RAM PGO выдавал чанки по 750 MB, и суммарный commit charge одного
+/// прогона доходил до 12 GB (борьба с pagefile).
+fn pgo_chunk_cap() -> usize {
+    let threads = num_cpus::get().max(1);
+    let phys = platform::physical_memory_bytes();
+    (phys / (threads * 2)).max(64 * 1024 * 1024)
+}
+
+/// Округление вверх до мегабайта.
+fn round_up_mb(bytes: usize) -> usize {
+    ((bytes + (1024 * 1024 - 1)) / (1024 * 1024)) * (1024 * 1024)
+}
+
 #[cfg_attr(coverage, coverage(off))]
 pub fn profile_bump_chunk_size_full() -> usize {
     let bump = Bump::new();
@@ -3504,11 +3535,16 @@ pub fn profile_bump_chunk_size_full() -> usize {
             vectr.push(vec);
         }
     }
-    let used = bump.allocated_bytes();
+    // `allocated_bytes()` у bumpalo — сумма ЗАРЕЗЕРВИРОВАННЫХ чанков (список
+    // растёт геометрически ×2 с отсечкой), а не использованные байты: наивное
+    // умножение давало 750 MB при реальном пике ~290 MB. Использованное =
+    // зарезервированное минус свободное место в текущем чанке
+    // (`chunk_capacity()` — публичный API bumpalo).
+    let used = bump.allocated_bytes().saturating_sub(bump.chunk_capacity());
     core::hint::black_box(&vectr);
     drop(vectr);
-    let recommended = used * 120 / 100;
-    ((recommended + (1024 * 1024 - 1)) / (1024 * 1024)) * (1024 * 1024)
+    let recommended = (used * 110 / 100).min(pgo_chunk_cap());
+    round_up_mb(recommended)
 }
 
 #[cfg_attr(coverage, coverage(off))]
@@ -3526,11 +3562,12 @@ pub fn profile_bump_chunk_size_light() -> usize {
             vectr.push(vec);
         }
     }
-    let used = bump.allocated_bytes();
+    // См. profile_bump_chunk_size_full: used = allocated - chunk_capacity.
+    let used = bump.allocated_bytes().saturating_sub(bump.chunk_capacity());
     core::hint::black_box(&vectr);
     drop(vectr);
-    let recommended = used * 120 / 100;
-    ((recommended + (1024 * 1024 - 1)) / (1024 * 1024)) * (1024 * 1024)
+    let recommended = (used * 110 / 100).min(pgo_chunk_cap());
+    round_up_mb(recommended)
 }
 
 #[cfg_attr(coverage, coverage(off))]
@@ -3556,11 +3593,16 @@ pub fn profile_arena_chunk_size_full() -> usize {
             vectr.push::<{ core::mem::align_of::<ArenaVec<ArenaString>>() }>(vec, bump);
         }
     }
+    // ThreadBump::allocated_bytes() = lo + hi — уже использованные байты.
+    // Маржа 15% вместо 5%: в режиме MiddleOut стороны чередуются ПО СЧЁТЧИКУ
+    // аллокаций, а не по байтам — при чётном числе аллокаций в итерации
+    // (scale=4: 1 буфер + 25 строк = 26) буферы 9.6 KB все достаются одной
+    // стороне, и ей нужно больше половины чанка.
     let used = bump.allocated_bytes();
     core::hint::black_box(&vectr);
     drop(vectr);
-    let recommended = used * 105 / 100;
-    ((recommended + (1024 * 1024 - 1)) / (1024 * 1024)) * (1024 * 1024)
+    let recommended = (used * 115 / 100).min(pgo_chunk_cap());
+    round_up_mb(recommended)
 }
 
 #[cfg_attr(coverage, coverage(off))]
@@ -3589,8 +3631,8 @@ pub fn profile_arena_chunk_size_light() -> usize {
     let used = bump.allocated_bytes();
     core::hint::black_box(&vectr);
     drop(vectr);
-    let recommended = used * 105 / 100;
-    ((recommended + (1024 * 1024 - 1)) / (1024 * 1024)) * (1024 * 1024)
+    let recommended = (used * 115 / 100).min(pgo_chunk_cap());
+    round_up_mb(recommended)
 }
 
 // ============================================================
@@ -3708,6 +3750,16 @@ pub fn run() {
     println!("Логических ядер: {}", all_cores.len());
     println!("Физических ядер: {}", num_cpus::get_physical());
     println!("Глобальный аллокатор: {}", allocator_label());
+    println!(
+        "Страницы: {} KB / huge pages {} MB: {}",
+        platform::page_size() / 1024,
+        platform::huge_page_size() / (1024 * 1024),
+        if platform::large_pages_available() {
+            "доступны"
+        } else {
+            "нет"
+        }
+    );
     println!();
 
     // PGO для bumpalo
@@ -3747,7 +3799,7 @@ pub fn run() {
 /// PGO-профилей. Запускается вместо тяжёлых бенчмарков `run()` только когда
 /// задана переменная окружения `R3_PGO_TRAIN` (её выставляет build.ps1 во время
 /// тренировочного прогона). Несколько сотен тысяч аллокаций — секунды, а не минуты.
-/// Между пачками делается reset(), чтобы одиночные bump'ы не ушли в OOM-панику.
+/// Между пачками делается reset(), чтобы одиночные bump'ы не ушли в перераспределение fallback-чанков.
 #[cfg_attr(coverage, coverage(off))]
 pub fn pgo_train() {
     const BATCH: u32 = 20_000;
@@ -4227,7 +4279,6 @@ fn run_benchmarks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::panic;
 
     // Множитель для облегчения тестов под Miri (Tree Borrows): в обычном режиме
     // = 1 (полные объёмы и арена), под Miri = 100 (в ×100 меньше аллокаций и
@@ -4339,35 +4390,30 @@ mod tests {
     }
 
     #[test]
-    fn forward_oom_panics() {
+    fn forward_oom_falls_back() {
         let (_arena, bump) = make_one(BumpDir::Forward, 64);
         let _ = bump.alloc_raw::<1>(64); // ровно заполняет
-        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            bump.alloc_raw::<1>(1);
-        }));
-        assert!(res.is_err(), "ожидается OOM-panic");
+        let p = bump.alloc_raw::<1>(1); // регион полон → fallback-чанк
+        assert!(!p.is_null());
+        assert!(!bump.fallback.lock().chunks.is_empty());
     }
 
     #[test]
-    fn backward_oom_panics() {
+    fn backward_oom_falls_back() {
         let (_arena, bump) = make_one(BumpDir::Backward, 64);
         let _ = bump.alloc_raw::<1>(64);
-        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            bump.alloc_raw::<1>(1);
-        }));
-        assert!(res.is_err(), "ожидается OOM-panic");
+        let p = bump.alloc_raw::<1>(1);
+        assert!(!p.is_null());
+        assert!(!bump.fallback.lock().chunks.is_empty());
     }
 
     #[test]
-    fn middleout_oom_panics() {
+    fn middleout_oom_falls_back() {
         let (_arena, bump) = make_one(BumpDir::MiddleOut, 64);
-        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            bump.alloc_raw::<1>(64);
-        }));
-        assert!(
-            res.is_err(),
-            "ожидается OOM-panic (середина даёт только половину свободных байт)"
-        );
+        // Середина даёт только половину свободных байт → fallback-чанк.
+        let p = bump.alloc_raw::<1>(64);
+        assert!(!p.is_null());
+        assert!(!bump.fallback.lock().chunks.is_empty());
     }
 
     #[test]
@@ -5636,41 +5682,75 @@ mod tests {
     }
 
     #[test]
-    fn cov_forward_pair_huge_alloc_panics_oom() {
+    fn cov_forward_pair_huge_alloc_falls_back() {
         // Forward bump в паре (общий регион), огромный блок больше всей пары →
-        // своя половина полна и заём у соседа невозможен → OOM panic.
+        // своя половина полна и заём у соседа невозможен → fallback-чанк.
         let arena = SharedArena::new(arena_scale(1 << 14));
         let v = split_pair_raw(&arena, 2);
         let huge = arena_scale(1 << 14) * 2; // больше всего объединённого региона
-        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            let _ = v[1].alloc_raw::<1>(huge); // v[1] — Forward bump пары
-        }));
-        assert!(res.is_err());
+        let p = v[1].alloc_raw::<1>(huge); // v[1] — Forward bump пары
+        assert!(!p.is_null());
+        assert!(!v[1].fallback.lock().chunks.is_empty());
     }
 
     #[test]
-    fn cov_backward_pair_huge_alloc_panics_oom() {
-        // Backward bump в паре, огромный блок → OOM panic.
+    fn cov_backward_pair_huge_alloc_falls_back() {
+        // Backward bump в паре, огромный блок → fallback-чанк.
         let arena = SharedArena::new(arena_scale(1 << 14));
         let v = split_pair_raw(&arena, 2);
         let huge = arena_scale(1 << 14) * 2;
-        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            let _ = v[0].alloc_raw::<1>(huge); // v[0] — Backward bump пары
-        }));
-        assert!(res.is_err());
+        let p = v[0].alloc_raw::<1>(huge); // v[0] — Backward bump пары
+        assert!(!p.is_null());
+        assert!(!v[0].fallback.lock().chunks.is_empty());
     }
 
     #[test]
-    fn cov_middleout_right_panic_oom() {
+    fn cov_middleout_right_falls_back() {
         // MiddleOut: маленький alloc влево, затем огромный — правая сторона
-        // (side=true) не помещается → OOM panic на правой ветке.
+        // (side=true) не помещается → fallback-чанк.
         let (_arena, bump) = make_one(BumpDir::MiddleOut, arena_scale(1 << 14));
         let _ = bump.alloc_raw::<1>(16); // левая сторона, ok
         let huge = arena_scale(1 << 14) * 2;
-        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            let _ = bump.alloc_raw::<1>(huge); // правая сторона → panic
-        }));
-        assert!(res.is_err());
+        let p = bump.alloc_raw::<1>(huge); // правая сторона → fallback
+        assert!(!p.is_null());
+        assert!(!bump.fallback.lock().chunks.is_empty());
+    }
+
+    #[test]
+    fn cov_mono_middleout_oom_falls_back_to_extra_chunk() {
+        // Мономорфный путь бенча (alloc_raw_m) при нехватке региона не паникует,
+        // а берёт дополнительный чанк через grow_fallback: иначе directional
+        // middle-out падает на workload с чётным числом аллокаций в итерации
+        // (все буферы достаются одной стороне).
+        let (_arena, bump) = make_one(BumpDir::MiddleOut, arena_scale(1 << 14));
+        let _ = bump.alloc_raw_m::<1, { ThreadBump::MODE_DIR_MIDDLEOUT }>(16); // левая, ok
+        let huge = arena_scale(1 << 14) * 2; // больше всего региона
+        let p = bump.alloc_raw_m::<1, { ThreadBump::MODE_DIR_MIDDLEOUT }>(huge);
+        assert!(!p.is_null(), "гигантский блок уходит в fallback-чанк");
+        assert!(
+            !bump.fallback.lock().chunks.is_empty(),
+            "fallback-чанк должен быть выделен"
+        );
+    }
+
+    #[test]
+    fn cov_mono_forward_oom_falls_back_to_extra_chunk() {
+        let (_arena, bump) = make_one(BumpDir::Forward, arena_scale(1 << 14));
+        let big = arena_scale(1 << 14);
+        let _ = bump.alloc_raw_m::<1, { ThreadBump::MODE_DIR_FORWARD }>(big); // регион полон
+        let p = bump.alloc_raw_m::<1, { ThreadBump::MODE_DIR_FORWARD }>(64);
+        assert!(!p.is_null());
+        assert!(!bump.fallback.lock().chunks.is_empty());
+    }
+
+    #[test]
+    fn cov_mono_backward_oom_falls_back_to_extra_chunk() {
+        let (_arena, bump) = make_one(BumpDir::Backward, arena_scale(1 << 14));
+        let big = arena_scale(1 << 14);
+        let _ = bump.alloc_raw_m::<1, { ThreadBump::MODE_DIR_BACKWARD }>(big); // регион полон
+        let p = bump.alloc_raw_m::<1, { ThreadBump::MODE_DIR_BACKWARD }>(64);
+        assert!(!p.is_null());
+        assert!(!bump.fallback.lock().chunks.is_empty());
     }
 
     #[test]
@@ -5695,10 +5775,10 @@ mod tests {
     }
 
     #[test]
-    fn cov_pair_full_try_borrow_forward_none_and_backward_panic() {
+    fn cov_pair_full_try_borrow_forward_none_and_backward_fallback() {
         // Пара: v[0]=Backward, v[1]=Forward, общий регион [0, 2cs), mid=cs.
         // Заполняем обе половины; переполнение v[0] (Backward) → try_borrow у
-        // v[1] (Forward, полон) → None (1610) → OOM panic (1331).
+        // v[1] (Forward, полон) → None → fallback-чанк.
         let arena = SharedArena::new(arena_scale(1 << 16));
         let v = split_pair_raw(&arena, 2);
         let cs = arena_scale(1 << 16) / 2; // половина пары
@@ -5706,25 +5786,23 @@ mod tests {
         let _ = v[1].alloc_raw::<1>(cs);
         // Заполняем верх Backward bump'а v[0] полностью.
         let _ = v[0].alloc_raw::<1>(cs);
-        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            let _ = v[0].alloc_raw::<1>(16); // некуда: своя пол. полна и сосед полон
-        }));
-        assert!(res.is_err());
+        let p = v[0].alloc_raw::<1>(16); // некуда: своя пол. полна и сосед полон
+        assert!(!p.is_null());
+        assert!(!v[0].fallback.lock().chunks.is_empty());
     }
 
     #[test]
-    fn cov_pair_full_try_borrow_backward_none_and_forward_panic() {
+    fn cov_pair_full_try_borrow_backward_none_and_forward_fallback() {
         // Пара: переполнение v[1] (Forward) → try_borrow у v[0] (Backward, полон)
-        // → None (1631) → OOM panic (1269).
+        // → None → fallback-чанк.
         let arena = SharedArena::new(arena_scale(1 << 16));
         let v = split_pair_raw(&arena, 2);
         let cs = arena_scale(1 << 16) / 2;
         let _ = v[1].alloc_raw::<1>(cs);
         let _ = v[0].alloc_raw::<1>(cs);
-        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            let _ = v[1].alloc_raw::<1>(16);
-        }));
-        assert!(res.is_err());
+        let p = v[1].alloc_raw::<1>(16);
+        assert!(!p.is_null());
+        assert!(!v[1].fallback.lock().chunks.is_empty());
     }
 
     #[test]
