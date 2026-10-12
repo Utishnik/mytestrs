@@ -36,7 +36,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Install nightly toolchain with Miri
-      run: rustup toolchain install nightly --profile minimal --component miri rust-src --no-self-update
+      run: rustup toolchain install nightly --profile minimal --component miri --component rust-src --no-self-update
     - name: Use nightly for this checkout
       run: rustup override set nightly
     - name: Build Miri sysroot
