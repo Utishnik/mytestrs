@@ -7,7 +7,7 @@ use orx_concurrent_vec::ConcurrentVec as OrxVec;
 use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1160,6 +1160,26 @@ impl<'a> Split<'a> {
     pub fn as_slice(&self) -> &[CachePadded<ThreadBump>] {
         &self.bumps
     }
+
+    /// Гуард-владелец доступа к bump'у по индексу. Выделение — по `&guard`,
+    /// `reset` — только по `&mut guard` (см. `BumpGuard`). Паникует при
+    /// выходе за границы — как срезовое индексирование.
+    pub fn guard_mut(&mut self, i: usize) -> BumpGuard<'_, ThreadBump> {
+        BumpGuard::new(&mut *self.bumps[i])
+    }
+
+    /// Гуарды на ВСЕ bumps разом: один вызов занимает `&mut self` целиком и
+    /// через `iter_mut` раздаёт непересекающиеся эксклюзивные доступы (по
+    /// одному `&mut` на элемент через два последовательных `guard_mut`
+    /// получить нельзя — заимствования пересеклись бы). Каждый гуард можно
+    /// отдать своему потоку (`Send`), там аллоцировать по `&guard` и
+    /// сбрасывать по `&mut guard`.
+    pub fn guards(&mut self) -> Vec<BumpGuard<'_, ThreadBump>> {
+        self.bumps
+            .iter_mut()
+            .map(|b| BumpGuard::new(&mut **b))
+            .collect()
+    }
 }
 
 impl<'a> std::ops::Deref for Split<'a> {
@@ -1167,6 +1187,78 @@ impl<'a> std::ops::Deref for Split<'a> {
     #[inline]
     fn deref(&self) -> &Self::Target {
         &self.bumps
+    }
+}
+
+/// Как у среза: `&mut split[i]` — место элемента, а не копия. Нужен для
+/// `BumpGuard::new(&mut split[i])` и для индексирования гуардов по образцу
+/// обычного `Vec`/среза.
+impl<'a> std::ops::DerefMut for Split<'a> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.bumps
+    }
+}
+
+// ============================================================
+//                  BUMP GUARD (ОБЁРТКА-ВЛАДЕЛЕЦ)
+// ============================================================
+
+/// Обёртка-владелец доступа к bump-аллокатору (`ThreadBump`, `ZoneBump`, …).
+///
+/// Контракт:
+/// * **выделение** — только через заимствование гуарда: `&guard`
+///   (`Deref`): `guard.alloc_raw::<A>(n)`, `ArenaVec::with_capacity_in(n, &guard)`
+///   и т.п.;
+/// * **`reset`** — только через `&mut guard`: сам `reset` теперь
+///   `fn reset(&mut self)` (см. `ThreadBump::reset`), а до `&mut ThreadBump`
+///   можно добраться лишь через `DerefMut` гуарда, т.е. нужен именно
+///   изменяемый гуард. По одной `&guard` сбросить регион нельзя.
+///
+/// Гуард владеет не памятью региона, а **эксклюзивным доступом** к нему (по
+/// образцу `MutexGuard`): bumps остаются на месте в `Split` — на них ссылаются
+/// сырые указатели `array`/`donor_array` режимов пар и доноров, — а гуард
+/// просто не даёт выполнить `reset` «по обычной ссылке», из-за чего сброс
+/// параллельно идущего выделения становится невозможен.
+pub struct BumpGuard<'a, T: ?Sized> {
+    inner: &'a mut T,
+}
+
+impl<'a, T: ?Sized> BumpGuard<'a, T> {
+    /// Взять эксклюзивный доступ к аллокатору (обёртка-владелец доступа).
+    #[inline]
+    pub fn new(inner: &'a mut T) -> Self {
+        Self { inner }
+    }
+
+    /// Выделение и прочие read-only операции — по этому заимствованию.
+    #[inline]
+    pub fn bump(&self) -> &T {
+        self.inner
+    }
+
+    /// Эксклюзивное заимствование аллокатора (`reset` и всё, что требует
+    /// `&mut`).
+    #[inline]
+    pub fn bump_mut(&mut self) -> &mut T {
+        self.inner
+    }
+}
+
+impl<T: ?Sized> Deref for BumpGuard<'_, T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        self.inner
+    }
+}
+
+/// Именно через `DerefMut` и открывается `reset(&mut self)`: вызов
+/// `guard.reset()` требует `&mut guard`.
+impl<T: ?Sized> DerefMut for BumpGuard<'_, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        self.inner
     }
 }
 
@@ -2010,8 +2102,19 @@ impl ThreadBump {
         self.alloc_raw_m::<ALIGN, MODE>(size) as *mut T
     }
 
+    /// Обнулить счётчики региона: регион переиспользуется с нуля (уже
+    /// выданные блоки становятся валидными только после того, как владелец
+    /// разберётся со своими указателями). Fallback-чанки не трогаются.
+    ///
+    /// Сознательно `&mut self`: `ThreadBump: Sync`, а режимы пар и доноров
+    /// ходят в счётчики соседа через сырые указатели `array`/`donor_array`,
+    /// поэтому `reset(&self)` позволял сбросить регион, пока оттуда
+    /// параллельно выделяется (гонка: два потока получают один адрес).
+    /// Эксклюзивное заимствование гарантирует, что на время сброса никто не
+    /// аллоцирует из этого bump'а. Наружу сброс идёт через `BumpGuard`
+    /// (`reset` требует `&mut guard`), см. `Split::guards`/`Split::guard_mut`.
     #[hotpath::measure]
-    fn reset(&self) {
+    pub fn reset(&mut self) {
         self.lo.store(0, Ordering::Relaxed);
         self.hi.store(0, Ordering::Relaxed);
         self.toggle.set(false);
@@ -2518,9 +2621,12 @@ impl ZoneBump<'static> {
     }
 
     /// Обнулить счётчики зоны (регион переиспользуется с нуля). Не трогает
-    /// уже выделенные fallback-чанки.
+    /// уже выделенные fallback-чанки. `&mut self` — единый контракт со
+    /// `ThreadBump::reset`: сброс даётся только за эксклюзивный доступ
+    /// (наружу — через `BumpGuard`: `reset` требует `&mut guard`), чтобы
+    /// регион не обнулялся «по обычной ссылке», из которой идёт выделение.
     #[allow(dead_code)]
-    pub fn reset(&self) {
+    pub fn reset(&mut self) {
         self.inner.lo.set(0);
         self.inner.hi.set(0);
         self.inner.toggle.set(false);
@@ -3190,7 +3296,7 @@ fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
         println!("[TOTAL CAPACITY]:  {}", total_capacity);
     }
     let arena = SharedArena::new(total_capacity);
-    let bumps: Split<'_> = match layout {
+    let mut bumps: Split<'_> = match layout {
         ArenaLayout::Uniform(dir) => arena.split_with_safe(core_ids.len(), dir),
         ArenaLayout::Neighbors => arena.split_alternating_safe(core_ids.len()),
         ArenaLayout::Pair => arena.split_paired_safe(core_ids.len()),
@@ -3219,46 +3325,50 @@ fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
     };
     let scale = bench_scale();
 
+    // Гуарды-владельцы: каждый поток получает эксклюзивный доступ к своему
+    // чанку. `guards()` занимает `&mut bumps` целиком и раздаёт
+    // непересекающиеся `&mut` (bumps при этом остаются на месте в `Split` —
+    // на них ссылаются сырые указатели `array`/`donor_array`).
+    let guards = bumps.guards();
     std::thread::scope(|sc| {
-        for (core_id, i) in core_ids.iter().zip(0..bumps.len()) {
-            // `&bumps[i]` — разделяемая ссылка в никогда не переезжающий массив.
-            // `CachePadded<ThreadBump>: Sync` (см. `unsafe impl Sync`), поэтому
-            // сама ссылка `Send` и её можно отдать потоку. Каждый чанк
-            // использует ровно один поток; заём у соседа идёт только через
-            // atomic-счётчики (см. `try_borrow`).
+        for (core_id, mut bump) in core_ids.iter().zip(guards) {
+            // Гуард `Send` (содержит `&mut ThreadBump`), его можно отдать
+            // потоку. Каждый чанк использует ровно один поток; заём у соседа
+            // идёт только через atomic-счётчики (см. `try_borrow`).
             let core = *core_id;
-            let bump = &bumps[i];
             sc.spawn(move || {
                 core_affinity::set_for_current(core);
                 hotpath::measure_block!("prefault", {
-                    bump.prefault_local(); // first-touch Р Р† Р В»Р С•Р С”Р В°Р В»РЎРЉР Р…Р С•Р в„– NUMA-Р Р…Р С•Р Т‘Р Вµ
+                    bump.prefault_local(); // first-touch Р Р† Р В»Р С•Р С”Р В°Р В»РЎРЉР Р…Р С•Р в„– NUMA-Р Р…Р С•Р Т‘Р Вµ
                 });
                 for _ in 0..(3 / scale).max(1) {
                     hotpath::measure_block!("alloc", {
+                        // Выделение — по заимствованию гуарда (`&bump`).
                         let mut vectr: ArenaVec<ArenaVec<ArenaString>> =
                             ArenaVec::with_capacity_in::<
                                 { core::mem::align_of::<ArenaVec<ArenaString>>() },
-                            >(vcap / scale, bump);
+                            >(vcap / scale, &bump);
                         for _ in 0..(outer / scale).max(1) {
                             for _ in 0..(inner / scale).max(1) {
                                 let mut vec: ArenaVec<ArenaString> =
                                     ArenaVec::with_capacity_in::<
                                         { core::mem::align_of::<ArenaString>() },
-                                    >(400, bump);
+                                    >(400, &bump);
                                 for _ in 0..(100 / scale).max(1) {
                                     vec.push::<{ core::mem::align_of::<ArenaString>() }>(
-                                        ArenaString::from_str_in("stroka", bump),
-                                        bump,
+                                        ArenaString::from_str_in("stroka", &bump),
+                                        &bump,
                                     );
                                 }
                                 vectr.push::<{ core::mem::align_of::<ArenaVec<ArenaString>>() }>(
-                                    vec, bump,
+                                    vec, &bump,
                                 );
                             }
                         }
                         core::hint::black_box(&vectr);
                         drop(vectr);
                     });
+                    // `reset` — только по `&mut bump` (DerefMut -> `&mut ThreadBump`).
                     hotpath::measure_block!("reset", {
                         bump.reset();
                     });
@@ -3274,9 +3384,11 @@ fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
 /// общих/динамических путей.
 #[inline(always)]
 #[cfg_attr(coverage, coverage(off))]
-fn arena_run_thread<const MODE: u32, const FULL: bool>(bump: &ThreadBump) {
+fn arena_run_thread<const MODE: u32, const FULL: bool>(bump: &mut BumpGuard<'_, ThreadBump>) {
+    // Выделение — по `&bump` (заимствование гуарда, авто-deref до
+    // `&ThreadBump`), `reset` в конце каждой итерации — по `&mut bump`.
     hotpath::measure_block!("prefault", {
-        bump.prefault_local(); // first-touch Р Р† Р В»Р С•Р С”Р В°Р В»РЎРЉР Р…Р С•Р в„– NUMA-Р Р…Р С•Р Т‘Р Вµ
+        bump.prefault_local(); // first-touch Р Р† Р В»Р С•Р С”Р В°Р В»РЎРЉР Р…Р С•Р в„– NUMA-Р Р…Р С•Р Т‘Р Вµ
     });
     let (vcap, outer, inner) = if FULL {
         (40000, 200, 200)
@@ -3321,14 +3433,15 @@ fn arena_bench_impl<const MODE: u32, const FULL: bool>(chunk_size: usize, smt: b
     let core_ids = get_cores(smt);
     let total_capacity = chunk_size * core_ids.len();
     let arena = SharedArena::new(total_capacity);
-    let bumps = make_split::<MODE>(&arena, core_ids.len());
+    let mut bumps = make_split::<MODE>(&arena, core_ids.len());
+    // Гуарды-владельцы: по одному на поток, отдаются в `move`-замыкания.
+    let guards = bumps.guards();
     std::thread::scope(|s| {
-        for (core_id, i) in core_ids.iter().zip(0..bumps.len()) {
+        for (core_id, mut bump) in core_ids.iter().zip(guards) {
             let core = *core_id;
-            let bump = &bumps[i];
             s.spawn(move || {
                 core_affinity::set_for_current(core);
-                arena_run_thread::<MODE, FULL>(bump);
+                arena_run_thread::<MODE, FULL>(&mut bump);
             });
         }
     });
@@ -3385,17 +3498,19 @@ fn arena_bench_neighbors_impl<const FULL: bool>(chunk_size: usize, smt: bool) {
     let core_ids = get_cores(smt);
     let total_capacity = chunk_size * core_ids.len();
     let arena = SharedArena::new(total_capacity);
-    let bumps = arena.split_alternating_safe(core_ids.len());
+    let mut bumps = arena.split_alternating_safe(core_ids.len());
+    // Гуарды-владельцы: по одному на поток (индекс сохраняем — он выбирает
+    // направление), бампы остаются на месте в `Split`.
+    let guards = bumps.guards();
     std::thread::scope(|s| {
-        for (core_id, i) in core_ids.iter().zip(0..bumps.len()) {
+        for (core_id, (i, mut bump)) in core_ids.iter().zip(guards.into_iter().enumerate()) {
             let core = *core_id;
-            let bump = &bumps[i];
             s.spawn(move || {
                 core_affinity::set_for_current(core);
                 if i % 2 == 0 {
-                    arena_run_thread::<MODE_BWD, FULL>(bump);
+                    arena_run_thread::<MODE_BWD, FULL>(&mut bump);
                 } else {
-                    arena_run_thread::<MODE_FWD, FULL>(bump);
+                    arena_run_thread::<MODE_FWD, FULL>(&mut bump);
                 }
             });
         }
@@ -3879,8 +3994,9 @@ pub fn pgo_train() {
     // Forward / Backward / MiddleOut на одном bump.
     for &dir in &[BumpDir::Forward, BumpDir::Backward, BumpDir::MiddleOut] {
         let arena = SharedArena::new(8 * 1024 * 1024);
-        let v = arena.split_with_safe(1, dir);
-        let b = &v[0];
+        let mut v = arena.split_with_safe(1, dir);
+        // Гуард-владелец: аллокация — по `&b`, `reset` — только по `&mut b`.
+        let mut b = v.guard_mut(0);
         for _ in 0..ROUNDS {
             hotpath::measure_block!("pgo-alloc", {
                 for _ in 0..BATCH {
@@ -3900,30 +4016,32 @@ pub fn pgo_train() {
     // Neighbors (alternating directions).
     {
         let arena = SharedArena::new(8 * 1024 * 1024);
-        let bumps = arena.split_alternating_safe(2);
-        let (a, c) = (&bumps[0], &bumps[1]);
+        let mut bumps = arena.split_alternating_safe(2);
+        // По гуарду на чанк; `g[i]` даёт и `&g[i]` (alloc), и `&mut g[i]`
+        // (reset) — по отдельности на каждый оператор.
+        let mut g = bumps.guards();
         for _ in 0..ROUNDS {
             for _ in 0..BATCH {
-                let _ = a.alloc_raw::<8>(8);
-                let _ = c.alloc_raw::<8>(8);
+                let _ = g[0].alloc_raw::<8>(8);
+                let _ = g[1].alloc_raw::<8>(8);
             }
-            a.reset();
-            c.reset();
+            g[0].reset();
+            g[1].reset();
         }
     }
 
     // Pair (shared combined region).
     {
         let arena = SharedArena::new(16 * 1024 * 1024);
-        let bumps = arena.split_paired_safe(2);
-        let (a, c) = (&bumps[0], &bumps[1]);
+        let mut bumps = arena.split_paired_safe(2);
+        let mut g = bumps.guards();
         for _ in 0..ROUNDS {
             for _ in 0..BATCH {
-                let _ = a.alloc_raw::<8>(8);
-                let _ = c.alloc_raw::<8>(8);
+                let _ = g[0].alloc_raw::<8>(8);
+                let _ = g[1].alloc_raw::<8>(8);
             }
-            a.reset();
-            c.reset();
+            g[0].reset();
+            g[1].reset();
         }
     }
 
@@ -3938,7 +4056,7 @@ pub fn pgo_train() {
         prio[0] = 100;
         prio[2] = 1; // низкий (минимальный среди доноров 0,2,4)
         prio[4] = 50;
-        let bumps = arena.split_donors_with_safe(
+        let mut bumps = arena.split_donors_with_safe(
             5,
             DonorPolicy {
                 kind,
@@ -3947,7 +4065,9 @@ pub fn pgo_train() {
                 priorities: Some(prio),
             },
         );
-        let needy = &bumps[1];
+        // Гуард-владелец доступом к needy-чанку: `alloc`/`remove_donor` — по
+        // `&needy`, `reset` — только по `&mut needy`.
+        let mut needy = bumps.guard_mut(1);
         for _ in 0..ROUNDS {
             hotpath::measure_block!("pgo-donors-alloc", {
                 for _ in 0..BATCH {
@@ -4489,10 +4609,10 @@ mod tests {
 
     #[test]
     fn reset_reuses_memory_forward() {
-        let (_arena, bump) = make_one(BumpDir::Forward, 4096);
+        let (_arena, mut bump) = make_one(BumpDir::Forward, 4096);
         let p0 = bump.alloc_raw::<1>(16);
         assert_eq!(bump.allocated_bytes(), 16);
-        bump.reset();
+        bump.reset(); // `reset(&mut self)` — только по изменяемому гуарду/владельцу
         assert_eq!(bump.allocated_bytes(), 0);
         let p1 = bump.alloc_raw::<1>(16);
         assert_eq!(p0, p1, "после reset первая аллокация по тому же адресу");
@@ -4500,7 +4620,7 @@ mod tests {
 
     #[test]
     fn reset_returns_middleout_to_middle() {
-        let (_arena, bump) = make_one(BumpDir::MiddleOut, 4096);
+        let (_arena, mut bump) = make_one(BumpDir::MiddleOut, 4096);
         let _ = bump.alloc_raw::<1>(16);
         let _ = bump.alloc_raw::<1>(16);
         assert!(bump.allocated_bytes() > 0);
@@ -4508,6 +4628,50 @@ mod tests {
         assert_eq!(bump.lo.load(Ordering::Relaxed), 0);
         assert_eq!(bump.hi.load(Ordering::Relaxed), 0);
         assert_eq!(bump.allocated_bytes(), 0);
+    }
+
+    /// Контракт `BumpGuard`: выделение — по `&guard` (заимствование), `reset`
+    /// — только по `&mut guard` (эксклюзивное заимствование).
+    #[test]
+    fn bump_guard_alloc_by_ref_reset_by_mut() {
+        let arena = SharedArena::new(arena_scale(1 << 14));
+        let mut s = arena.split_with_safe(1, BumpDir::Forward);
+        // Гуард-владелец эксклюзивного доступа: `&mut s[0]` из DerefMut
+        // Split'а оборачивается в обёртку.
+        let mut g = BumpGuard::new(&mut s[0]);
+        let p0 = g.alloc_raw::<8>(16);
+        assert!(!p0.is_null());
+        // Выделение в контейнер — тоже по заимствованию гуарда:
+        // `&BumpGuard` -> `&CachePadded<ThreadBump>` -> `&ThreadBump`.
+        let v: ArenaVec<u64> = ArenaVec::with_capacity_in::<8>(4, &g);
+        assert_eq!(v.as_slice().len(), 0);
+        // По одной `&g` сброс недоступен: нужен `&mut g`.
+        g.reset();
+        let p1 = g.alloc_raw::<8>(16);
+        assert_eq!(p0, p1, "после reset через гуард адрес тот же");
+        // read-only доступ — через `bump()`.
+        assert_eq!(g.bump().allocated_bytes(), 16);
+    }
+
+    /// Раздача гуардов на все чанки разом (`Split::guards`): каждый гуард
+    /// живёт независимо и сбрасывает только свой регион.
+    #[test]
+    fn bump_guard_split_guards_are_independent() {
+        let arena = SharedArena::new(arena_scale(4 * 4096));
+        let mut s = arena.split_alternating_safe(2);
+        let mut g = s.guards();
+        assert_eq!(g.len(), 2);
+        let p0 = g[0].alloc_raw::<8>(16);
+        let q0 = g[1].alloc_raw::<8>(16);
+        g[0].reset();
+        g[1].reset();
+        assert_eq!(g[0].alloc_raw::<8>(16), p0, "свой регион — свой reset");
+        assert_eq!(g[1].alloc_raw::<8>(16), q0, "свой регион — свой reset");
+        // `bump_mut()` — эксклюзивное заимствование самого аллокатора.
+        let p2 = g[0].bump_mut().alloc_raw::<8>(16);
+        assert_ne!(p2, p0, "до reset второй блок идёт следом");
+        g[0].reset();
+        assert_eq!(g[0].alloc_raw::<8>(16), p0);
     }
 
     #[test]
@@ -4525,7 +4689,7 @@ mod tests {
     #[test]
     fn prefault_does_not_crash_all_modes() {
         for dir in [BumpDir::Forward, BumpDir::Backward, BumpDir::MiddleOut] {
-            let (_arena, bump) = make_one(dir, 1 << 16);
+            let (_arena, mut bump) = make_one(dir, 1 << 16);
             let _ = bump.alloc_raw::<8>(1024);
             bump.prefault_local(); // на заполненном регионе
             bump.reset();
@@ -5222,7 +5386,7 @@ mod tests {
     #[test]
     fn split_local_zones_alloc_and_reset_independently() {
         let (_arena, bump) = make_one(BumpDir::Forward, arena_scale(4096));
-        let zones = bump.split_local(3, BumpDir::Forward);
+        let mut zones = bump.split_local(3, BumpDir::Forward);
         assert_eq!(zones.len(), 3);
         let mut firsts: Vec<*mut u8> = Vec::with_capacity(3);
         for z in &zones {
@@ -5456,7 +5620,7 @@ mod tests {
     fn zone_bump_dir_split_and_fallback() {
         let (_arena, bump) = make_one(BumpDir::Backward, arena_scale(1 << 16));
         let tb = CachePadded::into_inner(bump);
-        let zone = tb.into_zone();
+        let mut zone = tb.into_zone();
         assert_eq!(zone.dir(), BumpDir::Backward);
         assert_eq!(zone.allocated_bytes(), 0);
 
@@ -5655,7 +5819,7 @@ mod tests {
 
     #[test]
     fn cov_prefault_local_backward_after_alloc() {
-        let (_arena, bump) = make_one(BumpDir::Backward, arena_scale(1 << 14));
+        let (_arena, mut bump) = make_one(BumpDir::Backward, arena_scale(1 << 14));
         let _ = bump.alloc_raw::<1>(1024);
         bump.prefault_local();
         bump.reset();

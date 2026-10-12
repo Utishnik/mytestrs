@@ -1,2 +1,1 @@
 почему mimalloc последний v3 обгоняет бамп алокаторы?
-fix reset unsound(&self)
