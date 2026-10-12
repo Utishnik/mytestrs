@@ -428,6 +428,10 @@ mod platform {
     use std::sync::OnceLock;
 
     pub fn try_alloc_huge(size: usize) -> Option<RawAllocation> {
+        if cfg!(miri) {
+            // Под Miri huge pages не моделируем: MAP_HUGETLB не поддержан.
+            return None;
+        }
         #[cfg(target_os = "linux")]
         {
             unsafe {
@@ -498,6 +502,10 @@ mod platform {
     pub fn huge_page_size() -> usize {
         static HUGE: OnceLock<usize> = OnceLock::new();
         *HUGE.get_or_init(|| {
+            if cfg!(miri) {
+                // Под Miri хост-файлы изолированы — читать /proc/meminfo нельзя.
+                return 2 * 1024 * 1024;
+            }
             #[cfg(target_os = "linux")]
             {
                 if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
@@ -561,6 +569,10 @@ mod platform {
     /// фолтятся в контексте вызывающего потока, поэтому NUMA first-touch
     /// сохраняется. На старых ядрах вернёт EINVAL -> false -> fallback.
     pub fn populate_write(ptr: *mut u8, len: usize) -> bool {
+        if cfg!(miri) {
+            // Под Miri MADV_POPULATE_WRITE не поддержан — сработает fallback.
+            return false;
+        }
         #[cfg(target_os = "linux")]
         unsafe {
             libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_POPULATE_WRITE) == 0
@@ -578,6 +590,10 @@ mod platform {
     /// Просим ядро использовать transparent huge pages для региона (best-effort).
     /// Работает без резервирования явных huge pages; если THP выключен — no-op.
     pub fn advise_huge(ptr: *mut u8, len: usize) {
+        if cfg!(miri) {
+            // Под Miri MADV_HUGEPAGE не поддержан.
+            return;
+        }
         #[cfg(target_os = "linux")]
         unsafe {
             libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_HUGEPAGE);
