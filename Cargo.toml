@@ -19,9 +19,11 @@ orx-concurrent-vec = "4"
 boxcar = "0.2"
 triomphe = "0.1"
 branches = { version = "0.5.0", features = ["prefetch"] }
+pprof = { version = "0.13", optional = true, features = ["flamegraph", "protobuf-codec"] }
 
 [features]
 default = ["alloc-mimalloc"]
+pprof = ["dep:pprof"]
 alloc-mimalloc = ["dep:rustfs-mimalloc"]
 hotpath = ["hotpath/hotpath"]
 hotpath-cpu = ["hotpath/hotpath-cpu"]
@@ -75,3 +77,12 @@ lto = "fat"
 # sysroot-шный core, который дублирует build-std core (E0152). Unwind-ранайм
 # собирается из исходников вместе с остальным std.
 panic = "unwind"
+
+# Отдельный профиль для CPU-профилирования через pprof: debug-символы для
+# нормальных стеков во flamegraph, без strip и LTO.
+# Запуск: R3_PPROF=1 cargo run --profile profiling --features pprof
+[profile.profiling]
+inherits = "release"
+debug = true
+lto = false
+strip = false

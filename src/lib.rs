@@ -3932,12 +3932,143 @@ fn median(times: &[u128]) -> u128 {
 }
 
 // ============================================================
+//                    PPROF PROFILING SUPPORT
+// ============================================================
+
+#[cfg(all(feature = "pprof", not(miri), unix))]
+pub struct PprofGuard {
+    guard: Option<pprof::ProfilerGuard<'static>>,
+    out: String,
+}
+
+#[cfg(all(feature = "pprof", not(miri), unix))]
+impl PprofGuard {
+    #[cfg_attr(coverage, coverage(off))]
+    fn new() -> Self {
+        let enabled = std::env::var("R3_PPROF")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        if !enabled {
+            return Self {
+                guard: None,
+                out: String::new(),
+            };
+        }
+
+        let hz: i32 = std::env::var("R3_PPROF_HZ")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(999)
+            .clamp(1, 10_000);
+
+        let out = std::env::var("R3_PPROF_FILE")
+            .unwrap_or_else(|_| "r3-pprof.svg".to_string());
+
+        match pprof::ProfilerGuardBuilder::default().frequency(hz).build() {
+            Ok(guard) => {
+                println!("[pprof] profiling enabled: {} Hz, output: {}", hz, out);
+                Self {
+                    guard: Some(guard),
+                    out,
+                }
+            }
+            Err(e) => {
+                eprintln!("[pprof] failed to start profiler: {e}");
+                Self {
+                    guard: None,
+                    out,
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "pprof", not(miri), unix))]
+impl Drop for PprofGuard {
+    #[cfg_attr(coverage, coverage(off))]
+    fn drop(&mut self) {
+        let guard = match self.guard.take() {
+            Some(g) => g,
+            None => return,
+        };
+
+        let report = match guard.report().build() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[pprof] failed to build report: {e}");
+                return;
+            }
+        };
+
+        // Если файл заканчивается на .pb — пишем protobuf-профиль.
+        // Иначе пишем flamegraph SVG.
+        if self.out.ends_with(".pb") {
+            use pprof::protos::Message;
+
+            let mut file = match std::fs::File::create(&self.out) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[pprof] cannot create {}: {e}", self.out);
+                    return;
+                }
+            };
+
+            let profile = match report.pprof() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[pprof] failed to build protobuf profile: {e}");
+                    return;
+                }
+            };
+
+            if let Err(e) = profile.write_to_writer(&mut file) {
+                eprintln!("[pprof] failed to write protobuf profile: {e}");
+            } else {
+                println!("[pprof] protobuf profile written to {}", self.out);
+            }
+        } else {
+            let file = match std::fs::File::create(&self.out) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[pprof] cannot create {}: {e}", self.out);
+                    return;
+                }
+            };
+
+            if let Err(e) = report.flamegraph(file) {
+                eprintln!("[pprof] failed to write flamegraph: {e}");
+            } else {
+                println!("[pprof] flamegraph written to {}", self.out);
+            }
+        }
+    }
+}
+
+#[cfg(not(all(feature = "pprof", not(miri), unix)))]
+pub struct PprofGuard;
+
+#[cfg(all(feature = "pprof", not(miri), unix))]
+#[cfg_attr(coverage, coverage(off))]
+pub fn start_pprof() -> PprofGuard {
+    PprofGuard::new()
+}
+
+#[cfg(not(all(feature = "pprof", not(miri), unix)))]
+#[cfg_attr(coverage, coverage(off))]
+pub fn start_pprof() -> PprofGuard {
+    PprofGuard
+}
+
+// ============================================================
 //                          MAIN
 // ============================================================
 
 #[hotpath::main]
 #[cfg_attr(coverage, coverage(off))]
 pub fn run() {
+    let _pprof = start_pprof();
+
     let all_cores = core_affinity::get_core_ids().unwrap();
     println!("Логических ядер: {}", all_cores.len());
     println!("Физических ядер: {}", num_cpus::get_physical());
@@ -4004,6 +4135,8 @@ pub fn run() {
 /// Между пачками делается reset(), чтобы одиночные bump'ы не ушли в перераспределение fallback-чанков.
 #[cfg_attr(coverage, coverage(off))]
 pub fn pgo_train() {
+    let _pprof = start_pprof();
+
     const BATCH: u32 = 20_000;
     const ROUNDS: u32 = 10; // ~200k аллокаций на каждый прогон
 
