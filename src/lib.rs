@@ -3735,7 +3735,9 @@ pub fn profile_bump_chunk_size_full() -> usize {
     let used = bump.allocated_bytes().saturating_sub(bump.chunk_capacity());
     core::hint::black_box(&vectr);
     drop(vectr);
-    let recommended = (used * 110 / 100).min(pgo_chunk_cap());
+    // /2: выделяем вдвое меньше памяти под PGO-чанки bump full (см. git-историю;
+    // при нехватке bump просто доаллоцирует следующий чанк).
+    let recommended = (used * 110 / 100 / 2).min(pgo_chunk_cap());
     round_up_mb(recommended)
 }
 
@@ -3758,7 +3760,8 @@ pub fn profile_bump_chunk_size_light() -> usize {
     let used = bump.allocated_bytes().saturating_sub(bump.chunk_capacity());
     core::hint::black_box(&vectr);
     drop(vectr);
-    let recommended = (used * 110 / 100).min(pgo_chunk_cap());
+    // /2: вдвое меньше памяти под PGO-чанки bump light (см. profile_bump_chunk_size_full).
+    let recommended = (used * 110 / 100 / 2).min(pgo_chunk_cap());
     round_up_mb(recommended)
 }
 
@@ -3793,7 +3796,8 @@ pub fn profile_arena_chunk_size_full() -> usize {
     let used = bump.allocated_bytes();
     core::hint::black_box(&vectr);
     drop(vectr);
-    let recommended = (used * 115 / 100).min(pgo_chunk_cap());
+    // /2: вдвое меньше памяти под PGO-чанки arena full (см. profile_bump_chunk_size_full).
+    let recommended = (used * 115 / 100 / 2).min(pgo_chunk_cap());
     round_up_mb(recommended)
 }
 
@@ -3823,7 +3827,8 @@ pub fn profile_arena_chunk_size_light() -> usize {
     let used = bump.allocated_bytes();
     core::hint::black_box(&vectr);
     drop(vectr);
-    let recommended = (used * 115 / 100).min(pgo_chunk_cap());
+    // /2: вдвое меньше памяти под PGO-чанки arena light (см. profile_bump_chunk_size_full).
+    let recommended = (used * 115 / 100 / 2).min(pgo_chunk_cap());
     round_up_mb(recommended)
 }
 
@@ -3947,11 +3952,17 @@ impl PprofGuard {
     fn new() -> Self {
         // Профилирование включается самой фичей `pprof`: если бинарник собран
         // с `--features pprof`, профайлер стартует всегда (без env-переменных).
-        let hz: i32 = std::env::var("R3_PPROF_HZ")
+        // По умолчанию 999 Hz; `R3_PPROF_HALF=1` режет частоту сэмплирования
+        // вдвое (999 -> ~500 Hz): примерно вдвое меньше сэмплов, стеков и
+        // выделяемой памяти профайлером.
+        let base_hz: i32 = std::env::var("R3_PPROF_HZ")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(999)
-            .clamp(1, 10_000);
+            .unwrap_or(999);
+        let half = std::env::var("R3_PPROF_HALF")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        let hz: i32 = if half { (base_hz / 2).max(1) } else { base_hz }.clamp(1, 10_000);
 
         let out = std::env::var("R3_PPROF_FILE")
             .unwrap_or_else(|_| "r3-pprof.svg".to_string());
