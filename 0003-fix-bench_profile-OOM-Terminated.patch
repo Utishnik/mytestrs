@@ -1,0 +1,234 @@
+From 6164f8a06abc16d435597d872dc5f27db1d085cb Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Sun, 25 Oct 2026 10:31:51 +0000
+Subject: [PATCH] =?UTF-8?q?fix(bench=5Fprofile):=20=D0=B7=D0=B0=D1=89?=
+ =?UTF-8?q?=D0=B8=D1=82=D0=B0=20=D0=BE=D1=82=20OOM=20('Terminated')=20?=
+ =?UTF-8?q?=D0=BF=D1=80=D0=B8=20=D0=BF=D1=80=D0=BE=D1=84=D0=B8=D0=BB=D1=8C?=
+ =?UTF-8?q?=D0=BD=D0=BE=D0=BC=20=D0=BF=D1=80=D0=BE=D0=B3=D0=BE=D0=BD=D0=B5?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Полный профильный бенч спавнит по потоку на каждое логическое ядро и
+держит сотни МБ живых аллокаций — на WSL2 с малым лимитом RAM процесс
+убивался OOM-killer'ом прямо на первом бенче (SMT all logical cores).
+
+- по умолчанию теперь QUICK + R3_BENCH_SCALE=8 (флаги --quick/--scale N);
+- --full восстанавливает прежний полный прогон;
+- детект смерти по сигналу (exit 137/143) с подсказками (--scale, taskset,
+  .wslconfig memory=) вместо молчаливого 'Terminated';
+- то же самое в bench_profile.ps1 (-Quick/-Scale/-Full).
+---
+ bench_profile.ps1 | 36 +++++++++++++++++++++++-
+ bench_profile.sh  | 72 +++++++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 101 insertions(+), 7 deletions(-)
+
+diff --git a/bench_profile.ps1 b/bench_profile.ps1
+index 9b2fd37..d300dc2 100644
+--- a/bench_profile.ps1
++++ b/bench_profile.ps1
+@@ -21,6 +21,12 @@
+ #   powershell -File bench_profile.ps1 -Prefetch                # + win-prefetch-pages
+ #   powershell -File bench_profile.ps1 -Cpu                     # + hotpath-cpu (Linux/macOS only)
+ #   powershell -File bench_profile.ps1 -Capture                 # discard bench stdout
++#   powershell -File bench_profile.ps1 -Quick                   # быстрый прогон (R3_BENCH_QUICK)
++#   powershell -File bench_profile.ps1 -Scale 8                 # уменьшить нагрузку в N раз
++#   powershell -File bench_profile.ps1 -Full                    # полный прогон (без защиты от OOM)
++#
++# ВАЖНО: на машинах с малым объёмом RAM полный профильный прогон убивается
++# OOM-killer'ом ("Terminated"). По умолчанию скрипт включает Quick + Scale 8.
+ param(
+     [switch]$PprofOnly,
+     [switch]$HotpathOnly,
+@@ -32,11 +38,27 @@ param(
+     [ValidateSet('mono', 'dispatch', 'both')][string]$Style = 'both',
+     [switch]$Prefetch,
+     [switch]$Cpu,
+-    [switch]$Capture
++    [switch]$Capture,
++    [switch]$Quick,
++    [int]$Scale = 0,
++    [switch]$Full
+ )
+ 
+ $ErrorActionPreference = "Stop"
+ 
++# Авто-защита от OOM: если не попросили -Full, режем нагрузку.
++if (-not $Full) {
++    $Quick = $true
++    if ($Scale -eq 0) { $Scale = 8 }
++}
++if ($Scale -gt 0) { $env:R3_BENCH_SCALE = "$Scale" } else { Remove-Item Env:R3_BENCH_SCALE -ErrorAction SilentlyContinue }
++if ($Quick) {
++    $env:R3_BENCH_QUICK = "1"
++    Write-Host "===== режим: QUICK (R3_BENCH_QUICK=1), scale=$(if ($Scale -gt 0) { $Scale } else { 1 }) — передайте -Full для полного прогона =====" -ForegroundColor Yellow
++} else {
++    Remove-Item Env:R3_BENCH_QUICK -ErrorAction SilentlyContinue
++}
++
+ $doPprof = if ($PprofOnly) { $true } elseif ($HotpathOnly) { $false } else { $true }
+ $doHotpath = if ($HotpathOnly) { $true } elseif ($PprofOnly) { $false } else { $true }
+ 
+@@ -58,8 +80,14 @@ function Invoke-PprofRun([string]$fmt, [string]$file) {
+     if (-not (Test-Path $bin)) { $bin = "./target/profiling/r3" }
+     if ($Capture) {
+         & $bin *> $null
++        $rc = $LASTEXITCODE
+     } else {
+         & $bin | Tee-Object -FilePath "bench_pprof_$fmt.log"
++        $rc = $LASTEXITCODE
++    }
++    if ($rc -ne 0) {
++        Write-Host "!!! pprof bench завершился с кодом $rc (137/128+SIGKILL на unix = OOM; уменьшите нагрузку: -Scale 16)" -ForegroundColor Red
++        exit $rc
+     }
+     Write-Host "===== pprof ($fmt) written to $((Get-Location).Path)\$file =====" -ForegroundColor Green
+ }
+@@ -110,8 +138,14 @@ if ($doHotpath) {
+     if (-not (Test-Path $bin)) { $bin = "./target/release/r3" }
+     if ($Capture) {
+         & $bin *> $null
++        $rc = $LASTEXITCODE
+     } else {
+         & $bin | Tee-Object -FilePath "bench_hotpath.log"
++        $rc = $LASTEXITCODE
++    }
++    if ($rc -ne 0) {
++        Write-Host "!!! hotpath bench завершился с кодом $rc (OOM? уменьшите нагрузку: -Scale 16)" -ForegroundColor Red
++        exit $rc
+     }
+     Write-Host "===== hotpath report written to $((Get-Location).Path)\$HotpathOut =====" -ForegroundColor Green
+ }
+diff --git a/bench_profile.sh b/bench_profile.sh
+index 6f43231..b4dfedc 100755
+--- a/bench_profile.sh
++++ b/bench_profile.sh
+@@ -24,6 +24,20 @@
+ #   ./bench_profile.sh --prefetch               # hotpath build: + win-prefetch-pages
+ #   ./bench_profile.sh --cpu                    # hotpath: + hotpath-cpu (Linux/macOS only)
+ #   ./bench_profile.sh --capture                # discard bench stdout (no tee)
++#   ./bench_profile.sh --quick                  # быстрый прогон (R3_BENCH_QUICK=1):
++#                                               #   только базовые FULL/LIGHT × SMT/NO SMT
++#   ./bench_profile.sh --scale N                # уменьшить нагрузку в N раз
++#                                               #   (R3_BENCH_SCALE=N, см. src/lib.rs)
++#   ./bench_profile.sh --full                   # полный прогон БЕЗ защиты от OOM
++#
++# ВАЖНО про "Terminated" (OOM):
++#   Полный профильный прогон спавнит по потоку на каждое логическое ядро и
++#   держит сотни МБ живых аллокаций одновременно. На машине с 2-4 ГБ RAM
++#   (в т.ч. WSL2 с дефолтным лимитом памяти) процесс убивает OOM-killer
++#   прямо на первом бенче ("SMT (all logical cores)"). Поэтому скрипт по
++#   умолчанию включает --quick + --scale 8. Для полного прогона на большой
++#   машине передайте --full; при нехватке памяти повышайте --scale (16, 32)
++#   или ограничьте ядра: taskset -c 0-3 ./bench_profile.sh ...
+ #
+ # Notes:
+ #   * pprof needs a separate binary (built with --profile profiling --features pprof),
+@@ -43,6 +57,9 @@ CAPTURE=0
+ CPU=0
+ PREFETCH=0
+ STYLE="both"
++QUICK=0                # включается автоматически, если не задан --full
++SCALE=""               # пусто = авто (8), если не задан --full
++FULL=0
+ 
+ while [ $# -gt 0 ]; do
+     case "$1" in
+@@ -58,12 +75,35 @@ while [ $# -gt 0 ]; do
+         --prefetch)        PREFETCH=1 ;;
+         --cpu)             CPU=1 ;;
+         --capture)         CAPTURE=1 ;;
++        --quick)           QUICK=1 ;;
++        --scale)           shift; SCALE="${1:-8}" ;;
++        --full)            FULL=1 ;;
+         -h|--help)         sed -n '2,$p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'; exit 0 ;;
+         *) echo "unknown arg: $1" >&2; exit 2 ;;
+     esac
+     shift
+ done
+ 
++# Авто-защита от OOM: без --full режем нагрузку (quick + scale 8).
++if [ "$FULL" = "0" ]; then
++    QUICK=1
++    [ -z "$SCALE" ] && SCALE=8
++fi
++
++if [ -n "$SCALE" ]; then
++    case "$SCALE" in (*[!0-9]*|'') echo "bad --scale: $SCALE (expected integer >= 1)" >&2; exit 2;; esac
++    if [ "$SCALE" -ge 1 ]; then export R3_BENCH_SCALE="$SCALE"; else unset R3_BENCH_SCALE 2>/dev/null || true; fi
++else
++    unset R3_BENCH_SCALE 2>/dev/null || true
++fi
++
++if [ "$QUICK" = "1" ]; then
++    export R3_BENCH_QUICK=1
++    echo "===== режим: QUICK (R3_BENCH_QUICK=1), scale=${R3_BENCH_SCALE:-1} — для полного прогона передайте --full ====="
++else
++    unset R3_BENCH_QUICK 2>/dev/null || true
++fi
++
+ case "$FORMAT" in text|flamegraph|pb|all) ;; *)
+     echo "bad --format: $FORMAT (expected: text|flamegraph|pb|all)" >&2; exit 2 ;;
+ esac
+@@ -81,21 +121,40 @@ ext_for_format() {
+     esac
+ }
+ 
++# Возвращает 0 если процесс завершился нормально; печатает подсказку про OOM
++# при смерти по сигналу (137 = SIGKILL, обычно OOM-killer; 143 = SIGTERM).
++check_rc() {
++    local rc="$1" name="$2"
++    if [ "$rc" -eq 137 ] || [ "$rc" -eq 143 ]; then
++        echo "!!! $name убит сигналом (exit=$rc) — почти наверняка OOM-killer." >&2
++        echo "!!! Уменьшите нагрузку: --scale 16 (или 32)." >&2
++        echo "!!! Ограничьте ядра: taskset -c 0-3 ./bench_profile.sh ..." >&2
++        echo "!!! WSL2: поднимите память в %UserProfile%\.wslconfig ([wsl2] memory=8GB swap=8GB) и перезапустите wsl --shutdown." >&2
++        return 1
++    fi
++    if [ "$rc" -ne 0 ]; then
++        echo "!!! $name завершился с кодом $rc" >&2
++        return 1
++    fi
++    return 0
++}
++
+ run_pprof_once() {
+-    local fmt="$1" file="$2"
++    local fmt="$1" file="$2" rc=0
+     export R3_PPROF_FILE="$file"
+     [ -n "$HZ" ] && export R3_PPROF_HZ="$HZ" || unset R3_PPROF_HZ 2>/dev/null || true
+     echo "===== running pprof bench ($fmt) -> $file ====="
+     if [ "$CAPTURE" = "1" ]; then
+-        ./target/profiling/r3 >/dev/null
++        ./target/profiling/r3 >/dev/null || rc=$?
+     else
+-        ./target/profiling/r3 | tee "bench_pprof_${fmt}.log"
++        ./target/profiling/r3 | tee "bench_pprof_${fmt}.log" || rc=${PIPESTATUS[0]}
+     fi
++    check_rc "$rc" "pprof bench" || return 1
+     echo "===== pprof ($fmt) written to $(pwd)/$file ====="
+ }
+ 
+ run_hotpath_once() {
+-    local hp_features="hotpath"
++    local hp_features="hotpath" rc=0
+     [ "$PREFETCH" = "1" ] && hp_features="hotpath win-prefetch-pages"
+     [ "$CPU" = "1" ] && hp_features="$hp_features hotpath-cpu"
+ 
+@@ -116,10 +175,11 @@ run_hotpath_once() {
+ 
+     echo "===== running hotpath bench (style=$STYLE) -> $HP_OUT ====="
+     if [ "$CAPTURE" = "1" ]; then
+-        ./target/release/r3 >/dev/null
++        ./target/release/r3 >/dev/null || rc=$?
+     else
+-        ./target/release/r3 | tee bench_hotpath.log
++        ./target/release/r3 | tee bench_hotpath.log || rc=${PIPESTATUS[0]}
+     fi
++    check_rc "$rc" "hotpath bench" || return 1
+     echo "===== hotpath report written to $(pwd)/${HP_OUT} ====="
+ }
+ 
+-- 
+2.39.5
+
