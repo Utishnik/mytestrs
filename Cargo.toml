@@ -80,7 +80,7 @@ panic = "unwind"
 
 # Отдельный профиль для CPU-профилирования через pprof: debug-символы для
 # нормальных стеков во flamegraph, без strip и LTO.
-# Запуск: R3_PPROF=1 cargo run --profile profiling --features pprof
+# Запуск: cargo run --profile profiling --features pprof
 [profile.profiling]
 inherits = "release"
 debug = true

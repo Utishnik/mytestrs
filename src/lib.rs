@@ -3945,17 +3945,8 @@ pub struct PprofGuard {
 impl PprofGuard {
     #[cfg_attr(coverage, coverage(off))]
     fn new() -> Self {
-        let enabled = std::env::var("R3_PPROF")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-
-        if !enabled {
-            return Self {
-                guard: None,
-                out: String::new(),
-            };
-        }
-
+        // Профилирование включается самой фичей `pprof`: если бинарник собран
+        // с `--features pprof`, профайлер стартует всегда (без env-переменных).
         let hz: i32 = std::env::var("R3_PPROF_HZ")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
