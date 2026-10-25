@@ -1,0 +1,83 @@
+[pprof] profiling enabled: 499 Hz, output: FILE
+Логических ядер: 16
+Физических ядер: 8
+Глобальный аллокатор: rustfs-mimalloc (mimalloc v3.5.3)
+Страницы: 4 KB / huge pages 2 MB: нет
+
+PGO bump full: 70 MB
+PGO bump light: 18 MB
+
+PGO arena full: 55 MB
+PGO arena light: 14 MB
+
+
+########## Бенч: SMT (all logical cores) ##########
+
+=== FULL VERSION (SMT (all logical cores)) — style Both ===
+Round 1: MIMALOC = 154701 Р’Вµs, Bump = 87846 Р’Вµs, SharedBump = 193184 Р’Вµs, Arena mono|dispatch = 3128937|3227405 Р’Вµs
+
+=== LIGHT VERSION (SMT (all logical cores)) — style Both ===
+Round 1: MIMALOC = 82202 Р’Вµs, Bump = 63705 Р’Вµs, SharedBump = 44778 Р’Вµs, Arena mono|dispatch = 694999|657957 Р’Вµs
+
+########## Бенч: NO SMT (physical cores only) ##########
+
+=== FULL VERSION (NO SMT (physical cores only)) — style Both ===
+Round 1: MIMALOC = 122878 Р’Вµs, Bump = 40514 Р’Вµs, SharedBump = 131755 Р’Вµs, Arena mono|dispatch = 1431454|1424932 Р’Вµs
+
+=== LIGHT VERSION (NO SMT (physical cores only)) — style Both ===
+Round 1: MIMALOC = 10443 Р’Вµs, Bump = 11024 Р’Вµs, SharedBump = 29161 Р’Вµs, Arena mono|dispatch = 353187|355873 Р’Вµs
+
+########## Directional Arena: SMT (all logical cores) ##########
+
+=== Directional FULL (SMT (all logical cores)) — style Both ===
+  Forward      mono 3200500 Р’Вµs | dispatch 3208845 Р’Вµs
+  Backward     mono 3317547 Р’Вµs | dispatch 3388138 Р’Вµs
+  MiddleOut    mono 3440255 Р’Вµs | dispatch 3342825 Р’Вµs
+  Neighbors    mono 3291211 Р’Вµs | dispatch 3387428 Р’Вµs
+  Pair         mono 124475 Р’Вµs | dispatch 2613095 Р’Вµs
+  Donors       mono 251720 Р’Вµs | dispatch 228456 Р’Вµs
+  DonorsPrio   mono 226787 Р’Вµs | dispatch 221713 Р’Вµs
+  DonorsOrx    mono 2845815 Р’Вµs | dispatch 2420490 Р’Вµs
+  DonorsOrxPrio mono 2423350 Р’Вµs | dispatch 2968543 Р’Вµs
+  DonorsBoxcar mono 220595 Р’Вµs | dispatch 228279 Р’Вµs
+  DonorsBoxcarPrio mono 248993 Р’Вµs | dispatch 229340 Р’Вµs
+=== Directional LIGHT (SMT (all logical cores)) — style Both ===
+  Forward      mono 764561 Р’Вµs | dispatch 704675 Р’Вµs
+  Backward     mono 701598 Р’Вµs | dispatch 714248 Р’Вµs
+  MiddleOut    mono 740810 Р’Вµs | dispatch 689422 Р’Вµs
+  Neighbors    mono 727343 Р’Вµs | dispatch 676416 Р’Вµs
+  Pair         mono  61202 Р’Вµs | dispatch 453923 Р’Вµs
+  Donors       mono  68103 Р’Вµs | dispatch  56365 Р’Вµs
+  DonorsPrio   mono  64960 Р’Вµs | dispatch  56594 Р’Вµs
+  DonorsOrx    mono 553723 Р’Вµs | dispatch 690255 Р’Вµs
+  DonorsOrxPrio mono 614902 Р’Вµs | dispatch 801231 Р’Вµs
+  DonorsBoxcar mono  57053 Р’Вµs | dispatch  57335 Р’Вµs
+  DonorsBoxcarPrio mono  62056 Р’Вµs | dispatch  57405 Р’Вµs
+
+########## Directional Arena: NO SMT (physical cores only) ##########
+
+=== Directional FULL (NO SMT (physical cores only)) — style Both ===
+  Forward      mono 1703168 Р’Вµs | dispatch 1537282 Р’Вµs
+  Backward     mono 1620555 Р’Вµs | dispatch 1508436 Р’Вµs
+  MiddleOut    mono 1503000 Р’Вµs | dispatch 1568432 Р’Вµs
+  Neighbors    mono 1623083 Р’Вµs | dispatch 1591955 Р’Вµs
+  Pair         mono  70873 Р’Вµs | dispatch 1469288 Р’Вµs
+  Donors       mono 110550 Р’Вµs | dispatch 106742 Р’Вµs
+  DonorsPrio   mono 109911 Р’Вµs | dispatch 106099 Р’Вµs
+  DonorsOrx    mono 674312 Р’Вµs | dispatch 673980 Р’Вµs
+  DonorsOrxPrio mono 645017 Р’Вµs | dispatch 742653 Р’Вµs
+  DonorsBoxcar mono 111046 Р’Вµs | dispatch 106558 Р’Вµs
+  DonorsBoxcarPrio mono 110314 Р’Вµs | dispatch 110041 Р’Вµs
+=== Directional LIGHT (NO SMT (physical cores only)) — style Both ===
+  Forward      mono 345897 Р’Вµs | dispatch 371880 Р’Вµs
+  Backward     mono 357013 Р’Вµs | dispatch 361789 Р’Вµs
+  MiddleOut    mono 373422 Р’Вµs | dispatch 344335 Р’Вµs
+  Neighbors    mono 350056 Р’Вµs | dispatch 354980 Р’Вµs
+  Pair         mono  29797 Р’Вµs | dispatch 302554 Р’Вµs
+  Donors       mono  35470 Р’Вµs | dispatch  28408 Р’Вµs
+  DonorsPrio   mono  29625 Р’Вµs | dispatch  28003 Р’Вµs
+  DonorsOrx    mono 158572 Р’Вµs | dispatch 144817 Р’Вµs
+  DonorsOrxPrio mono 157669 Р’Вµs | dispatch 181058 Р’Вµs
+  DonorsBoxcar mono  28684 Р’Вµs | dispatch  27532 Р’Вµs
+  DonorsBoxcarPrio mono  30523 Р’Вµs | dispatch  28275 Р’Вµs
+[pprof] flamegraph written to FILE
