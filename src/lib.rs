@@ -3992,8 +3992,10 @@ impl Drop for PprofGuard {
             }
         };
 
-        // Если файл заканчивается на .pb — пишем protobuf-профиль.
-        // Иначе пишем flamegraph SVG.
+        // Формат выбирается по расширению файла:
+        //   .pb        — protobuf-профиль (для `go tool pprof`)
+        //   .txt/.folded — текстовый folded-формат (стек;колл-к)
+        //   иначе      — flamegraph SVG
         if self.out.ends_with(".pb") {
             use pprof::protos::Message;
 
@@ -4017,6 +4019,49 @@ impl Drop for PprofGuard {
                 eprintln!("[pprof] failed to write protobuf profile: {e}");
             } else {
                 println!("[pprof] protobuf profile written to {}", self.out);
+            }
+        } else if self.out.ends_with(".txt") || self.out.ends_with(".folded") {
+            let mut file = match std::fs::File::create(&self.out) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[pprof] cannot create {}: {e}", self.out);
+                    return;
+                }
+            };
+
+            use std::io::Write;
+
+            // Собираем folded-строки (стек через ';' + счётчик), сортируем по убыванию
+            // веса и пишем в текстовый файл. Формат совместим с `inferno`/`flamegraph.pl`.
+            let mut lines: Vec<(String, isize)> = {
+                use std::fmt::Write as _;
+                report
+                    .data
+                    .iter()
+                    .map(|(key, value)| {
+                        let mut line = key.thread_name_or_id();
+                        for frame in key.frames.iter().rev() {
+                            for symbol in frame.iter().rev() {
+                                line.push(';');
+                                write!(line, "{symbol}").unwrap();
+                            }
+                        }
+                        (line, *value)
+                    })
+                    .collect()
+            };
+            lines.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+            let mut result = Ok(());
+            for (line, count) in &lines {
+                if let Err(e) = writeln!(file, "{line} {count}") {
+                    result = Err(e);
+                    break;
+                }
+            }
+            match result {
+                Ok(()) => println!("[pprof] text (folded) profile written to {}", self.out),
+                Err(e) => eprintln!("[pprof] failed to write text profile: {e}"),
             }
         } else {
             let file = match std::fs::File::create(&self.out) {
