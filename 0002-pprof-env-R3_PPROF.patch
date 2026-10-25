@@ -1,0 +1,57 @@
+From bc166d3564afb80256d473fff3a90f5bf80053c3 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Sun, 25 Oct 2026 08:35:23 +0000
+Subject: [PATCH 2/2] =?UTF-8?q?pprof:=20=D0=B2=D0=BA=D0=BB=D1=8E=D1=87?=
+ =?UTF-8?q?=D0=B0=D1=82=D1=8C=20=D0=BF=D1=80=D0=BE=D1=84=D0=B0=D0=B9=D0=BB?=
+ =?UTF-8?q?=D0=B5=D1=80=20=D0=BF=D0=BE=20=D1=84=D0=B8=D1=87=D0=B5,=20?=
+ =?UTF-8?q?=D0=B0=20=D0=BD=D0=B5=20=D0=BF=D0=BE=20env-=D0=BF=D0=B5=D1=80?=
+ =?UTF-8?q?=D0=B5=D0=BC=D0=B5=D0=BD=D0=BD=D0=BE=D0=B9=20R3=5FPPROF?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ Cargo.toml |  2 +-
+ src/lib.rs | 13 ++-----------
+ 2 files changed, 3 insertions(+), 12 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 6569b20..54d39a7 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -80,7 +80,7 @@ panic = "unwind"
+ 
+ # Отдельный профиль для CPU-профилирования через pprof: debug-символы для
+ # нормальных стеков во flamegraph, без strip и LTO.
+-# Запуск: R3_PPROF=1 cargo run --profile profiling --features pprof
++# Запуск: cargo run --profile profiling --features pprof
+ [profile.profiling]
+ inherits = "release"
+ debug = true
+diff --git a/src/lib.rs b/src/lib.rs
+index ee9e08e..6bedf3f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -3945,17 +3945,8 @@ pub struct PprofGuard {
+ impl PprofGuard {
+     #[cfg_attr(coverage, coverage(off))]
+     fn new() -> Self {
+-        let enabled = std::env::var("R3_PPROF")
+-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+-            .unwrap_or(false);
+-
+-        if !enabled {
+-            return Self {
+-                guard: None,
+-                out: String::new(),
+-            };
+-        }
+-
++        // Профилирование включается самой фичей `pprof`: если бинарник собран
++        // с `--features pprof`, профайлер стартует всегда (без env-переменных).
+         let hz: i32 = std::env::var("R3_PPROF_HZ")
+             .ok()
+             .and_then(|v| v.parse::<i32>().ok())
+-- 
+2.39.5
+
