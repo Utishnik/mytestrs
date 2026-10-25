@@ -20,6 +20,8 @@
 #   ./bench_profile.sh --out FILE               # pprof output filename override
 #   ./bench_profile.sh --hotpath-out FILE       # hotpath report filename override
 #   ./bench_profile.sh --hz 999                 # pprof sampling frequency
+#   ./bench_profile.sh --half                   # pprof: half sampling freq (~500 Hz)
+#                                               #   AND half memory footprint (R3_BENCH_SCALE=2)
 #   ./bench_profile.sh --style mono|dispatch|both        # arena version to run
 #   ./bench_profile.sh --prefetch               # hotpath build: + win-prefetch-pages
 #   ./bench_profile.sh --cpu                    # hotpath: + hotpath-cpu (Linux/macOS only)
@@ -39,6 +41,7 @@ HP_FORMAT="table"      # hotpath format: table | json
 OUT=""                 # pprof output file override
 HP_OUT=""              # hotpath output file override
 HZ=""                  # pprof sampling frequency
+HALF=0                 # pprof: halve sampling freq and memory footprint
 CAPTURE=0
 CPU=0
 PREFETCH=0
@@ -54,6 +57,7 @@ while [ $# -gt 0 ]; do
         --out)             shift; OUT="${1:-}" ;;
         --hotpath-out)     shift; HP_OUT="${1:-}" ;;
         --hz)              shift; HZ="${1:-999}" ;;
+        --half)            HALF=1 ;;
         --style)           shift; STYLE="${1:-both}" ;;
         --prefetch)        PREFETCH=1 ;;
         --cpu)             CPU=1 ;;
@@ -85,6 +89,14 @@ run_pprof_once() {
     local fmt="$1" file="$2"
     export R3_PPROF_FILE="$file"
     [ -n "$HZ" ] && export R3_PPROF_HZ="$HZ" || unset R3_PPROF_HZ 2>/dev/null || true
+    # --half: в 2 раза меньше сэмплов (частота /2) и в 2 раза меньше выделяемой
+    # памяти бенча (R3_BENCH_SCALE=2 делит все аллокационные циклы пополам).
+    if [ "$HALF" = "1" ]; then
+        export R3_PPROF_HALF=1
+        export R3_BENCH_SCALE="${R3_BENCH_SCALE:-2}"
+    else
+        unset R3_PPROF_HALF 2>/dev/null || true
+    fi
     echo "===== running pprof bench ($fmt) -> $file ====="
     if [ "$CAPTURE" = "1" ]; then
         ./target/profiling/r3 >/dev/null
