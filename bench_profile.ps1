@@ -21,6 +21,12 @@
 #   powershell -File bench_profile.ps1 -Prefetch                # + win-prefetch-pages
 #   powershell -File bench_profile.ps1 -Cpu                     # + hotpath-cpu (Linux/macOS only)
 #   powershell -File bench_profile.ps1 -Capture                 # discard bench stdout
+#   powershell -File bench_profile.ps1 -Quick                   # быстрый прогон (R3_BENCH_QUICK)
+#   powershell -File bench_profile.ps1 -Scale 8                 # уменьшить нагрузку в N раз
+#   powershell -File bench_profile.ps1 -Full                    # полный прогон (без защиты от OOM)
+#
+# ВАЖНО: на машинах с малым объёмом RAM полный профильный прогон убивается
+# OOM-killer'ом ("Terminated"). По умолчанию скрипт включает Quick + Scale 8.
 param(
     [switch]$PprofOnly,
     [switch]$HotpathOnly,
@@ -32,10 +38,26 @@ param(
     [ValidateSet('mono', 'dispatch', 'both')][string]$Style = 'both',
     [switch]$Prefetch,
     [switch]$Cpu,
-    [switch]$Capture
+    [switch]$Capture,
+    [switch]$Quick,
+    [int]$Scale = 0,
+    [switch]$Full
 )
 
 $ErrorActionPreference = "Stop"
+
+# Авто-защита от OOM: если не попросили -Full, режем нагрузку.
+if (-not $Full) {
+    $Quick = $true
+    if ($Scale -eq 0) { $Scale = 8 }
+}
+if ($Scale -gt 0) { $env:R3_BENCH_SCALE = "$Scale" } else { Remove-Item Env:R3_BENCH_SCALE -ErrorAction SilentlyContinue }
+if ($Quick) {
+    $env:R3_BENCH_QUICK = "1"
+    Write-Host "===== режим: QUICK (R3_BENCH_QUICK=1), scale=$(if ($Scale -gt 0) { $Scale } else { 1 }) — передайте -Full для полного прогона =====" -ForegroundColor Yellow
+} else {
+    Remove-Item Env:R3_BENCH_QUICK -ErrorAction SilentlyContinue
+}
 
 $doPprof = if ($PprofOnly) { $true } elseif ($HotpathOnly) { $false } else { $true }
 $doHotpath = if ($HotpathOnly) { $true } elseif ($PprofOnly) { $false } else { $true }
@@ -58,8 +80,14 @@ function Invoke-PprofRun([string]$fmt, [string]$file) {
     if (-not (Test-Path $bin)) { $bin = "./target/profiling/r3" }
     if ($Capture) {
         & $bin *> $null
+        $rc = $LASTEXITCODE
     } else {
         & $bin | Tee-Object -FilePath "bench_pprof_$fmt.log"
+        $rc = $LASTEXITCODE
+    }
+    if ($rc -ne 0) {
+        Write-Host "!!! pprof bench завершился с кодом $rc (137/128+SIGKILL на unix = OOM; уменьшите нагрузку: -Scale 16)" -ForegroundColor Red
+        exit $rc
     }
     Write-Host "===== pprof ($fmt) written to $((Get-Location).Path)\$file =====" -ForegroundColor Green
 }
@@ -110,8 +138,14 @@ if ($doHotpath) {
     if (-not (Test-Path $bin)) { $bin = "./target/release/r3" }
     if ($Capture) {
         & $bin *> $null
+        $rc = $LASTEXITCODE
     } else {
         & $bin | Tee-Object -FilePath "bench_hotpath.log"
+        $rc = $LASTEXITCODE
+    }
+    if ($rc -ne 0) {
+        Write-Host "!!! hotpath bench завершился с кодом $rc (OOM? уменьшите нагрузку: -Scale 16)" -ForegroundColor Red
+        exit $rc
     }
     Write-Host "===== hotpath report written to $((Get-Location).Path)\$HotpathOut =====" -ForegroundColor Green
 }
