@@ -21,6 +21,13 @@
 #   ./bench_arena_profile.sh --no-smt        # только физические ядра
 #   ./bench_arena_profile.sh --out-prefix P  # P-flame.svg + P-folded.txt
 #   ./bench_arena_profile.sh --pb            # дополнительно r3-arena.pb (go tool pprof)
+#
+# Оптимизация «горячих мест» профиля (mmap/munmap, SpinMutex в grow_fallback):
+#   ./bench_arena_profile.sh --chunk-mb 256        # per-thread чанк арены 256 MB
+#                                                    вместо PGO-подсчёта (R3_ARENA_CHUNK_MB)
+#   ./bench_arena_profile.sh --fallback-chunk-mb 128
+#                                                    минимальный fallback-чанк 128 MB
+#                                                    (R3_FALLBACK_CHUNK_MB), меньше mmap/локов
 set -euo pipefail
 
 HZ=""
@@ -30,6 +37,8 @@ SCALE=""
 SMT=1
 PREFIX="r3-arena"
 PB=0
+CHUNK_MB=""
+FB_CHUNK_MB=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -39,6 +48,8 @@ while [ $# -gt 0 ]; do
         --scale)       shift; SCALE="${1:-1}" ;;
         --no-smt)      SMT=0 ;;
         --pb)          PB=1 ;;
+        --chunk-mb)         shift; CHUNK_MB="${1:?--chunk-mb требует число МБ}" ;;
+        --fallback-chunk-mb) shift; FB_CHUNK_MB="${1:?--fallback-chunk-mb требует число МБ}" ;;
         --out-prefix)  shift; PREFIX="${1:-r3-arena}" ;;
         -h|--help)     sed -n '2,$p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -68,12 +79,16 @@ export R3_BENCH_STYLE="$STYLE"
 [ -n "$ROUNDS" ] && export R3_PROFILE_ROUNDS="$ROUNDS"
 [ -n "$SCALE" ]  && export R3_BENCH_SCALE="$SCALE"
 [ "$SMT" = "0" ] && export R3_BENCH_SMT=0
+# Оптимизация hotspots из профиля: крупные чанки вместо частых mmap/munmap и
+# захватов SpinMutex в grow_fallback (см. fallback_chunk_bytes / arena_chunk_override).
+[ -n "$CHUNK_MB" ]    && export R3_ARENA_CHUNK_MB="$CHUNK_MB"
+[ -n "$FB_CHUNK_MB" ] && export R3_FALLBACK_CHUNK_MB="$FB_CHUNK_MB"
 
 # Один и тот же бинарь (profile profiling + feature pprof) гоняется отдельно
 # ради каждого выхода: отдельные прогоны = чистые независимые профили.
 for out in "${OUTS[@]}"; do
     export R3_PPROF_FILE="$out"
-    echo "===== arena-only profile run -> $out (style=$STYLE${HZ:+, hz=$HZ}${ROUNDS:+, rounds=$ROUNDS}${SCALE:+, scale=$SCALE}, smt=$SMT) ====="
+    echo "===== arena-only profile run -> $out (style=$STYLE${HZ:+, hz=$HZ}${ROUNDS:+, rounds=$ROUNDS}${SCALE:+, scale=$SCALE}${CHUNK_MB:+, chunk_mb=$CHUNK_MB}${FB_CHUNK_MB:+, fb_chunk_mb=$FB_CHUNK_MB}, smt=$SMT) ====="
     cargo bench --profile profiling --features pprof --bench arena_profile
     echo "===== wrote $(pwd)/$out ====="
 done
