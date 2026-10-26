@@ -30,7 +30,7 @@ fn prefetch_write(_addr: *const u8) {}
 //               ПЛАТФОРМЕННЫЙ СЛОЙ ВЫДЕЛЕНИЯ ПАМЯТИ
 // ============================================================
 
-struct RawAllocation {
+pub(crate) struct RawAllocation {
     ptr: *mut u8,
     size: usize,
     is_huge: bool,
@@ -117,6 +117,48 @@ fn fallback_chunk_bytes(base_chunk: usize, need: usize) -> usize {
     let m = fallback_chunk_mult();
     let floor = if m == 1 { 0 } else { m * 1024 * 1024 };
     base_chunk.max(floor).max(need)
+}
+
+// ===== Thread-local кэш freed fallback-чанков =====
+//
+// По профилю hottest места — `munmap` из `platform::free` (вызывается из
+// `Drop for ThreadBump`) и `__mmap64` из `grow_fallback`: арена живёт в режиме
+// «попросил у ОС → отдал ОС» на каждой итерации бенча (new → alloc → Drop).
+// Кэш возвращает освобождённые чанки во владение тому же потоку без обращения
+// к ОС (ни `munmap` на drop, ни нового `mmap` на grow). Хранится ровно один
+// чанок на поток — этого достаточно для steady-state «создал арену → уронил
+// арену», где каждый новый чанк совпадает по размеру с предыдущим.
+thread_local! {
+    static FREED_CHUNK_CACHE: RawAllocationCache =
+        const { RawAllocationCache(std::cell::Cell::new(None)) };
+}
+
+struct RawAllocationCache(std::cell::Cell<Option<RawAllocation>>);
+
+impl RawAllocationCache {
+    /// Забрать закэшированный чанк подходящего размера (иначе `None`).
+    #[inline]
+    fn take(&self, size: usize) -> Option<RawAllocation> {
+        let cur = self.0.take();
+        match cur {
+            Some(c) if c.size >= size => Some(c),
+            other => {
+                // Не подошёл по размеру — освобождаем через ОС и идём mmap'ить.
+                if let Some(o) = other {
+                    platform::free(o);
+                }
+                None
+            }
+        }
+    }
+
+    /// Положить чанк в кэш; прежний содержимец кэша освобождается через ОС.
+    #[inline]
+    fn put(&self, alloc: RawAllocation) {
+        if let Some(o) = self.0.replace(Some(alloc)) {
+            platform::free(o);
+        }
+    }
 }
 
 /// Запись о доноре в реестре: индекс в массиве bumps, его приоритет и флаг
@@ -820,7 +862,7 @@ impl SharedArena {
                     use_priority: false,
                     base_chunk: 0,
                     fallback: SpinMutex::new(FallbackChunks {
-                        chunks: Vec::new(),
+                        chunks: Vec::with_capacity(4),
                         used: 0,
                     }),
                 })
@@ -886,7 +928,7 @@ impl SharedArena {
                     use_priority: false,
                     base_chunk: 0,
                     fallback: SpinMutex::new(FallbackChunks {
-                        chunks: Vec::new(),
+                        chunks: Vec::with_capacity(4),
                         used: 0,
                     }),
                 })
@@ -950,7 +992,7 @@ impl SharedArena {
                         use_priority: false,
                         base_chunk: 0,
                         fallback: SpinMutex::new(FallbackChunks {
-                            chunks: Vec::new(),
+                            chunks: Vec::with_capacity(4),
                             used: 0,
                         }),
                     })
@@ -982,7 +1024,7 @@ impl SharedArena {
                         use_priority: false,
                         base_chunk: 0,
                         fallback: SpinMutex::new(FallbackChunks {
-                            chunks: Vec::new(),
+                            chunks: Vec::with_capacity(4),
                             used: 0,
                         }),
                     })
@@ -1164,7 +1206,7 @@ impl SharedArena {
                     use_priority: policy.use_priority,
                     base_chunk: chunk_size,
                     fallback: SpinMutex::new(FallbackChunks {
-                        chunks: Vec::new(),
+                        chunks: Vec::with_capacity(4),
                         used: 0,
                     }),
                 })
@@ -1446,9 +1488,18 @@ impl Drop for ThreadBump {
     fn drop(&mut self) {
         // Первичный регион арены освобождает `SharedArena`; здесь — только
         // дополнительные fallback-чанки, выделенные «где-то в памяти».
+        // Самый последний (самый большой/свежий) чанк отдаём в thread-local
+        // кэш для мгновенного переиспользования этим же потоком (без
+        // `munmap` + нового `mmap` на следующей итерации бенча); остальные
+        // освобождаем через ОС.
         let mut fb = self.fallback.lock();
+        let last = fb.chunks.pop();
         for a in fb.chunks.drain(..) {
             platform::free(a);
+        }
+        drop(fb);
+        if let Some(a) = last {
+            let _ = FREED_CHUNK_CACHE.try_with(|c| c.put(a));
         }
     }
 }
@@ -2158,12 +2209,20 @@ impl ThreadBump {
             None => true,
         };
         if full {
-            #[cfg(feature = "tune")]
-            FALLBACK_MMAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Размер чанка: base_chunk, но не меньше R3_FALLBACK_CHUNK_MB (если
             // задан) — крупные редкие mmap вместо частых mmap/munmap+SpinMutex.
             let alloc_size = fallback_chunk_bytes(self.base_chunk, need).next_multiple_of(page);
-            let alloc = platform::alloc_normal(alloc_size);
+            // Сначала пытаемся переиспользовать чанк, освобождённый этим же
+            // потоком ранее (thread-local кэш): без `mmap` вообще. Счётчик
+            // `FALLBACK_MMAPS` инкрементируется только при реальном мапе.
+            let alloc = match FREED_CHUNK_CACHE.try_with(|c| c.take(alloc_size)) {
+                Ok(Some(a)) => a,
+                _ => {
+                    #[cfg(feature = "tune")]
+                    FALLBACK_MMAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    platform::alloc_normal(alloc_size)
+                }
+            };
             fb.chunks.push(alloc);
             fb.used = 0;
         }
@@ -2321,7 +2380,7 @@ impl ThreadBump {
             use_priority: false,
             base_chunk,
             fallback: SpinMutex::new(FallbackChunks {
-                chunks: Vec::new(),
+                chunks: Vec::with_capacity(4),
                 used: 0,
             }),
         }
@@ -2362,7 +2421,7 @@ impl ThreadBump {
             use_priority,
             base_chunk,
             fallback: SpinMutex::new(FallbackChunks {
-                chunks: Vec::new(),
+                chunks: Vec::with_capacity(4),
                 used: 0,
             }),
         }
@@ -2706,7 +2765,7 @@ impl ZoneBump<'static> {
                 is_huge,
                 base_chunk,
                 fallback: SpinMutex::new(FallbackChunks {
-                    chunks: Vec::new(),
+                    chunks: Vec::with_capacity(4),
                     used: 0,
                 }),
             }),
