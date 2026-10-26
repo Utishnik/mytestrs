@@ -79,6 +79,40 @@ pub fn take_fallback_calls() -> usize {
     take_fallback_counters().0
 }
 
+/// Накопленное (НЕ обнуляемое reset'ом) потребление памяти потоками: байты,
+/// выданные из fallback-чанков (`grow_fallback`). Счёт `FALLBACK_CALLS`
+/// считается на каждое обращение в `grow_fallback`, включая те, что
+/// обслуживаются уже существующим чанком без `mmap`; байты же выдаются только
+/// там, где регион потока исчерпан. Автоподбор измеряет по этой метрике
+/// реальное потребление многопоточной нагрузки: `reset` региона обнуляет
+/// per-thread счётчики, поэтому пик одной итерации снаружи не виден, а сумма
+/// выдач через fallback — видна полностью (при огромном candidate-чанке весь
+/// прогон живёт на fallback).
+#[cfg(feature = "tune")]
+static REGION_TAKEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Прочитать и обнулить накопленное потребление регионов (см. `REGION_TAKEN`).
+#[cfg(feature = "tune")]
+pub fn take_region_taken() -> usize {
+    REGION_TAKEN.swap(0, Ordering::Relaxed)
+}
+
+/// Заглушка без фичи `tune` (см. `take_region_taken`).
+#[cfg(not(feature = "tune"))]
+pub fn take_region_taken() -> usize {
+    0
+}
+
+/// Прочитать и обнулить счётчик РЕАЛЬНЫХ новых mmap-чанков в `grow_fallback`
+/// (см. `FALLBACK_MMAPS`). Именно он — метрика hotspot'а для автоподбора:
+/// обращения в `grow_fallback` случаются и при идеальном чанке (первый аллок
+/// после reset региона), а вот новые `mmap` при достаточно большом чанке
+/// исчезают полностью.
+#[cfg(feature = "tune")]
+pub fn take_fallback_mmaps() -> usize {
+    take_fallback_counters().1
+}
+
 /// Заглушка без фичи `tune`: счётчиков нет — всегда 0, чтобы `arena_tune_scan`
 /// компилировался при любой комбинации флагов (в т.ч. при `--all-features`,
 /// где `tune` включена).
@@ -90,6 +124,12 @@ pub fn take_fallback_counters() -> (usize, usize) {
 /// Заглушка без фичи `tune` (см. `take_fallback_counters`).
 #[cfg(not(feature = "tune"))]
 pub fn take_fallback_calls() -> usize {
+    0
+}
+
+/// Заглушка без фичи `tune` (см. `take_fallback_mmaps`).
+#[cfg(not(feature = "tune"))]
+pub fn take_fallback_mmaps() -> usize {
     0
 }
 
@@ -112,10 +152,16 @@ fn fallback_chunk_mult() -> usize {
 /// N МБ — это позволяет одним мапом покрыть весь прогон и убрать основные
 /// горячие точки профиля: частые `mmap`/`munmap` и захваты `SpinMutex` в
 /// `grow_fallback` (см. рекомендации по профилю arena).
+///
+/// `cap` — потолок размера одного чанка (длина региона потока). Floor из
+/// переменной НЕ должен превышать его: fallback-чанки переиспользуются потоком
+/// через thread-local кэш, и гигантский floor на поток легко суммарно превышает
+/// физическую память (на CI-машинах с 2 GB RAM это `mmap failed` / OOM).
+/// `base_chunk` и `need` потолка не касаются: `need` обязан влезть в чанк.
 #[inline]
-fn fallback_chunk_bytes(base_chunk: usize, need: usize) -> usize {
+fn fallback_chunk_bytes(base_chunk: usize, need: usize, cap: usize) -> usize {
     let m = fallback_chunk_mult();
-    let floor = if m == 1 { 0 } else { m * 1024 * 1024 };
+    let floor = if m == 1 { 0 } else { (m * 1024 * 1024).min(cap) };
     base_chunk.max(floor).max(need)
 }
 
@@ -2196,8 +2242,13 @@ impl ThreadBump {
     #[hotpath::measure]
     #[inline(always)]
     fn grow_fallback<const ALIGN: usize>(&self, size: usize) -> *mut u8 {
-    #[cfg(feature = "tune")]
-    FALLBACK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "tune")]
+        {
+            FALLBACK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Выдача из fallback — это тоже потребление нагрузки потоком
+            // (см. `REGION_TAKEN`: по нему автоподбор меряет `need`).
+            REGION_TAKEN.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+        }
         let page = platform::page_size();
         // Размер чанка — хотя бы базовый чанк, выровнен по странице; блок `size`
         // выровнен внутри.
@@ -2211,7 +2262,8 @@ impl ThreadBump {
         if full {
             // Размер чанка: base_chunk, но не меньше R3_FALLBACK_CHUNK_MB (если
             // задан) — крупные редкие mmap вместо частых mmap/munmap+SpinMutex.
-            let alloc_size = fallback_chunk_bytes(self.base_chunk, need).next_multiple_of(page);
+            let alloc_size =
+                fallback_chunk_bytes(self.base_chunk, need, self.len).next_multiple_of(page);
             // Сначала пытаемся переиспользовать чанк, освобождённый этим же
             // потоком ранее (thread-local кэш): без `mmap` вообще. Счётчик
             // `FALLBACK_MMAPS` инкрементируется только при реальном мапе.
@@ -2874,7 +2926,8 @@ impl ZoneBump<'static> {
             None => true,
         };
         if full {
-            let alloc_size = fallback_chunk_bytes(d.base_chunk, need).next_multiple_of(page);
+            let alloc_size =
+                fallback_chunk_bytes(d.base_chunk, need, d.len).next_multiple_of(page);
             fb.chunks.push(platform::alloc_normal(alloc_size));
             fb.used = 0;
         }
@@ -3936,7 +3989,19 @@ pub fn profile_arena_chunk_size_full() -> usize {
     if let Some(mb) = arena_chunk_override() {
         return mb;
     }
-    let arena = SharedArena::new(1024 * 1024 * 1024);
+    // Огромный чанк нужен, чтобы за прогон не было ни одного `mmap` в
+    // grow_fallback; но на машинах с малой RAM (CI: 2 GB) 1 GB сразу может не
+    // выдаваться — тогда откатываемся к половинкам, пока арена не влезет.
+    let mut cap_probe = 1024 * 1024 * 1024;
+    let arena = loop {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SharedArena::new(cap_probe)
+        })) {
+            Ok(a) => break a,
+            Err(_) if cap_probe > 16 * 1024 * 1024 => cap_probe /= 2,
+            Err(_) => panic!("profile_arena_chunk_size_full: не удалось выделить арену"),
+        }
+    };
     let bumps = arena.split_safe(1);
     let bump = &bumps[0];
     let s = bench_scale();
