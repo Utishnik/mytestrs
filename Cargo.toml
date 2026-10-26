@@ -25,6 +25,9 @@ pprof = { version = "0.13", optional = true, features = ["flamegraph", "protobuf
 default = ["alloc-mimalloc"]
 pprof = ["dep:pprof"]
 alloc-mimalloc = ["dep:rustfs-mimalloc"]
+# Счётчик grow_fallback + автоподбор chunk size (arena_tune_scan) для
+# bench_arena_profile.sh --tune. Не входит в default: без него бинарь идентичен.
+tune = []
 hotpath = ["hotpath/hotpath"]
 hotpath-cpu = ["hotpath/hotpath-cpu"]
 # Асинхронный prefetch страниц на Windows через PrefetchVirtualMemory.

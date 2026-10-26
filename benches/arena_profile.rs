@@ -11,10 +11,18 @@
 //! pprof включается фичей `pprof`: если бинарник собран с `--features pprof`,
 //! профайлер стартует сам (файл — по `R3_PPROF_FILE`, формат — по расширению:
 //! .svg — flamegraph, .txt/.folded — folded text, .pb — protobuf).
+//!
+//! Автоподбор chunk size включается фичей `tune` + `R3_TUNE_CHUNKS=1`
+//! (см. bench_arena_profile.sh --tune): перед прогоном `arena_tune_scan`
+//! сеткой размеров замеряет число grow_fallback/mmap и ставит наименьший
+//! чанк без fallback; подобранный размер попадает в R3_ARENA_CHUNK_MB,
+//! который профильные функции читают при каждом создании арены.
 use r3::*;
 use std::sync::OnceLock;
 
 /// PGO-размеры чанков арены (per-thread), вычисляются один раз и кешируются.
+/// При R3_ARENA_CHUNK_MB (в т.ч. выставленном автоподбором) profile_* возвращают
+/// override — кеш здесь безопасен: tune-скан выполняется до первого вызова.
 fn arena_pgo() -> (usize, usize) {
     static P: OnceLock<(usize, usize)> = OnceLock::new();
     *P.get_or_init(|| (profile_arena_chunk_size_full(), profile_arena_chunk_size_light()))
@@ -22,12 +30,24 @@ fn arena_pgo() -> (usize, usize) {
 
 #[hotpath::main]
 fn main() {
+    let smt = std::env::var("R3_BENCH_SMT").as_deref() != Ok("0");
+
+    // Автоподбор per-thread чанка арены по числу mmap/grow_fallback.
+    #[cfg(feature = "tune")]
+    if std::env::var("R3_TUNE_CHUNKS").as_deref() == Ok("1") {
+        println!("=== auto-tuning arena chunk size ===");
+        let chosen = arena_tune_scan(smt);
+        println!(
+            "=== tuned chunk: {} MB/thread (R3_ARENA_CHUNK_MB set) ===",
+            chosen / (1024 * 1024)
+        );
+    }
+
     let _pprof = start_pprof(); // no-op без фичи `pprof`
 
     println!("Глобальный аллокатор: {}", allocator_label());
     let (fa, la) = arena_pgo();
 
-    let smt = std::env::var("R3_BENCH_SMT").as_deref() != Ok("0");
     let mode_str = if smt { "SMT" } else { "NO SMT" };
     println!("=== Arena-only profile run ({mode_str}) ===");
 
