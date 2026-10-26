@@ -44,6 +44,32 @@ struct FallbackChunks {
     used: usize,
 }
 
+/// Множитель размера fallback-чанка из `R3_FALLBACK_CHUNK_MB` (см.
+/// `fallback_chunk_bytes`). По умолчанию 1 — поведение идентично историческому
+/// (`base_chunk.max(need)`), ничего не меняется для бенчей без переменной.
+fn fallback_chunk_mult() -> usize {
+    static M: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("R3_FALLBACK_CHUNK_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(1)
+    })
+}
+
+/// Размер fallback-чанка в байтах: по умолчанию `base_chunk` (историческое
+/// поведение). Если задан `R3_FALLBACK_CHUNK_MB=N`, чанк берётся не меньше
+/// N МБ — это позволяет одним мапом покрыть весь прогон и убрать основные
+/// горячие точки профиля: частые `mmap`/`munmap` и захваты `SpinMutex` в
+/// `grow_fallback` (см. рекомендации по профилю arena).
+#[inline]
+fn fallback_chunk_bytes(base_chunk: usize, need: usize) -> usize {
+    let m = fallback_chunk_mult();
+    let floor = if m == 1 { 0 } else { m * 1024 * 1024 };
+    base_chunk.max(floor).max(need)
+}
+
 /// Запись о доноре в реестре: индекс в массиве bumps, его приоритет и флаг
 /// логического удаления (для динамических реестров orx/boxcar, где физическое
 /// удаление из lock-free вектора невозможно без `&mut`, — удаление помечает
@@ -2081,7 +2107,9 @@ impl ThreadBump {
             None => true,
         };
         if full {
-            let alloc_size = need.max(self.base_chunk).next_multiple_of(page);
+            // Размер чанка: base_chunk, но не меньше R3_FALLBACK_CHUNK_MB (если
+            // задан) — крупные редкие mmap вместо частых mmap/munmap+SpinMutex.
+            let alloc_size = fallback_chunk_bytes(self.base_chunk, need).next_multiple_of(page);
             let alloc = platform::alloc_normal(alloc_size);
             fb.chunks.push(alloc);
             fb.used = 0;
@@ -2725,7 +2753,7 @@ impl ZoneBump<'static> {
             None => true,
         };
         if full {
-            let alloc_size = need.max(d.base_chunk).next_multiple_of(page);
+            let alloc_size = fallback_chunk_bytes(d.base_chunk, need).next_multiple_of(page);
             fb.chunks.push(platform::alloc_normal(alloc_size));
             fb.used = 0;
         }
@@ -3765,8 +3793,26 @@ pub fn profile_bump_chunk_size_light() -> usize {
     round_up_mb(recommended)
 }
 
+/// Override per-thread чанка арены из `R3_ARENA_CHUNK_MB=N` (МБ). Нужен для
+/// профилировочных прогонов: вручную заданный крупный чанк уменьшает число
+/// `grow_fallback`/mmap и захватов SpinMutex на fallback-реестре. Без
+/// переменной — None, поведение как раньше.
+fn arena_chunk_override() -> Option<usize> {
+    static O: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *O.get_or_init(|| {
+        std::env::var("R3_ARENA_CHUNK_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .map(|mb| mb * 1024 * 1024)
+    })
+}
+
 #[cfg_attr(coverage, coverage(off))]
 pub fn profile_arena_chunk_size_full() -> usize {
+    if let Some(mb) = arena_chunk_override() {
+        return mb;
+    }
     let arena = SharedArena::new(1024 * 1024 * 1024);
     let bumps = arena.split_safe(1);
     let bump = &bumps[0];
@@ -3803,6 +3849,9 @@ pub fn profile_arena_chunk_size_full() -> usize {
 
 #[cfg_attr(coverage, coverage(off))]
 pub fn profile_arena_chunk_size_light() -> usize {
+    if let Some(mb) = arena_chunk_override() {
+        return mb;
+    }
     let arena = SharedArena::new(512 * 1024 * 1024);
     let bumps = arena.split_safe(1);
     let bump = &bumps[0];
