@@ -55,6 +55,13 @@ harness = false
 name = "alloc_bench"
 harness = false
 
+# Профильный прогон ТОЛЬКО shared-арены (без spin-мьютекса):
+#   cargo bench --profile profiling --features pprof --bench arena_profile
+# Запускается через скрипт bench_arena_profile.sh (сохраняет .svg + .txt).
+[[bench]]
+name = "arena_profile"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "fat"

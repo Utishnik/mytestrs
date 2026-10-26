@@ -1,2 +1,3 @@
-/target
-/rustfs-bench/target
+target/
+Cargo.lock
+*.log
