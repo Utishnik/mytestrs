@@ -34,6 +34,8 @@
 #                                          # подобранный R3_ARENA_CHUNK_MB подставляется
 #                                          # во все прогоны (и в flamegraph тоже)
 #   ./bench_arena_profile.sh --tune --tune-rounds 5   # больше повторов на кандидата
+#   ./bench_arena_profile.sh --tune --tune-only       # только автотюн: печать
+#                                          # подобранного R3_ARENA_CHUNK_MB, без pprof-прогонов
 set -euo pipefail
 
 HZ=""
@@ -45,6 +47,9 @@ PREFIX="r3-arena"
 PB=0
 CHUNK_MB=""
 FB_CHUNK_MB=""
+TUNE=0
+TUNE_ROUNDS=""
+TUNE_ONLY=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -57,7 +62,10 @@ while [ $# -gt 0 ]; do
         --chunk-mb)         shift; CHUNK_MB="${1:?--chunk-mb требует число МБ}" ;;
         --fallback-chunk-mb) shift; FB_CHUNK_MB="${1:?--fallback-chunk-mb требует число МБ}" ;;
         --out-prefix)  shift; PREFIX="${1:-r3-arena}" ;;
-        -h|--help)     sed -n '2,$p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --tune)        TUNE=1 ;;
+        --tune-rounds) shift; TUNE_ROUNDS="${1:?--tune-rounds требует число}" ;;
+        --tune-only)   TUNE=1; TUNE_ONLY=1 ;;
+        -h|--help)     awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 && !/^#/ {exit}' "$0"; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
     shift
@@ -89,14 +97,59 @@ export R3_BENCH_STYLE="$STYLE"
 # захватов SpinMutex в grow_fallback (см. fallback_chunk_bytes / arena_chunk_override).
 [ -n "$CHUNK_MB" ]    && export R3_ARENA_CHUNK_MB="$CHUNK_MB"
 [ -n "$FB_CHUNK_MB" ] && export R3_FALLBACK_CHUNK_MB="$FB_CHUNK_MB"
+[ -n "$TUNE_ROUNDS" ] && export R3_TUNE_ROUNDS="$TUNE_ROUNDS"
+
+# Фича `tune` включает счётчик grow_fallback + скан arena_tune_scan внутри
+# бенча (срабатывает при R3_TUNE_CHUNKS=1, задаётся ниже). Отдельный tune-прогон
+# НЕ профилируется pprof: его задача — только подобрать размер чанка; подобранный
+# R3_ARENA_CHUNK_MB печатается в stdout и подхватывается скриптом для всех
+# последующих (чистых, без фичи tune) профилей.
+FEATURES=(pprof)
+if [ "$TUNE" = "1" ]; then
+    FEATURES+=(tune)
+    export R3_TUNE_CHUNKS=1
+fi
+
+# --- Прогон автотюна -----------------------------------------------------------
+# Скрипт сам парсит вывод `[tune] ... chosen chunk=N MB`, чтобы tune-лог не
+# попал в профили и чтобы финальные прогоны собирались БЕЗ фичи tune (бинарь
+# идентичен обычному профилю, только с подобранным чанком).
+if [ "$TUNE" = "1" ]; then
+    echo "===== autotune run (grid R3_ARENA_CHUNK_MB -> min grow_fallback/mmap; style=$STYLE${TUNE_ROUNDS:+, tune_rounds=$TUNE_ROUNDS}${SMT:+, smt=$SMT}) ====="
+    TUNE_LOG="$(mktemp "${TMPDIR:-/tmp}/r3-tune.XXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -f '$TUNE_LOG'" EXIT
+    cargo bench --profile profiling --features "${FEATURES[*]}" --bench arena_profile 2>&1 | tee "$TUNE_LOG"
+    # pipefail выше гарантирует, что сюда мы попадаем только при успехе cargo.
+
+    TUNED_MB="$(sed -n 's/.*chosen chunk=\([0-9]\+\) MB.*/\1/p' "$TUNE_LOG" | tail -1)"
+    if [ -z "$TUNED_MB" ]; then
+        echo "error: автотюн не выдал результат (не найдена строка '[tune] ... chosen chunk=... MB')." >&2
+        echo "       Проверь, что бинарь собирается с фичей tune и что в бенче есть arena_tune_scan." >&2
+        exit 1
+    fi
+    if [ -n "$CHUNK_MB" ]; then
+        echo "===== note: --chunk-mb=$CHUNK_MB переопределён автотюном: R3_ARENA_CHUNK_MB=$TUNED_MB MB ====="
+    fi
+    export R3_ARENA_CHUNK_MB="$TUNED_MB"
+    unset R3_TUNE_CHUNKS
+    echo "===== tuned: R3_ARENA_CHUNK_MB=${R3_ARENA_CHUNK_MB} MB ====="
+    rm -f "$TUNE_LOG"
+    trap - EXIT
+
+    if [ "$TUNE_ONLY" = "1" ]; then
+        echo "===== done (--tune-only): подобран R3_ARENA_CHUNK_MB=${R3_ARENA_CHUNK_MB} MB; pprof-прогоны пропущены ====="
+        exit 0
+    fi
+fi
 
 # Один и тот же бинарь (profile profiling + feature pprof) гоняется отдельно
 # ради каждого выхода: отдельные прогоны = чистые независимые профили.
 for out in "${OUTS[@]}"; do
     export R3_PPROF_FILE="$out"
-    echo "===== arena-only profile run -> $out (style=$STYLE${HZ:+, hz=$HZ}${ROUNDS:+, rounds=$ROUNDS}${SCALE:+, scale=$SCALE}${CHUNK_MB:+, chunk_mb=$CHUNK_MB}${FB_CHUNK_MB:+, fb_chunk_mb=$FB_CHUNK_MB}, smt=$SMT) ====="
+    echo "===== arena-only profile run -> $out (style=$STYLE${HZ:+, hz=$HZ}${ROUNDS:+, rounds=$ROUNDS}${SCALE:+, scale=$SCALE}${R3_ARENA_CHUNK_MB:+, chunk_mb=$R3_ARENA_CHUNK_MB}${FB_CHUNK_MB:+, fb_chunk_mb=$FB_CHUNK_MB}, smt=$SMT) ====="
     cargo bench --profile profiling --features pprof --bench arena_profile
-    echo "===== wrote $(pwd)/$out ====="
+    echo "===== wrote $out ====="
 done
 
 unset R3_PPROF_FILE
