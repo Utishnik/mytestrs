@@ -28,6 +28,12 @@
 #   ./bench_arena_profile.sh --fallback-chunk-mb 128
 #                                                    минимальный fallback-чанк 128 MB
 #                                                    (R3_FALLBACK_CHUNK_MB), меньше mmap/локов
+#
+# Автоматический подбор chunk size (вместо ручного --chunk-mb):
+#   ./bench_arena_profile.sh --tune        # сетка размеров -> минимум grow_fallback/mmap,
+#                                          # подобранный R3_ARENA_CHUNK_MB подставляется
+#                                          # во все прогоны (и в flamegraph тоже)
+#   ./bench_arena_profile.sh --tune --tune-rounds 5   # больше повторов на кандидата
 set -euo pipefail
 
 HZ=""

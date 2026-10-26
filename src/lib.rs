@@ -44,11 +44,25 @@ struct FallbackChunks {
     used: usize,
 }
 
+/// Счётчик обращений в `grow_fallback` (новый fallback-чанк = mmap). Включён
+/// только с фичей `tune` — используется автоподбором chunk size
+/// (`arena_tune_scan`): по числу mmap на конфигурацию видно, где чанки ещё
+/// слишком малы. Статика ради этого одна: счёт глобальный, но он нам и нужен
+/// глобальный (на весь прогон).
+#[cfg(feature = "tune")]
+static FALLBACK_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Прочитать и обнулить счётчик `grow_fallback` (см. `FALLBACK_CALLS`).
+#[cfg(feature = "tune")]
+pub fn take_fallback_calls() -> usize {
+    FALLBACK_CALLS.swap(0, Ordering::Relaxed)
+}
+
 /// Множитель размера fallback-чанка из `R3_FALLBACK_CHUNK_MB` (см.
 /// `fallback_chunk_bytes`). По умолчанию 1 — поведение идентично историческому
 /// (`base_chunk.max(need)`), ничего не меняется для бенчей без переменной.
 fn fallback_chunk_mult() -> usize {
-    static M: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static M: OnceLock<usize> = OnceLock::new();
     *M.get_or_init(|| {
         std::env::var("R3_FALLBACK_CHUNK_MB")
             .ok()
@@ -2096,6 +2110,8 @@ impl ThreadBump {
     #[hotpath::measure]
     #[inline(always)]
     fn grow_fallback<const ALIGN: usize>(&self, size: usize) -> *mut u8 {
+    #[cfg(feature = "tune")]
+    FALLBACK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let page = platform::page_size();
         // Размер чанка — хотя бы базовый чанк, выровнен по странице; блок `size`
         // выровнен внутри.
@@ -3797,15 +3813,17 @@ pub fn profile_bump_chunk_size_light() -> usize {
 /// профилировочных прогонов: вручную заданный крупный чанк уменьшает число
 /// `grow_fallback`/mmap и захватов SpinMutex на fallback-реестре. Без
 /// переменной — None, поведение как раньше.
+///
+/// Override НЕ кешируется в OnceLock: автоподбор (`arena_tune_scan`) меняет
+/// переменную между конфигурациями внутри одного процесса, поэтому значение
+/// читается при каждом вызове. Чтение env — редкий путь (только инициализация
+/// арены/профильного замера), в hot-loop аллокаций его нет.
 fn arena_chunk_override() -> Option<usize> {
-    static O: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *O.get_or_init(|| {
-        std::env::var("R3_ARENA_CHUNK_MB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .map(|mb| mb * 1024 * 1024)
-    })
+    std::env::var("R3_ARENA_CHUNK_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .map(|mb| mb * 1024 * 1024)
 }
 
 #[cfg_attr(coverage, coverage(off))]
@@ -3884,6 +3902,142 @@ pub fn profile_arena_chunk_size_light() -> usize {
 // ============================================================
 //                        УТИЛИТЫ
 // ============================================================
+
+/// Автоматический подбор per-thread размера чанка арены (`R3_ARENA_CHUNK_MB`).
+///
+/// Диагноз по профилю: самые горячие места — `mmap`/`munmap` внутри
+/// `grow_fallback` и захваты `SpinMutex` на fallback-реестре. Причина — чанк
+/// слишком мал и поток постоянно просит у ОС новый. Подбор делает два замера:
+///
+///  * **need** — сколько байт реально использует поток за одну итерацию
+///    нагрузки (полный профильный прогон при огромном чанке: mmap нет вовсе,
+///    поэтому `allocated_bytes()` = точное потребление);
+///  * **floor** — минимальный размер, который ещё влезает в лимит памяти
+///    (`pgo_chunk_cap()`), т.е. самый маленький кандидат сетки.
+///
+/// Затем сеткой кандидатов (geometric 1 MB .. cap, ~2x шаг) замеряется число
+/// обращений в `grow_fallback` (счётчик `FALLBACK_CALLS`, фича `tune`) и время
+/// прогона. Итог: наименьший чанк с нулём fallback-вызовов — ровно столько,
+/// чтобы покрыть need без запасных mmap; если даже floor не убирает fallback
+/// полностью (need > cap — нагрузка больше лимита памяти), берётся candidate с
+/// минимумом fallback-вызовов.
+///
+/// Стили (`mono`/`dispatch`/`both`) берутся из `R3_BENCH_STYLE` (как в
+/// бенчах), повторность — из `R3_TUNE_ROUNDS` (по умолчанию 3). Возвращает
+/// выбранный размер в байтах и выставляет `R3_ARENA_CHUNK_MB` для процесса,
+/// чтобы все последующие прогоны (в т.ч. pprof) использовали подобранный чанк.
+#[cfg_attr(coverage, coverage(off))]
+pub fn arena_tune_scan(smt: bool) -> usize {
+    use std::time::Instant;
+
+    let mb = 1024 * 1024;
+    let cap = pgo_chunk_cap().max(mb);
+    let style = bench_style();
+    let run_mono = style != BenchStyle::Dispatch;
+    let run_dispatch = style != BenchStyle::Mono;
+    let rounds = std::env::var("R3_TUNE_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(3)
+        .max(1) as usize;
+
+    let set_chunk = |bytes: usize| {
+        std::env::set_var("R3_ARENA_CHUNK_MB", (bytes / mb).max(1).to_string());
+    };
+
+    let load = || {
+        if run_mono {
+            arena_m_full_forward(cap, smt);
+            arena_m_light_forward(cap, smt);
+        }
+        if run_dispatch {
+            arena_full(cap, smt);
+            arena_light(cap, smt);
+        }
+    };
+
+    // Прогрев: JIT/кэш планировщика/первые страницы — первые прогоны всегда
+    // шумные, их не меряем.
+    load();
+    load();
+
+    // --- Замер need: сколько байт потребляет одна итерация нагрузки --------
+    // `profile_arena_chunk_size_*` гоняют ровно ту же нагрузку, что и бенчи
+    // (full 200x200 / light 100x100), в один поток при чанке 1 GB — fallback
+    // там не срабатывает вовсе, поэтому `allocated_bytes()` = точное пиковое
+    // потребление за итерацию. Возврат этих функций уже округлён до МБ;
+    // суммируем full+light (поток за прогон делает оба).
+    let prev_override = std::env::var("R3_ARENA_CHUNK_MB").ok();
+    std::env::set_var("R3_ARENA_CHUNK_MB", "1024");
+    let need = profile_arena_chunk_size_full() + profile_arena_chunk_size_light();
+    match prev_override {
+        Some(v) => std::env::set_var("R3_ARENA_CHUNK_MB", v),
+        None => std::env::remove_var("R3_ARENA_CHUNK_MB"),
+    }
+    let need = round_up_mb(need.max(mb));
+
+    // --- Сетка кандидатов: geometric ~2x от 1 MB до cap --------------------
+    let mut candidates: Vec<usize> = Vec::new();
+    let mut c = mb;
+    while c < cap {
+        candidates.push(c);
+        c *= 2;
+    }
+    candidates.push(cap);
+    // need обязано быть в сетке: именно оно гарантированно убирает fallback.
+    if !candidates.contains(&need) && need <= cap {
+        candidates.push(need);
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+
+    // --- Сканирование -------------------------------------------------------
+    // Функции арены читают override при создании SharedArena, так что смена
+    // env между конфигурациями действует сразу (см. arena_chunk_override).
+    // Прогон с заведомо малым чанком тоже даёт fallback-вызовы — счётчик
+    // обнуляем непосредственно перед замером каждой кандидатуры.
+    let mut results: Vec<(usize, usize, f64)> = Vec::new(); // (chunk, fb_calls, ms)
+    for &cand in &candidates {
+        set_chunk(cand);
+        load(); // прогрев этой конфигурации (первые страницы/кэш) — не мерим
+        let _ = take_fallback_calls();
+        let t0 = Instant::now();
+        for _ in 0..rounds {
+            load();
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / rounds as f64;
+        let calls = take_fallback_calls();
+        results.push((cand, calls, ms));
+        println!(
+            "[tune] chunk={:>5} MB  fallback_calls={:<6}  {:.1} ms/round",
+            cand / mb,
+            calls,
+            ms
+        );
+    }
+
+    // Наименьший кандидат без единого fallback-вызова; если таких нет —
+    // кандидат с минимумом вызовов (при равенстве — быстрее по времени).
+    let best = results
+        .iter()
+        .filter(|(_, calls, _)| *calls == 0)
+        .min_by_key(|(cand, _, _)| *cand)
+        .or_else(|| results.iter().min_by(|a, b| a.1.cmp(&b.1).then(a.2.total_cmp(&b.2))))
+        .map(|&(cand, calls, ms)| (cand, calls, ms))
+        .unwrap_or((need, 0, 0.0));
+
+    set_chunk(best.0);
+    println!(
+        "[tune] need={} MB; chosen chunk={} MB (fallback_calls={}, {:.1} ms/round); \
+         R3_ARENA_CHUNK_MB={}",
+        need / mb,
+        best.0 / mb,
+        best.1,
+        best.2,
+        best.0 / mb
+    );
+    best.0
+}
 
 /// Отладочные принты арены показываются только при R3_VERBOSE=1,
 /// чтобы не засорять вывод `cargo bench`.
