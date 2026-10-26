@@ -45,23 +45,49 @@ struct FallbackChunks {
     used: usize,
 }
 
-/// Счётчик обращений в `grow_fallback` (новый fallback-чанк = mmap). Включён
+/// Счётчик обращений в `grow_fallback` (переполнение региона). Включён
 /// только с фичей `tune` — используется автоподбором chunk size
-/// (`arena_tune_scan`): по числу mmap на конфигурацию видно, где чанки ещё
-/// слишком малы. Статика ради этого одна: счёт глобальный, но он нам и нужен
-/// глобальный (на весь прогон).
+/// (`arena_tune_scan`). Статика ради этого одна: счёт глобальный, но он нам
+/// и нужен глобальный (на весь прогон).
 #[cfg(feature = "tune")]
 static FALLBACK_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Счётчик РЕАЛЬНЫХ новых mmap-чанков внутри `grow_fallback` (ветка `full`:
+/// регион исчерпан и в последнем fallback-чанке тоже не хватило места).
+/// Именно это — hotspot из профиля (`mmap`/`munmap` + `SpinMutex`), поэтому
+/// автотюн выбирает размер чанка по нулю именно этих вызовов, а не по всем
+/// обращениям в `grow_fallback`: последние случаются и при достаточно большом
+/// чанке — каждая итерация нагрузки начинается с reset'а региона, и первый же
+/// аллок после него идёт в grow_fallback, где место находится в уже
+/// существующем чанке (без mmap).
+#[cfg(feature = "tune")]
+static FALLBACK_MMAPS: AtomicUsize = AtomicUsize::new(0);
+
+/// Прочитать и обнулить счётчики `grow_fallback` (см. `FALLBACK_CALLS` /
+/// `FALLBACK_MMAPS`). Возвращает `(обращения, новые mmap-чанки)`.
+#[cfg(feature = "tune")]
+pub fn take_fallback_counters() -> (usize, usize) {
+    (
+        FALLBACK_CALLS.swap(0, Ordering::Relaxed),
+        FALLBACK_MMAPS.swap(0, Ordering::Relaxed),
+    )
+}
 
 /// Прочитать и обнулить счётчик `grow_fallback` (см. `FALLBACK_CALLS`).
 #[cfg(feature = "tune")]
 pub fn take_fallback_calls() -> usize {
-    FALLBACK_CALLS.swap(0, Ordering::Relaxed)
+    take_fallback_counters().0
 }
 
-/// Заглушка без фичи `tune`: счётчика нет — всегда 0, чтобы `arena_tune_scan`
+/// Заглушка без фичи `tune`: счётчиков нет — всегда 0, чтобы `arena_tune_scan`
 /// компилировался при любой комбинации флагов (в т.ч. при `--all-features`,
 /// где `tune` включена).
+#[cfg(not(feature = "tune"))]
+pub fn take_fallback_counters() -> (usize, usize) {
+    (0, 0)
+}
+
+/// Заглушка без фичи `tune` (см. `take_fallback_counters`).
 #[cfg(not(feature = "tune"))]
 pub fn take_fallback_calls() -> usize {
     0
@@ -2132,6 +2158,8 @@ impl ThreadBump {
             None => true,
         };
         if full {
+            #[cfg(feature = "tune")]
+            FALLBACK_MMAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Размер чанка: base_chunk, но не меньше R3_FALLBACK_CHUNK_MB (если
             // задан) — крупные редкие mmap вместо частых mmap/munmap+SpinMutex.
             let alloc_size = fallback_chunk_bytes(self.base_chunk, need).next_multiple_of(page);
@@ -2169,6 +2197,15 @@ impl ThreadBump {
         }
         let size = count * core::mem::size_of::<T>();
         self.alloc_raw_m::<ALIGN, MODE>(size) as *mut T
+    }
+
+    /// Тестовый/профилировочный доступ к `alloc_uninit_slice` (счётчик
+    /// `grow_fallback` в автотюне выделяет блоки ровно так же, как реальный
+    /// бенч — через `ArenaVec`, т.е. кратные размеру элемента).
+    #[cfg(feature = "tune")]
+    #[allow(dead_code)]
+    pub fn alloc_slice_for_tune<T, const ALIGN: usize>(&self, count: usize) -> *mut T {
+        self.alloc_uninit_slice::<T, ALIGN>(count)
     }
 
     /// Обнулить счётчики региона: регион переиспользуется с нуля (уже
