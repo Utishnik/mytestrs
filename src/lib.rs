@@ -442,10 +442,24 @@ mod platform {
     // чтобы проверить логику (в первую очередь реестр доноров) через Miri.
     // База должна быть выровнена не хуже страницы (как VirtualAlloc), иначе
     // указатели вида `ptr + off` окажутся невыровненными (UB под Tree Borrows).
+    //
+    // ВАЖНО (падал miri (windows-latest) в CI): вызывающий код (grow_fallback)
+    // округляет размер чанка вверх до страницы (`next_multiple_of(page)`), а
+    // границы чанков в логике считаются по полю `size`. Если аллоцировать ровно
+    // `size`, то dealloc с Layout(alloc.size) мог бы разойтись с alloc, а любые
+    // расхождения округлений дали бы «dealloc with a different layout» = UB.
+    // Поэтому под Miri выделяем буфер фиксированного размера MIRI_VIRT_SIZE с
+    // выравниванием по странице, а в RawAllocation.size кладём запрошенный
+    // size — логические границы чанков остаются корректными, а alloc/dealloc
+    // используют строго идентичный Layout.
+    #[cfg(miri)]
+    const MIRI_VIRT_SIZE: usize = 1 << 24; // 16 MiB
+
     #[cfg(miri)]
     pub fn alloc_normal(size: usize) -> RawAllocation {
         use std::alloc::{Layout, alloc};
-        let layout = Layout::from_size_align(size, 16).unwrap();
+        assert!(size <= MIRI_VIRT_SIZE, "miri shim: chunk too large");
+        let layout = Layout::from_size_align(MIRI_VIRT_SIZE, page_size()).unwrap();
         let ptr = unsafe { alloc(layout) };
         assert!(!ptr.is_null(), "std alloc failed (miri)");
         RawAllocation {
@@ -470,7 +484,9 @@ mod platform {
     #[cfg(miri)]
     pub fn free(alloc: RawAllocation) {
         use std::alloc::{Layout, dealloc};
-        let layout = Layout::from_size_align(alloc.size, 16).unwrap();
+        // Layout строго идентичный alloc_normal: иначе Miri репортит
+        // «dealloc with a different layout» = UB (падал miri windows-latest).
+        let layout = Layout::from_size_align(MIRI_VIRT_SIZE, page_size()).unwrap();
         unsafe { dealloc(alloc.ptr, layout) };
     }
 
