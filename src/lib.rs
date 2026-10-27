@@ -34,8 +34,10 @@ pub(crate) struct RawAllocation {
     ptr: *mut u8,
     size: usize,
     is_huge: bool,
-    /// Под Miri (windows-шим): фактический размер std-аллокации может
-    /// отличаться от логического `size` (округления вызывающего кода).
+    /// Под Miri Windows-сборки `alloc_normal` идёт через `std::alloc` и
+    /// аллоцирует буфер размером `max(MIRI_VIRT_SIZE, size)` с выравниванием
+    /// по странице — фактический Layout аллокации может отличаться от
+    /// логического `size` (вызывающий код округляет чанки вверх до страницы).
     /// `free` deallocает строго Layout'ом `(virt_size, virt_align)` — тем же,
     /// что использовался в `alloc_normal`, чтобы не получить UB
     /// «dealloc with a different layout».
@@ -45,18 +47,27 @@ pub(crate) struct RawAllocation {
     virt_align: usize,
 }
 
+impl Clone for RawAllocation {
+    #[inline]
+    fn clone(&self) -> Self {
+        // Копируем поля, а не конструируем литералом: набор cfg-полей
+        // (`virt_size`/`virt_align`) зависит от платформы и Miri.
+        RawAllocation { ..*self }
+    }
+}
+impl Copy for RawAllocation {}
+
 impl RawAllocation {
     /// Освободить чанк через платформенный слой. В кэшах и контейнерах храним
     /// `Option<RawAllocation>`; при вытеснении/замене элемента старый чанк
     /// обязан быть освобождён — иначе Miri репортит «memory leaked» (падал
     /// `miri (windows-latest)` из-за thread-local кэша freed-чанков, который
     /// никогда не дренируется при завершении тестового процесса).
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn release(self) {
         platform::free(self);
     }
-}
-
 }
 
 /// Список дополнительных чанков, выделенных «где-то в памяти» в режиме доноров,
@@ -203,9 +214,16 @@ fn fallback_chunk_bytes(base_chunk: usize, need: usize, cap: usize) -> usize {
 // `Cell<Option<RawAllocation>>` без Drop и никогда не дренировался при
 // завершении процесса — Miri репортит утечку каждой оставшейся в кэше
 // std-аллокации. Теперь кэш хранит `Cell<Option<Box<ChunkSlot>>>`, где
-// `ChunkSlot` освобождает чанк в своём `Drop`: `Box` — это обычная heap-аллокация,
-// она уничтожается вместе с потоком/процессом автоматически, без явного
-// деструктора у thread_local. Утечки больше нет ни на Windows, ни на Unix.
+// `ChunkSlot` освобождает чанк в своём `Drop`.
+//
+// Оговорка про «Box уничтожается вместе с потоком/процессом автоматически»:
+// это верно только для типов БЕЗ деструктора. `ChunkSlot` содержит `Drop`,
+// поэтому обычный `thread_local!` гарантированно вызывает деструктор слота
+// при завершении потока (в том числе под Miri) — на этом и построен фикс.
+// Именно поэтому здесь НЕ используется `const`-инициализация тред-локали:
+// `thread_local! { static X: T = const { ... } }` запрещена для типов с
+// деструктором (E0730), а если бы компилировалась, то деструктор вообще не
+// запускался бы и утечка вернулась.
 struct ChunkSlot(RawAllocation);
 
 impl Drop for ChunkSlot {
@@ -218,8 +236,7 @@ impl Drop for ChunkSlot {
 }
 
 thread_local! {
-    static FREED_CHUNK_CACHE: RawAllocationCache =
-        const { RawAllocationCache(std::cell::Cell::new(None)) };
+    static FREED_CHUNK_CACHE: RawAllocationCache = const { RawAllocationCache(std::cell::Cell::new(None)) };
 }
 
 struct RawAllocationCache(std::cell::Cell<Option<Box<ChunkSlot>>>);
@@ -230,10 +247,11 @@ impl RawAllocationCache {
     fn take(&self, size: usize) -> Option<RawAllocation> {
         match self.0.take() {
             Some(slot) if slot.0.size >= size => {
-                // Достаём чанк из Box без запуска Drop слота.
-                let mut slot = slot;
-                let a = unsafe { std::ptr::read(&slot.0) };
-                std::mem::forget(slot); // освободится только сам Box-ящик
+                // Достаём чанк из Box без запуска Drop слота: `slot` — owned
+                // значение (`Box<ChunkSlot>`), поле читается напрямую,
+                // `ptr::read`/`forget` не нужны.
+                let a = slot.0;
+                drop(slot); // освобождается только сам Box-«ящик»
                 Some(a)
             }
             other => {
@@ -1622,7 +1640,15 @@ impl Drop for ThreadBump {
         }
         drop(fb);
         if let Some(a) = last {
-            let _ = FREED_CHUNK_CACHE.try_with(|c| c.put(a));
+            // `try_with` может НЕ вызвать замыкание: если тред-локаль уже
+            // удалена (поток завершается) или инициализация провалилась.
+            // Раньше результат просто выбрасывался (`let _ = ...`) — чанк
+            // терялся, и Miri репортил «memory leaked». Теперь при отказе
+            // освобождаем чанк напрямую через платформенный слой.
+            match FREED_CHUNK_CACHE.try_with(|c| c.put(a)) {
+                Ok(()) => {}
+                Err(_) => a.release(),
+            }
         }
     }
 }
