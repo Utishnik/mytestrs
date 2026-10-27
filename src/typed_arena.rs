@@ -29,6 +29,11 @@ struct ArenaRegion {
     len: usize,
     /// Байт, занято начиная с `ptr` (атомарный bump текущего потока).
     used: AtomicUsize,
+    /// Чанк ownership: Some — spill-регион, выделенный `platform::alloc_normal`
+    /// (освобождается в `Drop for Arena` строго тем же `RawAllocation`, из
+    /// которого брались `ptr`/`len`); None — первичный регион, живущий в общем
+    /// буфере `SharedArena` (его освобождает сам `SharedArena`).
+    alloc: Option<RawAllocation>,
 }
 
 // Thread-local: индекс первичного региона для текущего потока. Кэш
@@ -105,6 +110,7 @@ impl<T> Arena<T> {
                 ptr: b.ptr,
                 len: b.len,
                 used: AtomicUsize::new(0),
+                alloc: None,
             })
             .collect::<Vec<_>>();
         Arena {
@@ -179,6 +185,12 @@ impl<T> Arena<T> {
     }
 
     /// Занять spill-регион (выделить новый через платформенный аллокатор).
+    /// `RawAllocation` сохраняется в регионе целиком: при деаллокации мы
+    /// отдаём платформенному слою ровно тот же чанк, что получали из
+    /// `alloc_normal`, а не реконструируем его из `ptr`/`len`. Это важно под
+    /// Miri на Windows: там фактический Layout аллокации хранится в cfg-полях
+    /// `virt_size`/`virt_align`, и реконструкция давала Layout с нулевыми
+    /// полями → panic `LayoutError` в `free()` (падал `miri (windows-latest)`).
     fn take_spill_region(&self) -> ArenaRegion {
         let size = self.spill_size();
         let alloc = platform::alloc_normal(size);
@@ -186,6 +198,7 @@ impl<T> Arena<T> {
             ptr: alloc.ptr,
             len: alloc.size,
             used: AtomicUsize::new(0),
+            alloc: Some(alloc),
         }
     }
 
@@ -370,12 +383,12 @@ impl<T> Drop for Arena<T> {
         self.clear();
         let spill = self.spill.get_mut();
         for r in spill.drain(..) {
-            platform::free(RawAllocation {
-                ptr: r.ptr,
-                size: r.len,
-                is_huge: false,
-                ..Default::default()
-            });
+            // Освобождаем ровно тот чанк, что выдавал `alloc_normal`
+            // (Layout alloc/dealloc строго идентичны — критично под Miri
+            // на Windows, где virt_size/virt_align отличаются от len).
+            if let Some(a) = r.alloc {
+                platform::free(a);
+            }
         }
     }
 }
