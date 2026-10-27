@@ -34,6 +34,61 @@ pub(crate) struct RawAllocation {
     ptr: *mut u8,
     size: usize,
     is_huge: bool,
+    /// Под Miri Windows-сборки `alloc_normal` идёт через `std::alloc` и
+    /// аллоцирует буфер размером `max(MIRI_VIRT_SIZE, size)` с выравниванием
+    /// по странице — фактический Layout аллокации может отличаться от
+    /// логического `size` (вызывающий код округляет чанки вверх до страницы).
+    /// `free` deallocает строго Layout'ом `(virt_size, virt_align)` — тем же,
+    /// что использовался в `alloc_normal`, чтобы не получить UB
+    /// «dealloc with a different layout».
+    /// Заполняется ТОЛЬКО в `platform::alloc_normal` под Miri на Windows;
+    /// во всех остальных конструкторах (в т.ч. unix-ветках и huge-аллоках)
+    /// обязано быть нулём — дефолт через `..Default::default()` снимает
+    /// необходимость перечислять cfg-поля в каждом литерале (иначе новый
+    /// литерал без полей ломает сборку `cargo miri test --target
+    /// x86_64-pc-windows-msvc`, которая компилирует windows-код даже на
+    /// linux-раннере).
+    #[cfg(all(miri, windows))]
+    virt_size: usize,
+    #[cfg(all(miri, windows))]
+    virt_align: usize,
+}
+
+impl Default for RawAllocation {
+    fn default() -> Self {
+        RawAllocation {
+            ptr: ptr::null_mut(),
+            size: 0,
+            is_huge: false,
+            #[cfg(all(miri, windows))]
+            virt_size: 0,
+            #[cfg(all(miri, windows))]
+            virt_align: 0,
+        }
+    }
+}
+
+impl Clone for RawAllocation {
+    #[inline]
+    fn clone(&self) -> Self {
+        // Копируем поля, а не конструируем литералом: набор cfg-полей
+        // (`virt_size`/`virt_align`) зависит от платформы и Miri.
+        RawAllocation { ..*self }
+    }
+}
+impl Copy for RawAllocation {}
+
+impl RawAllocation {
+    /// Освободить чанк через платформенный слой. В кэшах и контейнерах храним
+    /// `Option<RawAllocation>`; при вытеснении/замене элемента старый чанк
+    /// обязан быть освобождён — иначе Miri репортит «memory leaked» (падал
+    /// `miri (windows-latest)` из-за thread-local кэша freed-чанков, который
+    /// никогда не дренируется при завершении тестового процесса).
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn release(self) {
+        platform::free(self);
+    }
 }
 
 /// Список дополнительных чанков, выделенных «где-то в памяти» в режиме доноров,
@@ -174,36 +229,66 @@ fn fallback_chunk_bytes(base_chunk: usize, need: usize, cap: usize) -> usize {
 // к ОС (ни `munmap` на drop, ни нового `mmap` на grow). Хранится ровно один
 // чанок на поток — этого достаточно для steady-state «создал арену → уронил
 // арену», где каждый новый чанк совпадает по размеру с предыдущим.
-thread_local! {
-    static FREED_CHUNK_CACHE: RawAllocationCache =
-        const { RawAllocationCache(std::cell::Cell::new(None)) };
+//
+// ВАЖНО (падал `miri (windows-latest)` из-за `memory leaked`): thread_local с
+// деструктором не может быть `const`-инициализирован, поэтому раньше кэш был
+// `Cell<Option<RawAllocation>>` без Drop и никогда не дренировался при
+// завершении процесса — Miri репортит утечку каждой оставшейся в кэше
+// std-аллокации. Теперь кэш хранит `Cell<Option<Box<ChunkSlot>>>`, где
+// `ChunkSlot` освобождает чанк в своём `Drop`.
+//
+// Оговорка про «Box уничтожается вместе с потоком/процессом автоматически»:
+// это верно только для типов БЕЗ деструктора. `ChunkSlot` содержит `Drop`,
+// поэтому обычный `thread_local!` гарантированно вызывает деструктор слота
+// при завершении потока (в том числе под Miri) — на этом и построен фикс.
+// Именно поэтому здесь НЕ используется `const`-инициализация тред-локали:
+// `thread_local! { static X: T = const { ... } }` запрещена для типов с
+// деструктором (E0730), а если бы компилировалась, то деструктор вообще не
+// запускался бы и утечка вернулась.
+struct ChunkSlot(RawAllocation);
+
+impl Drop for ChunkSlot {
+    #[inline]
+    fn drop(&mut self) {
+        // Забираем чанк через ptr::read (поля RawAllocation Copy) и отдаём ОС.
+        let a = unsafe { std::ptr::read(&self.0) };
+        platform::free(a);
+    }
 }
 
-struct RawAllocationCache(std::cell::Cell<Option<RawAllocation>>);
+thread_local! {
+    static FREED_CHUNK_CACHE: RawAllocationCache = const { RawAllocationCache(std::cell::Cell::new(None)) };
+}
+
+struct RawAllocationCache(std::cell::Cell<Option<Box<ChunkSlot>>>);
 
 impl RawAllocationCache {
     /// Забрать закэшированный чанк подходящего размера (иначе `None`).
     #[inline]
     fn take(&self, size: usize) -> Option<RawAllocation> {
-        let cur = self.0.take();
-        match cur {
-            Some(c) if c.size >= size => Some(c),
+        match self.0.take() {
+            Some(slot) if slot.0.size >= size => {
+                // Достаём чанк из Box без запуска Drop слота: `slot` — owned
+                // значение (`Box<ChunkSlot>`), поле читается напрямую,
+                // `ptr::read`/`forget` не нужны.
+                let a = slot.0;
+                drop(slot); // освобождается только сам Box-«ящик»
+                Some(a)
+            }
             other => {
-                // Не подошёл по размеру — освобождаем через ОС и идём mmap'ить.
-                if let Some(o) = other {
-                    platform::free(o);
-                }
+                // Не подошёл по размеру (или его нет) — при вытеснении `other`
+                // чанк будет освобождён автоматически Drop'ом слота.
+                drop(other);
                 None
             }
         }
     }
 
-    /// Положить чанк в кэш; прежний содержимец кэша освобождается через ОС.
+    /// Положить чанк в кэш; прежний содержимец кэша освобождается через ОС
+    /// (Drop слота при уничтожении вытесненного `Box`).
     #[inline]
     fn put(&self, alloc: RawAllocation) {
-        if let Some(o) = self.0.replace(Some(alloc)) {
-            platform::free(o);
-        }
+        self.0.replace(Some(Box::new(ChunkSlot(alloc))));
     }
 }
 
@@ -325,8 +410,14 @@ mod platform {
     };
     use windows_sys::Win32::System::Memory::*;
     use windows_sys::Win32::System::SystemInformation::{
-        GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
+        GlobalMemoryStatusEx, MEMORYSTATUSEX,
     };
+    // GetSystemInfo/SYSTEM_INFO нужны только вне Miri (page_size); под
+    // Miri-сборкой с кросс-таргетом на windows это вызвало бы warning
+    // unused_imports. Атрибуты внутри use-списка запрещены синтаксисом Rust,
+    // поэтому выносим в отдельные import'ы.
+    #[cfg(not(miri))]
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     /// Включаем SeLockMemoryPrivilege ("Lock pages in memory"), если она
@@ -414,6 +505,7 @@ mod platform {
                     ptr: ptr as *mut u8,
                     size,
                     is_huge: true,
+                    ..Default::default()
                 })
             }
         }
@@ -434,6 +526,7 @@ mod platform {
                 ptr: ptr as *mut u8,
                 size,
                 is_huge: false,
+                ..Default::default()
             }
         }
     }
@@ -448,9 +541,10 @@ mod platform {
     // границы чанков в логике считаются по полю `size`. Если аллоцировать ровно
     // `size`, то dealloc с Layout(alloc.size) мог бы разойтись с alloc, а любые
     // расхождения округлений дали бы «dealloc with a different layout» = UB.
-    // Поэтому под Miri выделяем буфер фиксированного размера MIRI_VIRT_SIZE с
-    // выравниванием по странице, а в RawAllocation.size кладём запрошенный
-    // size — логические границы чанков остаются корректными, а alloc/dealloc
+    // Поэтому выделяем буфер размером max(MIRI_VIRT_SIZE, запрошенный size) с
+    // выравниванием по странице, фактический Layout запоминаем в полях
+    // virt_size/virt_align, а в RawAllocation.size кладём запрошенный size —
+    // логические границы чанков остаются корректными, а alloc/dealloc
     // используют строго идентичный Layout.
     #[cfg(miri)]
     const MIRI_VIRT_SIZE: usize = 1 << 24; // 16 MiB
@@ -458,14 +552,21 @@ mod platform {
     #[cfg(miri)]
     pub fn alloc_normal(size: usize) -> RawAllocation {
         use std::alloc::{Layout, alloc};
-        assert!(size <= MIRI_VIRT_SIZE, "miri shim: chunk too large");
-        let layout = Layout::from_size_align(MIRI_VIRT_SIZE, page_size()).unwrap();
+        let virt_size = size.max(MIRI_VIRT_SIZE);
+        let virt_align = page_size();
+        let layout = Layout::from_size_align(virt_size, virt_align).unwrap();
         let ptr = unsafe { alloc(layout) };
         assert!(!ptr.is_null(), "std alloc failed (miri)");
         RawAllocation {
             ptr,
             size,
             is_huge: false,
+            // Поля есть только под `cfg(all(miri, windows))` — на unix-раннере
+            // с кросс-таргетом на windows их задаём явно.
+            #[cfg(all(miri, windows))]
+            virt_size,
+            #[cfg(all(miri, windows))]
+            virt_align,
         }
     }
 
@@ -484,9 +585,16 @@ mod platform {
     #[cfg(miri)]
     pub fn free(alloc: RawAllocation) {
         use std::alloc::{Layout, dealloc};
-        // Layout строго идентичный alloc_normal: иначе Miri репортит
-        // «dealloc with a different layout» = UB (падал miri windows-latest).
-        let layout = Layout::from_size_align(MIRI_VIRT_SIZE, page_size()).unwrap();
+        // Layout строго идентичный тому, что был в `alloc_normal`: иначе Miri
+        // репортит «dealloc with a different layout» = UB (падал
+        // `miri (windows-latest)`). Под windows-таргетом берём сохранённые
+        // virt_size/virt_align; на unix-таргетах этих полей нет — там
+        // alloc_normal выделял ровно `size` с выравниванием по странице.
+        #[cfg(all(miri, windows))]
+        let (vsize, valign) = (alloc.virt_size, alloc.virt_align);
+        #[cfg(not(windows))]
+        let (vsize, valign) = (alloc.size.max(MIRI_VIRT_SIZE), page_size());
+        let layout = Layout::from_size_align(vsize, valign).unwrap();
         unsafe { dealloc(alloc.ptr, layout) };
     }
 
@@ -629,6 +737,7 @@ mod platform {
                     ptr: ptr as *mut u8,
                     size,
                     is_huge: true,
+                    ..Default::default()
                 })
             }
         }
@@ -655,6 +764,7 @@ mod platform {
                 ptr: ptr as *mut u8,
                 size,
                 is_huge: false,
+                ..Default::default()
             }
         }
     }
@@ -1297,11 +1407,9 @@ impl SharedArena {
 
 impl Drop for SharedArena {
     fn drop(&mut self) {
-        let alloc = RawAllocation {
-            ptr: self.alloc.ptr,
-            size: self.alloc.size,
-            is_huge: self.alloc.is_huge,
-        };
+        // `alloc` забираем из `&mut self` напрямую (Copy-поля, конструктор
+        // полей не нужен — так фикс не зависит от cfg-полей RawAllocation).
+        let alloc = unsafe { std::ptr::read(&self.alloc) };
         platform::free(alloc);
     }
 }
@@ -1561,7 +1669,15 @@ impl Drop for ThreadBump {
         }
         drop(fb);
         if let Some(a) = last {
-            let _ = FREED_CHUNK_CACHE.try_with(|c| c.put(a));
+            // `try_with` может НЕ вызвать замыкание: если тред-локаль уже
+            // удалена (поток завершается) или инициализация провалилась.
+            // Раньше результат просто выбрасывался (`let _ = ...`) — чанк
+            // терялся, и Miri репортил «memory leaked». Теперь при отказе
+            // освобождаем чанк напрямую через платформенный слой.
+            match FREED_CHUNK_CACHE.try_with(|c| c.put(a)) {
+                Ok(()) => {}
+                Err(_) => a.release(),
+            }
         }
     }
 }
