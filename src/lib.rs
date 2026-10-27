@@ -41,10 +41,31 @@ pub(crate) struct RawAllocation {
     /// `free` deallocает строго Layout'ом `(virt_size, virt_align)` — тем же,
     /// что использовался в `alloc_normal`, чтобы не получить UB
     /// «dealloc with a different layout».
+    /// Заполняется ТОЛЬКО в `platform::alloc_normal` под Miri на Windows;
+    /// во всех остальных конструкторах (в т.ч. unix-ветках и huge-аллоках)
+    /// обязано быть нулём — дефолт через `..Default::default()` снимает
+    /// необходимость перечислять cfg-поля в каждом литерале (иначе новый
+    /// литерал без полей ломает сборку `cargo miri test --target
+    /// x86_64-pc-windows-msvc`, которая компилирует windows-код даже на
+    /// linux-раннере).
     #[cfg(all(miri, windows))]
     virt_size: usize,
     #[cfg(all(miri, windows))]
     virt_align: usize,
+}
+
+impl Default for RawAllocation {
+    fn default() -> Self {
+        RawAllocation {
+            ptr: ptr::null_mut(),
+            size: 0,
+            is_huge: false,
+            #[cfg(all(miri, windows))]
+            virt_size: 0,
+            #[cfg(all(miri, windows))]
+            virt_align: 0,
+        }
+    }
 }
 
 impl Clone for RawAllocation {
@@ -389,8 +410,14 @@ mod platform {
     };
     use windows_sys::Win32::System::Memory::*;
     use windows_sys::Win32::System::SystemInformation::{
-        GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
+        GlobalMemoryStatusEx, MEMORYSTATUSEX,
     };
+    // GetSystemInfo/SYSTEM_INFO нужны только вне Miri (page_size); под
+    // Miri-сборкой с кросс-таргетом на windows это вызвало бы warning
+    // unused_imports. Атрибуты внутри use-списка запрещены синтаксисом Rust,
+    // поэтому выносим в отдельные import'ы.
+    #[cfg(not(miri))]
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     /// Включаем SeLockMemoryPrivilege ("Lock pages in memory"), если она
@@ -478,10 +505,7 @@ mod platform {
                     ptr: ptr as *mut u8,
                     size,
                     is_huge: true,
-                    #[cfg(all(miri, windows))]
-                    virt_size: 0,
-                    #[cfg(all(miri, windows))]
-                    virt_align: 0,
+                    ..Default::default()
                 })
             }
         }
@@ -502,6 +526,7 @@ mod platform {
                 ptr: ptr as *mut u8,
                 size,
                 is_huge: false,
+                ..Default::default()
             }
         }
     }
@@ -536,7 +561,11 @@ mod platform {
             ptr,
             size,
             is_huge: false,
+            // Поля есть только под `cfg(all(miri, windows))` — на unix-раннере
+            // с кросс-таргетом на windows их задаём явно.
+            #[cfg(all(miri, windows))]
             virt_size,
+            #[cfg(all(miri, windows))]
             virt_align,
         }
     }
@@ -556,10 +585,16 @@ mod platform {
     #[cfg(miri)]
     pub fn free(alloc: RawAllocation) {
         use std::alloc::{Layout, dealloc};
-        // Layout строго идентичный тому, что был в alloc_normal: иначе Miri
-        // репортит «dealloc with a different layout» = UB (падал miri
-        // windows-latest).
-        let layout = Layout::from_size_align(alloc.virt_size, alloc.virt_align).unwrap();
+        // Layout строго идентичный тому, что был в `alloc_normal`: иначе Miri
+        // репортит «dealloc with a different layout» = UB (падал
+        // `miri (windows-latest)`). Под windows-таргетом берём сохранённые
+        // virt_size/virt_align; на unix-таргетах этих полей нет — там
+        // alloc_normal выделял ровно `size` с выравниванием по странице.
+        #[cfg(all(miri, windows))]
+        let (vsize, valign) = (alloc.virt_size, alloc.virt_align);
+        #[cfg(not(windows))]
+        let (vsize, valign) = (alloc.size.max(MIRI_VIRT_SIZE), page_size());
+        let layout = Layout::from_size_align(vsize, valign).unwrap();
         unsafe { dealloc(alloc.ptr, layout) };
     }
 
@@ -702,10 +737,7 @@ mod platform {
                     ptr: ptr as *mut u8,
                     size,
                     is_huge: true,
-                    #[cfg(all(miri, windows))]
-                    virt_size: 0,
-                    #[cfg(all(miri, windows))]
-                    virt_align: 0,
+                    ..Default::default()
                 })
             }
         }
@@ -732,10 +764,7 @@ mod platform {
                 ptr: ptr as *mut u8,
                 size,
                 is_huge: false,
-                #[cfg(all(miri, windows))]
-                virt_size: 0,
-                #[cfg(all(miri, windows))]
-                virt_align: 0,
+                ..Default::default()
             }
         }
     }

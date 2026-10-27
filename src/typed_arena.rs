@@ -374,6 +374,7 @@ impl<T> Drop for Arena<T> {
                 ptr: r.ptr,
                 size: r.len,
                 is_huge: false,
+                ..Default::default()
             });
         }
     }
