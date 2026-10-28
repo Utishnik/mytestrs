@@ -188,35 +188,48 @@ pub fn take_fallback_mmaps() -> usize {
     0
 }
 
-/// Множитель размера fallback-чанка из `R3_FALLBACK_CHUNK_MB` (см.
-/// `fallback_chunk_bytes`). По умолчанию 1 — поведение идентично историческому
-/// (`base_chunk.max(need)`), ничего не меняется для бенчей без переменной.
-fn fallback_chunk_mult() -> usize {
+/// Минимальный размер fallback-чанка по умолчанию (без env-переменных):
+/// 1 МБ. По профилю pprof самые горячие места — `__GI_munmap`/`__GI___mmap64`
+/// в `platform::alloc/free` и захваты `SpinMutex` в `grow_fallback`: при
+/// маленьких чанках арена живёт в режиме «попросил у ОС → отдал ОС» на каждой
+/// итерации бенча. Floor в 1 МБ делает один mmap покрывающим тысячи мелких
+/// аллокаций (`ArenaString`/`ArenaVec`) и радикально сокращает число системных
+/// вызовов и очередей за глобальным пулом чанков.
+const DEFAULT_FALLBACK_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Floor размера fallback-чанка в байтах из `R3_FALLBACK_CHUNK_MB` (см.
+/// `fallback_chunk_bytes`). Значение по умолчанию — 1 МБ
+/// (`DEFAULT_FALLBACK_CHUNK_BYTES`); env задаёт явный пол, если нужен другой.
+fn fallback_chunk_floor() -> usize {
     static M: OnceLock<usize> = OnceLock::new();
     *M.get_or_init(|| {
         std::env::var("R3_FALLBACK_CHUNK_MB")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)
-            .unwrap_or(1)
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or(DEFAULT_FALLBACK_CHUNK_BYTES)
     })
 }
 
-/// Размер fallback-чанка в байтах: по умолчанию `base_chunk` (историческое
-/// поведение). Если задан `R3_FALLBACK_CHUNK_MB=N`, чанк берётся не меньше
-/// N МБ — это позволяет одним мапом покрыть весь прогон и убрать основные
-/// горячие точки профиля: частые `mmap`/`munmap` и захваты `SpinMutex` в
-/// `grow_fallback` (см. рекомендации по профилю arena).
+/// Размер fallback-чанка в байтах: не меньше `base_chunk` и не меньше floor
+/// (по умолчанию 1 МБ, см. `DEFAULT_FALLBACK_CHUNK_BYTES`; переопределяется
+/// `R3_FALLBACK_CHUNK_MB=N`). Крупные редкие mmap вместо частых
+/// mmap/munmap+SpinMutex — это убирает основные горячие точки профиля
+/// (см. рекомендации по профилю arena).
 ///
-/// `cap` — потолок размера одного чанка (длина региона потока). Floor из
-/// переменной НЕ должен превышать его: fallback-чанки переиспользуются потоком
-/// через thread-local кэш, и гигантский floor на поток легко суммарно превышает
-/// физическую память (на CI-машинах с 2 GB RAM это `mmap failed` / OOM).
-/// `base_chunk` и `need` потолка не касаются: `need` обязан влезть в чанк.
+/// `cap` — потолок размера одного чанка (длина региона потока). Floor
+/// каппится им: fallback-чанки переиспользуются потоком через thread-local
+/// кэш, и гигантский floor на поток легко суммарно превышает физическую
+/// память (на CI-машинах с 2 GB RAM это `mmap failed` / OOM). Каппинг
+/// применяется только когда регион сам не меньше дефолтного floor (1 МБ) —
+/// иначе маленький тестовый регион остался бы крошечным и вернулись бы
+/// частые mmap. `base_chunk` и `need` потолка не касаются: `need` обязан
+/// влезть в чанк.
 #[inline]
 fn fallback_chunk_bytes(base_chunk: usize, need: usize, cap: usize) -> usize {
-    let m = fallback_chunk_mult();
-    let floor = if m == 1 { 0 } else { (m * 1024 * 1024).min(cap) };
+    let floor = fallback_chunk_floor();
+    let floor = if cap >= floor { floor.min(cap) } else { 0 };
     base_chunk.max(floor).max(need)
 }
 
@@ -2392,8 +2405,9 @@ impl ThreadBump {
             None => true,
         };
         if full {
-            // Размер чанка: base_chunk, но не меньше R3_FALLBACK_CHUNK_MB (если
-            // задан) — крупные редкие mmap вместо частых mmap/munmap+SpinMutex.
+            // Размер чанка: не меньше base_chunk и не меньше floor
+            // (по умолчанию 1 МБ; переопределяется R3_FALLBACK_CHUNK_MB) —
+            // крупные редкие mmap вместо частых mmap/munmap+SpinMutex.
             let alloc_size =
                 fallback_chunk_bytes(self.base_chunk, need, self.len).next_multiple_of(page);
             // Сначала пытаемся переиспользовать чанк, освобождённый этим же
@@ -5198,6 +5212,32 @@ mod tests {
     }
     fn count_scale(base: usize) -> usize {
         base / MS
+    }
+
+    /// По профилю pprof hotspot — частые `mmap`/`munmap` в `grow_fallback`:
+    /// fallback-чанки были крошечными (`base_chunk.max(need)` при
+    /// `base_chunk == 0`). Регрессия: floor по умолчанию обязан быть не меньше
+    /// 1 МБ, чтобы один mmap покрывал тысячи мелких аллокаций.
+    #[test]
+    fn fallback_chunk_bytes_default_floor_is_1mb() {
+        // Регион >= floor: чанк = min(floor, cap), а не `need` и не 0.
+        assert_eq!(
+            fallback_chunk_bytes(0, 8, 64 * 1024 * 1024),
+            DEFAULT_FALLBACK_CHUNK_BYTES
+        );
+        // need больше floor — берём need (аллокация обязана влезть в чанк).
+        assert_eq!(
+            fallback_chunk_bytes(0, 2 * 1024 * 1024, 64 * 1024 * 1024),
+            2 * 1024 * 1024
+        );
+        // base_chunk больше floor — пол не уменьшает его.
+        assert_eq!(
+            fallback_chunk_bytes(4 * 1024 * 1024, 8, 64 * 1024 * 1024),
+            4 * 1024 * 1024
+        );
+        // Маленький регион (< дефолтного floor): каппинг не применяется,
+        // поведение как историческое (тесты границ/OOM не ломаются).
+        assert_eq!(fallback_chunk_bytes(0, 8, 4096), 8);
     }
 
     /// Один bump заданного направления на `cap` байт.

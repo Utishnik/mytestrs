@@ -28,6 +28,7 @@
 #   ./bench_arena_profile.sh --fallback-chunk-mb 128
 #                                                    минимальный fallback-чанк 128 MB
 #                                                    (R3_FALLBACK_CHUNK_MB), меньше mmap/локов
+#                                                    (по умолчанию floor уже 1 MB)
 #
 # Автоматический подбор chunk size (вместо ручного --chunk-mb):
 #   ./bench_arena_profile.sh --tune        # сетка размеров -> минимум grow_fallback/mmap,
