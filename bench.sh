@@ -19,6 +19,10 @@
 #   ./bench.sh 1 "" mimalloc --quick   # мелкий бенч: только FULL/LIGHT × SMT/NO SMT
 #   ./bench.sh 1 "" mimalloc --tune    # перед прогоном: автоподбор
 #                                      # R3_ARENA_CHUNK_MB (arena_tune_scan)
+#   ./bench.sh --tune --scale 4        # автотюн на уменьшенной нагрузке
+#                                      # (итерации /4) + обычный прогон со scale=4
+#   ./bench.sh --tune --scale 4 --tune-only  # только автотюн, без основного
+#                                      # бенча (быстро получить R3_ARENA_CHUNK_MB)
 #
 # Флаги (порядок не важен):
 #   --quick  мелкий бенч (R3_BENCH_QUICK=1)
@@ -29,20 +33,67 @@
 #            R3_ARENA_CHUNK_MB для всех последующих прогонов скрипта.
 #            Тюн меряет нагрузку при текущем R3_BENCH_SCALE/R3_TUNE_ROUNDS —
 #            держите их теми же, с которыми пойдёт основной прогон.
+#   --tune-only  вместе с --tune: ограничиться авттюном (напечатать подобранный
+#            R3_ARENA_CHUNK_MB и выйти), основной бенч не запускать.
+#   --scale N  масштаб нагрузки (R3_BENCH_SCALE=N, все итерации делятся на N;
+#            по умолчанию 1). Значение экспортится ДО автотюна, поэтому тюн и
+#            основной прогон идут при одном и том же scale — подбирать чанк
+#            нужно именно под ту нагрузку, с которой он будет использоваться
+#            (уменьшение scale пропорционально уменьшает need и подобранный
+#            чанк). Принимается как "--scale 4", так и "--scale=4".
+#   --smt/--no-smt  включать ли SMT-логик-ядра (R3_BENCH_SMT=1/0, как
+#            --no-smt в bench_arena_profile.sh). Автотюн всегда меряет сетку
+#            чанков при smt=yes (как и раньше); флаги действуют на основной
+#            прогон бинаря.
 set -euo pipefail
 
 MODE="${1:-1}"
 STYLE="${2:-}"
 ALLOCATOR="${3:-mimalloc}"
-QUICK="${4:-}"
+QUICK=""
 TUNE=0
-# Флаги можно указывать в любой позиции ($4 сохранён для обратной совместимости).
+TUNE_ONLY=0
+SCALE="${R3_BENCH_SCALE:-}"
+SMT=""
+prev_flag=""
+# Флаги можно указывать в любой позиции (позиционные аргументы — первые три).
+pos=0
 for arg in "$@"; do
     case "$arg" in
         --quick) QUICK="--quick" ;;
         --tune)  TUNE=1 ;;
+        --tune-only) TUNE=1; TUNE_ONLY=1 ;;
+        --scale) SCALE="__NEXT__"; prev_flag="--scale" ;;
+        --scale=*) SCALE="${arg#--scale=}" ;;
+        --smt)    SMT=1 ;;
+        --no-smt) SMT=0 ;;
+        *)
+            # Значение, следующее сразу за `--scale`, не считается позиционным
+            # аргументом (иначе `./bench.sh --tune --scale 4` съел бы 4 как MODE).
+            if [ "$prev_flag" = "--scale" ]; then prev_flag=""; continue; fi
+            prev_flag=""
+            pos=$((pos + 1))
+            case "$pos" in
+                1) MODE="$arg" ;;
+                2) STYLE="$arg" ;;
+                3) ALLOCATOR="$arg" ;;
+            esac
+            ;;
     esac
 done
+# Если --scale указан без значения через "=" — берём следующий аргумент.
+if [ "$SCALE" = "__NEXT__" ]; then
+    prev=""
+    SCALE=""
+    for arg in "$@"; do
+        if [ "$prev" = "--scale" ]; then SCALE="$arg"; break; fi
+        prev="$arg"
+    done
+fi
+if [ -n "$SCALE" ] && ! [[ "$SCALE" =~ ^[1-9][0-9]*$ ]]; then
+    echo "bad --scale: '$SCALE' (expected: целое число >= 1)" >&2
+    exit 2
+fi
 TRIPLE="$(rustc --print host-tuple)"
 
 if [ -n "$STYLE" ]; then
@@ -51,6 +102,18 @@ fi
 
 if [ "$QUICK" = "--quick" ]; then
     export R3_BENCH_QUICK=1
+fi
+
+# Масштаб нагрузки: экспортируется ДО автотюна, чтобы тюн и основной прогон
+# мерили/использовали одну и ту же нагрузку (bench_scale() читает R3_BENCH_SCALE).
+if [ -n "$SCALE" ]; then
+    export R3_BENCH_SCALE="$SCALE"
+fi
+
+# SMT: влияет на основной прогон бинаря (get_cores(smt)); tune-скан по-прежнему
+# всегда крутит сетку при smt=yes.
+if [ -n "$SMT" ]; then
+    export R3_BENCH_SMT="$SMT"
 fi
 
 case "$ALLOCATOR" in
@@ -81,7 +144,7 @@ fi
 # (см. arena_tune_scan). Подобранное R3_ARENA_CHUNK_MB подхватывают как
 # моментальный бинарь основной прогоны, так и оба пакета (`r3`/`rustfs-bench`).
 if [ "$TUNE" = "1" ]; then
-    echo "===== autotune (arena_tune_scan: сетка R3_ARENA_CHUNK_MB -> min fallback_calls; smt=yes, style=${STYLE:-default}) ====="
+    echo "===== autotune (arena_tune_scan: сетка R3_ARENA_CHUNK_MB -> min fallback_calls; smt=yes, style=${STYLE:-default}${SCALE:+, scale=$SCALE}) ====="
     TUNE_LOG="$(mktemp "${TMPDIR:-/tmp}/r3-tune.XXXXXX")"
     # shellcheck disable=SC2064
     trap "rm -f '$TUNE_LOG'" EXIT
@@ -98,7 +161,12 @@ if [ "$TUNE" = "1" ]; then
     rm -f "$TUNE_LOG"
 
     export R3_ARENA_CHUNK_MB="$TUNED_MB"
-    echo "===== tuned: R3_ARENA_CHUNK_MB=${R3_ARENA_CHUNK_MB} MB ====="
+    echo "===== tuned: R3_ARENA_CHUNK_MB=${R3_ARENA_CHUNK_MB} MB (нагрузка тюна: scale=${SCALE:-1}, rounds=${R3_TUNE_ROUNDS:-3}) ====="
+
+    if [ "$TUNE_ONLY" = "1" ]; then
+        echo "===== done (--tune-only): основной бенч пропущен ====="
+        exit 0
+    fi
 fi
 
 for a in $ALLOCATORS; do
