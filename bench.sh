@@ -151,7 +151,11 @@ if [ "$TUNE" = "1" ]; then
     # R3_VERBOSE=1: тюн печатает статус привилегии «Lock pages in memory» и
     # факт получения huge pages каждой ареной (иначе на Windows молча
     # откатываемся на 4KB-страницы и причины не видно).
-    R3_VERBOSE=1 R3_TUNE_CHUNKS=1 cargo bench --bench arena_profile --features tune 2>&1 | tee "$TUNE_LOG"
+    # Число потоков тюна должно совпадать с основным прогоном: чанк подбирается
+    # per-thread, а суммарная память = chunk × threads. При --no-smt тюним на
+    # физических ядрах (иначе подобранное значение завышено вдвое по RAM).
+    R3_VERBOSE=1 R3_TUNE_CHUNKS=1 R3_BENCH_SMT="${R3_BENCH_SMT:-1}" \
+        cargo bench --bench arena_profile --features tune 2>&1 | tee "$TUNE_LOG"
 
     TUNED_MB="$(sed -n 's/.*chosen chunk=\([0-9]\+\) MB.*/\1/p' "$TUNE_LOG" | tail -1)"
     if [ -z "$TUNED_MB" ]; then

@@ -910,6 +910,35 @@ mod platform {
                         errno,
                         hugetlb_errno_hint(errno)
                     );
+                    // Дополнительная диагностика по /proc/meminfo: без явного
+                    // пула (HugePages_Total=0) mmap всегда вернёт ENOMEM, а
+                    // крошечный пул не даёт выделить пробу в 2 huge-страницы.
+                    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+                        let get = |key: &str| -> Option<usize> {
+                            meminfo.lines().find_map(|line| {
+                                line.strip_prefix(key)
+                                    .map(|rest| rest.trim_end())
+                                    .and_then(|rest| rest.split_whitespace().next())
+                                    .and_then(|num| num.parse::<usize>().ok())
+                            })
+                        };
+                        let total = get("HugePages_Total:").unwrap_or(0);
+                        let free = get("HugePages_Free:").unwrap_or(0);
+                        let sz_kb = get("Hugepagesize:").unwrap_or(2048);
+                        eprintln!(
+                            "  [huge] пул ядра: HugePages_Total={total}, HugePages_Free={free}, \
+                             Hugepagesize={sz_kb} KB (проба требует {} MB непрерывного пула)",
+                            (2 * sz_kb * 1024) / (1024 * 1024)
+                        );
+                        if total == 0 {
+                            eprintln!("  [huge] включение: sudo sysctl vm.nr_hugepages=512");
+                        } else if free < 2 {
+                            eprintln!(
+                                "  [huge] пул зарезервирован, но свободных страниц мало: \
+                                 увеличьте vm.nr_hugepages либо освободите память"
+                            );
+                        }
+                    }
                 }
                 false
             }
@@ -4380,8 +4409,11 @@ fn arena_need_bytes(full: bool) -> usize {
 /// итераций делятся на scale) — тюн обязан идти при том же scale, что и
 /// основной прогон, иначе подобранный чанк не будет соответствовать нагрузке.
 ///
-/// Стили (`mono`/`dispatch`/`both`) берутся из `R3_BENCH_STYLE` (как в
-/// бенчах), повторность — из `R3_TUNE_ROUNDS` (по умолчанию 3). Возвращает
+/// Стили: время прогона меряется на том стиле, который выбран `R3_BENCH_STYLE`
+/// (mono/dispatch/both), но метрика выбора (mmap + потребление) ВСЕГДА
+/// снимается с dispatch-прогона той же нагрузки — мономорфный путь не проходит
+/// через `grow_fallback`, где стоят счётчики (см. комментарий у `load`).
+/// Повторность — из `R3_TUNE_ROUNDS` (по умолчанию 3). Возвращает
 /// выбранный размер в байтах и выставляет `R3_ARENA_CHUNK_MB` для процесса,
 /// чтобы все последующие прогоны (в т.ч. pprof) использовали подобранный чанк.
 #[cfg_attr(coverage, coverage(off))]
@@ -4412,15 +4444,25 @@ pub fn arena_tune_scan(smt: bool) -> usize {
         unsafe { std::env::set_var("R3_ARENA_CHUNK_MB", (bytes / mb).max(1).to_string()) };
     };
 
+    // ВАЖНО: при скане сетки ВСЕГДА гоняем dispatch-варианты (`arena_*`),
+    // независимо от R3_BENCH_STYLE. Причина: мономорфный путь (`arena_m_*`)
+    // использует alloc_raw_m и НЕ проходит через grow_fallback, где стоят
+    // счётчики FALLBACK_MMAPS/REGION_TAKEN — при style=mono счётчики всегда
+    // показывали бы 0 mmap'ов даже для чанка в 1 MB (мусорная метрика ->
+    // выбирался минимальный кандидат сетки -> основной прогон уходил в
+    // mmap-шторм). Время прогона при этом зависит от реального пути аллокаций,
+    // поэтому mono-кандидатуры меряются только ВРЕМЕНЕМ (метрика `ms`), а по
+    // mmap/потреблению судим по dispatch-прогону той же нагрузки.
     let load = |chunk: usize| {
+        arena_full(chunk, smt);
+        arena_light(chunk, smt);
+    };
+    let load_all = |chunk: usize| {
         if run_mono {
             arena_m_full_forward(chunk, smt);
             arena_m_light_forward(chunk, smt);
         }
-        if run_dispatch {
-            arena_full(chunk, smt);
-            arena_light(chunk, smt);
-        }
+        load(chunk);
     };
 
     // Прогрев: JIT/кэш планировщика/первые страницы — первые прогоны всегда
@@ -4481,11 +4523,11 @@ pub fn arena_tune_scan(smt: bool) -> usize {
     // региона), они печатаются только как справочная информация.
     let mut results: Vec<(usize, usize, usize, f64)> = Vec::new(); // (chunk, calls, mmaps, ms)
     for &cand in &candidates {
-        load(cand); // прогрев этой конфигурации (первые страницы/кэш) — не мерим
+        load_all(cand); // прогрев этой конфигурации (первые страницы/кэш) — не мерим
         let _ = take_fallback_counters();
         let t0 = Instant::now();
         for _ in 0..rounds {
-            load(cand);
+            load_all(cand);
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3 / rounds as f64;
         let (calls, mmaps) = take_fallback_counters();
@@ -4499,12 +4541,25 @@ pub fn arena_tune_scan(smt: bool) -> usize {
         );
     }
 
+    // Потолок чанка: cap — это размер НА ПОТОК, т.е. threads×cap ≈ 80% RAM.
+    // Такой прогон уходит в свопинг/перебитие кэшей и выглядит «арена хуже
+    // mimalloc» (у mimalloc тред-локи держат только реально используемые
+    // страницы). Поэтому из zero-mmap кандидатов берём наименьший, но не
+    // больше `need` — ровно столько, сколько нагрузка потребляет за итерацию;
+    // fallback при этом остаётся нулевым (чанк >= need).
+    let chunk_cap = need.min(cap);
     // Наименьший кандидат без единого нового mmap; если таких нет — кандидат с
     // минимумом mmap (при равенстве — быстрее по времени).
     let best = results
         .iter()
-        .filter(|(_, _, mmaps, _)| *mmaps == 0)
+        .filter(|(cand, _, mmaps, _)| *mmaps == 0 && *cand <= chunk_cap)
         .min_by_key(|(cand, _, _, _)| *cand)
+        .or_else(|| {
+            results
+                .iter()
+                .filter(|(cand, _, _, _)| *cand <= chunk_cap)
+                .min_by(|a, b| a.2.cmp(&b.2).then(a.3.total_cmp(&b.3)))
+        })
         .or_else(|| {
             results
                 .iter()
@@ -4514,6 +4569,18 @@ pub fn arena_tune_scan(smt: bool) -> usize {
         .unwrap_or((need, 0, 0, 0.0));
 
     set_chunk(best.0);
+    if best.0 > cap / 2 {
+        println!(
+            "[tune] WARNING: выбран чанк {} MB/поток (суммарно ~{} MB на {} потоков) — \
+             близок к лимиту памяти {}, начнётся свопинг и арена гарантированно проиграет \
+             mimalloc. Увеличьте R3_BENCH_SCALE (меньше нагрузка -> меньше need) или \
+             уменьшите число потоков (SMT off).",
+            best.0 / mb,
+            best.0 * num_cpus::get().max(1) / mb,
+            num_cpus::get(),
+            cap / mb,
+        );
+    }
     println!(
         "[tune] need={} MB; chosen chunk={} MB (fallback_calls={}, new_mmaps={}, {:.1} ms/round); \\\n         R3_ARENA_CHUNK_MB={}",
         need / mb,
