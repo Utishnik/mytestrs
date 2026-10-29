@@ -2380,57 +2380,6 @@ impl ThreadBump {
         }
     }
 
-    /// SSO-выдача без аллокации (см. `ArenaVec::from_slice_in`): если блок из
-    /// `size + 16` байт уже помещается в текущий регион, резервируем его
-    /// bump-инкрементом и возвращаем `(ptr, size)` — вызывающий кладёт туда
-    /// короткие данные инлайн. Никакого похода в `fallback`/`SpinMutex`.
-    /// Возвращает `None`, если регион переполнен — тогда обычный путь.
-    #[inline(always)]
-    fn try_alloc_inline<const ALIGN: usize>(&self, size: usize) -> Option<(*mut u8, usize)> {
-        // Только Forward-регионы: Backward/MiddleOut имеют свою семантику
-        // lo/hi (счётчики «израсходовано с края»), их инлайн-резерв здесь
-        // не реализован — такие потоки используют обычный путь.
-        if !matches!(self.dir, BumpDir::Forward) {
-            return None;
-        }
-        let need = size + 16;
-        // Fast path единственного владельца (совпадает с alloc_raw_dir).
-        if self.neighbor_idx.is_none() && matches!(self.donor_reg, DonorReg::None) {
-            let cur = self.lo.load(Ordering::Relaxed);
-            let off = (cur + ALIGN - 1) & !(ALIGN - 1);
-            let end = off + need;
-            if end <= self.len {
-                self.lo.store(end, Ordering::Relaxed);
-                let p = unsafe { self.ptr.add(off) };
-                prefetch_write(unsafe { self.ptr.add(off + size) });
-                return Some((p, size));
-            }
-            return None;
-        }
-        let mid = if self.neighbor_idx.is_some() {
-            self.len / 2
-        } else {
-            self.len
-        };
-        loop {
-            let cur = self.lo.load(Ordering::Relaxed);
-            let off = (cur + ALIGN - 1) & !(ALIGN - 1);
-            let end = off + need;
-            if end > mid {
-                return None;
-            }
-            if self
-                .lo
-                .compare_exchange_weak(cur, end, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                let p = unsafe { self.ptr.add(off) };
-                prefetch_write(unsafe { self.ptr.add(off + size) });
-                return Some((p, size));
-            }
-        }
-    }
-
     /// Выделить совершенно новый чанк «где-то в памяти» (через платформенный
     /// аллокатор) и вернуть в нём указатель на блок `size`. Чанк сохраняется в
     /// `fallback` и освобождается в `Drop`. Адрес возвращается вызывающему — его
@@ -3260,65 +3209,13 @@ impl ZoneBump<'static> {
 //          ARENA VEC / ARENA STRING (ПОСЛЕДНИЙ РАЗДЕЛ)
 // ============================================================
 
-/// SSO (small string optimization) для байтовых векторов (`size_of::<T>() == 1`):
-/// все данные лежат в ОДНОМ непрерывном блоке, зарезервированном bump'ом
-/// (`try_alloc_inline`) при создании вектора (`with_capacity_in`/`from_slice_in`).
-/// Отдельной аллокации (и походов в `fallback`/`SpinMutex`/mmap) под каждый
-/// короткий элемент нет вовсе: горячий путь бенча
-/// `from_str_in -> alloc_raw -> grow_fallback -> SpinMutex/mmap` заменяется на
-/// чистый `store` в уже зарезервированный блок. Это прямой ответ на hotspot
-/// профиля (конкуренция за глобальный мьютекс fallback-пула).
-///
-/// SSO-вектор отличается флагом `sso`: данные лежат в `sso_base` и непрерывны
-/// на `[0..len)`, поэтому `as_slice` возвращает срез прямо в арену — ноль
-/// копий, ноль аллокаций в куче. Нулевые байты допустимы (флаг режима живёт
-/// в поле `sso`, а не в самих данных).
 struct ArenaVec<T> {
     ptr: *mut T,
     len: usize,
     cap: usize,
-    /// Флаг SSO-режима этого вектора: данные лежат в `sso_base`, а не в `ptr`.
-    /// Для не-байтовых `T` всегда `false`.
-    sso: bool,
-    /// База непрерывного inline-блока (валиден только при `sso == true`).
-    sso_base: *mut u8,
 }
 
 impl<T> ArenaVec<T> {
-    #[inline(always)]
-    fn is_sso(&self) -> bool {
-        self.sso
-    }
-
-    /// SSO-инициализация для байтовых векторов: резервирует один непрерывный
-    /// inline-блок под `capacity` значений. `None` — T не байтовый или регион
-    /// переполнен (тогда вызывающий использует обычный ареновый путь).
-    #[inline(always)]
-    fn sso_new<const ALIGN: usize>(capacity: usize, bump: &ThreadBump) -> Option<Self> {
-        if capacity == 0 || core::mem::size_of::<T>() != 1 {
-            return None;
-        }
-        let (p, _) = bump.try_alloc_inline::<ALIGN>(capacity)?;
-        Some(Self {
-            ptr: ptr::null_mut(),
-            len: 0,
-            cap: capacity,
-            sso: true,
-            sso_base: p,
-        })
-    }
-
-    /// Записать байтовое значение в inline-блок на позицию `len`
-    /// (вызывается только при `sso && len < cap`, см. `push*`).
-    #[inline(always)]
-    fn sso_write_byte(&mut self, value: T) {
-        debug_assert!(self.sso && self.len < self.cap);
-        debug_assert_eq!(core::mem::size_of::<T>(), 1);
-        unsafe {
-            *self.sso_base.add(self.len) = *(&value as *const T as *const u8);
-        }
-    }
-
     #[inline(always)]
     fn with_capacity_in<const ALIGN: usize>(capacity: usize, bump: &ThreadBump) -> Self {
         if capacity == 0 {
@@ -3326,36 +3223,18 @@ impl<T> ArenaVec<T> {
                 ptr: ptr::null_mut(),
                 len: 0,
                 cap: 0,
-                sso: false,
-                sso_base: ptr::null_mut(),
             };
-        }
-        // SSO: для байтовых векторов резервируем ОДИН непрерывный блок под все
-        // будущие значения и НЕ выделяем массив самих элементов — push пишет
-        // прямо в блок. Экономит `cap*size_of::<T>()` байт арены и, главное,
-        // каждую отдельную аллокацию (элемента/строки).
-        if let Some(v) = Self::sso_new::<ALIGN>(capacity, bump) {
-            return v;
         }
         let ptr = bump.alloc_uninit_slice::<T, ALIGN>(capacity);
         Self {
             ptr,
             len: 0,
             cap: capacity,
-            sso: false,
-            sso_base: ptr::null_mut(),
         }
     }
 
     #[inline(always)]
     fn push<const ALIGN: usize>(&mut self, value: T, bump: &ThreadBump) {
-        // SSO fast path: байтовый вектор со свободным местом в inline-блоке —
-        // пишем инлайн, без похода в арену (см. комментарий к struct `ArenaVec`).
-        if core::mem::size_of::<T>() == 1 && self.sso && self.len < self.cap {
-            self.sso_write_byte(value);
-            self.len += 1;
-            return;
-        }
         if self.len == self.cap {
             self.grow::<ALIGN>(bump);
         }
@@ -3370,45 +3249,17 @@ impl<T> ArenaVec<T> {
         T: Copy,
     {
         let len = slice.len();
-        // SSO fast path для байтовых данных: копируем в заранее
-        // зарезервированный inline-блок; обычный путь (`alloc_raw ->
-        // grow_fallback`) остаётся только при переполненном регионе.
-        if core::mem::size_of::<T>() == 1 && len > 0 {
-            let mut v = Self::with_capacity_in::<ALIGN>(len, bump);
-            v.len = len;
-            unsafe {
-                let dst = if v.sso { v.sso_base } else { v.ptr as *mut u8 };
-                ptr::copy_nonoverlapping(slice.as_ptr() as *const u8, dst, len);
-            }
-            return v;
-        }
         let ptr = bump.alloc_uninit_slice::<T, ALIGN>(len);
         unsafe {
             ptr::copy_nonoverlapping(slice.as_ptr(), ptr, len);
         }
-        Self {
-            ptr,
-            len,
-            cap: len,
-            sso: false,
-            sso_base: ptr::null_mut(),
-        }
+        Self { ptr, len, cap: len }
     }
 
     fn grow<const ALIGN: usize>(&mut self, bump: &ThreadBump) {
         let new_cap = if self.cap == 0 { 4 } else { self.cap * 2 };
         let new_ptr = bump.alloc_uninit_slice::<T, ALIGN>(new_cap);
-        if self.sso {
-            // Inline-блок исчерпан: переносим содержимое в обычный ареновый
-            // буфер (холодный путь). Данные непрерывны — это один memcpy.
-            if self.len > 0 {
-                unsafe {
-                    ptr::copy_nonoverlapping(self.sso_base as *const T, new_ptr, self.len);
-                }
-            }
-            self.sso = false;
-            self.sso_base = ptr::null_mut();
-        } else if self.len > 0 {
+        if self.len > 0 {
             unsafe {
                 ptr::copy_nonoverlapping(self.ptr, new_ptr, self.len);
             }
@@ -3429,32 +3280,19 @@ impl<T> ArenaVec<T> {
                 ptr: ptr::null_mut(),
                 len: 0,
                 cap: 0,
-                sso: false,
-                sso_base: ptr::null_mut(),
             };
-        }
-        if let Some(v) = Self::sso_new::<ALIGN>(capacity, bump) {
-            return v;
         }
         let ptr = bump.alloc_uninit_slice_m::<T, ALIGN, MODE>(capacity);
         Self {
             ptr,
             len: 0,
             cap: capacity,
-            sso: false,
-            sso_base: ptr::null_mut(),
         }
     }
 
     #[inline(always)]
     #[cfg_attr(coverage, coverage(off))]
     fn push_m<const ALIGN: usize, const MODE: u32>(&mut self, value: T, bump: &ThreadBump) {
-        // SSO fast path: зеркально `push` (см. комментарий к struct `ArenaVec`).
-        if core::mem::size_of::<T>() == 1 && self.sso && self.len < self.cap {
-            self.sso_write_byte(value);
-            self.len += 1;
-            return;
-        }
         if self.len == self.cap {
             self.grow_m::<ALIGN, MODE>(bump);
         }
@@ -3470,43 +3308,18 @@ impl<T> ArenaVec<T> {
         T: Copy,
     {
         let len = slice.len();
-        // SSO fast path: зеркально `from_slice_in` (см. комментарий там).
-        if core::mem::size_of::<T>() == 1 && len > 0 {
-            let mut v = Self::with_capacity_in_m::<ALIGN, MODE>(len, bump);
-            v.len = len;
-            unsafe {
-                let dst = if v.sso { v.sso_base } else { v.ptr as *mut u8 };
-                ptr::copy_nonoverlapping(slice.as_ptr() as *const u8, dst, len);
-            }
-            return v;
-        }
         let ptr = bump.alloc_uninit_slice_m::<T, ALIGN, MODE>(len);
         unsafe {
             ptr::copy_nonoverlapping(slice.as_ptr(), ptr, len);
         }
-        Self {
-            ptr,
-            len,
-            cap: len,
-            sso: false,
-            sso_base: ptr::null_mut(),
-        }
+        Self { ptr, len, cap: len }
     }
 
     #[cfg_attr(coverage, coverage(off))]
     fn grow_m<const ALIGN: usize, const MODE: u32>(&mut self, bump: &ThreadBump) {
         let new_cap = if self.cap == 0 { 4 } else { self.cap * 2 };
         let new_ptr = bump.alloc_uninit_slice_m::<T, ALIGN, MODE>(new_cap);
-        if self.sso {
-            // Inline-блок исчерпан: один memcpy в ареновый буфер (холодный путь).
-            if self.len > 0 {
-                unsafe {
-                    ptr::copy_nonoverlapping(self.sso_base as *const T, new_ptr, self.len);
-                }
-            }
-            self.sso = false;
-            self.sso_base = ptr::null_mut();
-        } else if self.len > 0 {
+        if self.len > 0 {
             unsafe {
                 ptr::copy_nonoverlapping(self.ptr, new_ptr, self.len);
             }
@@ -3517,15 +3330,6 @@ impl<T> ArenaVec<T> {
 
     /// Возвращает срез элементов (безопасно, если len > 0)
     fn as_slice(&self) -> &[T] {
-        // SSO: данные непрерывны в inline-блоке — возвращаем срез прямо в
-        // арену: ноль копий, ноль аллокаций в куче (см. struct `ArenaVec`).
-        // Сюда из `ArenaString::deref` валидна любая UTF-8-последовательность.
-        if self.sso && self.len > 0 {
-            debug_assert_eq!(core::mem::size_of::<T>(), 1);
-            unsafe {
-                return std::slice::from_raw_parts(self.sso_base as *const T, self.len);
-            }
-        }
         if self.len == 0 {
             return &[];
         }
@@ -3535,10 +3339,6 @@ impl<T> ArenaVec<T> {
 
 impl<T> Drop for ArenaVec<T> {
     fn drop(&mut self) {
-        // SSO-векторы содержат только байты (Copy) — drop-элементов не нужен.
-        if self.is_sso() {
-            return;
-        }
         for i in 0..self.len {
             unsafe {
                 self.ptr.add(i).drop_in_place();
@@ -5687,72 +5487,6 @@ mod tests {
     #[test]
     fn data_integrity_middleout() {
         data_integrity(BumpDir::MiddleOut);
-    }
-
-    /// SSO-вектор байтов (size_of::<T>() == 1): данные лежат непрерывно в
-    /// inline-блоке арены, `as_slice` — прямая ссылка на арену без копий и
-    /// без аллокаций в куче. Нулевые байты допустимы; push сверх capacity
-    /// переносит данные в обычный ареновый буфер (grow/промоушен).
-    #[test]
-    fn arena_vec_sso_bytes_zero_copy_nul_and_grow_promotion() {
-        let (_arena, bump) = make_one(BumpDir::Forward, 1 << 20);
-
-        // Короткие данные с нулевыми байтами — прямо в inline-блоке.
-        let raw: [u8; 5] = [0, 1, 0, 255, 7];
-        let mut v: ArenaVec<u8> = ArenaVec::with_capacity_in::<1>(8, &bump);
-        for b in raw {
-            v.push::<1>(b, &bump);
-        }
-        assert!(v.is_sso(), "байтовый вектор обязан попасть в inline-блок");
-        assert_eq!(v.as_slice(), &raw);
-
-        // Push сверх capacity: grow переносит содержимое в ареновый буфер.
-        let mut v: ArenaVec<u8> = ArenaVec::with_capacity_in::<1>(4, &bump);
-        for b in raw {
-            v.push::<1>(b, &bump);
-        }
-        for i in 0..64u8 {
-            v.push::<1>(i, &bump);
-        }
-        assert!(
-            !v.is_sso(),
-            "после переполнения данные обязаны переехать в арену"
-        );
-        assert_eq!(v.as_slice()[..5], raw);
-        assert_eq!(v.as_slice()[5..], (0..64).collect::<Vec<u8>>());
-
-        // from_slice_in (путь ArenaString::from_str_in) тоже попадает в SSO.
-        let s = ArenaVec::from_slice_in::<1>(&raw, &bump);
-        assert!(s.is_sso());
-        assert_eq!(s.as_slice(), &raw);
-    }
-
-    /// Мономорфные версии SSO (with_capacity_in_m/push_m/from_slice_in_m) и
-    /// пограничные строки ArenaString: пустая, с нулевым байтом, UTF-8.
-    #[test]
-    fn arena_vec_sso_mono_and_edge_strings() {
-        const M: u32 = ThreadBump::MODE_DIR_FORWARD;
-        let (_arena, bump) = make_one(BumpDir::Forward, 1 << 20);
-
-        let mut v: ArenaVec<u8> = ArenaVec::with_capacity_in_m::<1, M>(2, &bump);
-        v.push_m::<1, M>(0, &bump); // нулевой байт не ломает SSO
-        for i in 9..24u8 {
-            v.push_m::<1, M>(i, &bump);
-        }
-        assert!(v.as_slice()[0] == 0);
-        assert_eq!(v.as_slice()[1..], (9..24).collect::<Vec<u8>>());
-
-        let f: ArenaVec<u8> = ArenaVec::from_slice_in_m::<1, M>(&[0, 9, 0], &bump);
-        assert!(f.is_sso());
-        assert_eq!(f.as_slice(), &[0, 9, 0]);
-
-        // Пустая строка, строка с нулевым байтом и UTF-8 — через Deref.
-        let e = ArenaString::from_str_in("", &bump);
-        assert_eq!(&*e, "");
-        let s = ArenaString::from_str_in("a\0b", &bump);
-        assert_eq!(&*s, "a\0b");
-        let sm = ArenaString::from_str_in_m::<M>("Привет", &bump);
-        assert_eq!(&*sm, "Привет");
     }
 
     #[test]
