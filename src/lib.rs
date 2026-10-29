@@ -433,7 +433,7 @@ impl DonorPolicy {
 
 #[cfg(windows)]
 mod platform {
-    use super::{RawAllocation, verbose_enabled};
+    use super::{huge_enabled, RawAllocation, verbose_enabled};
     use std::ptr;
     use std::sync::OnceLock;
     use windows_sys::Win32::Foundation::{
@@ -452,9 +452,10 @@ mod platform {
     // unused_imports. Атрибуты внутри use-списка запрещены синтаксисом Rust,
     // поэтому выносим в отдельные import'ы.
     #[cfg(not(miri))]
-    use windows_sys::Win32::System::SystemInformation::{
-        GetLargePageMinimum, GetSystemInfo, SYSTEM_INFO,
-    };
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    // GetLargePageMinimum живёт в Win32_System_Memory (попал сюда через
+    // glob-импорт `Memory::*` выше), а НЕ в SystemInformation — прямой
+    // импорт оттуда ломает сборку на Windows (E0432).
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     /// Включаем SeLockMemoryPrivilege ("Lock pages in memory"), если она
@@ -4479,7 +4480,10 @@ pub fn arena_tune_scan(smt: bool) -> usize {
     let cap = pgo_chunk_cap().max(mb);
     let style = bench_style();
     let run_mono = style != BenchStyle::Dispatch;
-    let run_dispatch = style != BenchStyle::Mono;
+    // dispatch-нагрузки (`load`) гоняются ВСЕГДА (см. комментарий у `load_all`:
+    // по mmap-счётчикам судим только по dispatch-прогону), поэтому отдельный
+    // флаг `run_dispatch` нигде не читается — `_`, чтобы не шуметь warning'ом.
+    let _run_dispatch = style != BenchStyle::Mono;
     let rounds = std::env::var("R3_TUNE_ROUNDS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
