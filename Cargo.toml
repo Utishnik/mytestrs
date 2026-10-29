@@ -35,6 +35,18 @@ hotpath-cpu = ["hotpath/hotpath-cpu"]
 # в чужом контексте (working-set lock, чужая NUMA-нода) и это даёт
 # регрессию. Включается явно: `cargo build --features win-prefetch-pages`.
 win-prefetch-pages = []
+# Huge pages + prefault (трогание памяти). ВЫКЛЮЧЕН по умолчанию.
+# Включение: `cargo build --features huge` (compile-time) ИЛИ
+# `R3_HUGE=1` (runtime, работает и в бинаре без фичи).
+# При активной фиче:
+#   * арены запрашивают huge pages (MAP_HUGETLB / MEM_LARGE_PAGES),
+#     если ОС их даёт;
+#   * prefault (first-touch трогание страниц региона в своей NUMA-ноде,
+#     MADV_POPULATE_WRITE / touch-loop) выполняется только для регионов,
+#     реально лежащих на huge pages.
+# Без фичи и без R3_HUGE=1: обычные 4KB-страницы, prefault не выполняется
+# вообще (в т.ч. блоки hotpath "prefault" не создаются).
+huge = []
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

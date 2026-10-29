@@ -197,6 +197,28 @@ pub fn take_fallback_mmaps() -> usize {
 /// вызовов и очередей за глобальным пулом чанков.
 const DEFAULT_FALLBACK_CHUNK_BYTES: usize = 1024 * 1024;
 
+/// Активна ли возможность huge pages: compile-time фича cargo `huge`
+/// (`cargo build --features huge`) ИЛИ runtime-переменная `R3_HUGE=1`.
+///
+/// Фича управляет двумя связанными поведениями:
+///   * арены запрашивают huge pages (MAP_HUGETLB / MEM_LARGE_PAGES),
+///     если ОС их даёт;
+///   * prefault (трогание памяти) выполняется только при активной фиче —
+///     и то лишь для регионов, реально лежащих на huge pages.
+///
+/// Runtime-переменная работает и в бинаре, собранном без фичи (порог
+/// `R3_HUGE=0` не включает режим). Результат кешируется в `OnceLock`:
+/// переменная окружения читается один раз за процесс.
+fn huge_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "huge")
+            || std::env::var("R3_HUGE")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+    })
+}
+
 /// Floor размера fallback-чанка в байтах из `R3_FALLBACK_CHUNK_MB` (см.
 /// `fallback_chunk_bytes`). Значение по умолчанию — 1 МБ
 /// (`DEFAULT_FALLBACK_CHUNK_BYTES`); env задаёт явный пол, если нужен другой.
@@ -503,6 +525,11 @@ mod platform {
 
     #[cfg_attr(coverage, coverage(off))]
     pub fn try_alloc_huge(size: usize) -> Option<RawAllocation> {
+        // Huge pages активны только при feature `huge` или R3_HUGE=1
+        // (см. `huge_enabled`).
+        if !huge_enabled() {
+            return None;
+        }
         // Под Miri нет шимов для Windows-привилегий (AdjustTokenPrivileges и
         // др.), поэтому huge-страницы просто не пытаемся — упадём на обычный
         // VirtualAlloc через alloc_normal.
@@ -752,11 +779,16 @@ mod platform {
 
 #[cfg(unix)]
 mod platform {
-    use super::RawAllocation;
+    use super::{huge_enabled, RawAllocation};
     use std::ptr;
     use std::sync::OnceLock;
 
     pub fn try_alloc_huge(size: usize) -> Option<RawAllocation> {
+        // Huge pages активны только при feature `huge` или R3_HUGE=1
+        // (см. `huge_enabled`).
+        if !huge_enabled() {
+            return None;
+        }
         if cfg!(miri) {
             // Под Miri huge pages не моделируем: MAP_HUGETLB не поддержан.
             return None;
@@ -1035,24 +1067,31 @@ impl SharedArena {
     fn new(total_capacity: usize) -> Self {
         // Размер под huge pages должен быть КРАТЕН huge_page_size(), иначе
         // MEM_LARGE_PAGES / MAP_HUGETLB молча не срабатывают и регион
-        // выделяется обычными 4KB-страницами. Округляем только для крупных
+        // выделяется обычными 4KB-страницами. Округляем только при активной
+        // фиче huge (feature `huge` или R3_HUGE=1) и только для крупных
         // арен (мелкие и так не получают huge pages и должны сохранять
-        // точный размер — иначе ломаются тесты границ/OOM); на Windows округляем
-        // всегда, т.к. проба доступности large pages там стоит одного syscall.
+        // точный размер — иначе ломаются тесты границ/OOM); на Windows
+        // округляем всегда при активной фиче, т.к. проба доступности large
+        // pages там стоит одного syscall.
+        let huge_on = huge_enabled();
         let huge = platform::huge_page_size();
         let round_up = if cfg!(windows) {
             true
         } else {
             total_capacity >= huge
         };
-        let cap = if round_up && huge.is_power_of_two() && total_capacity > 0 {
+        let cap = if huge_on && round_up && huge.is_power_of_two() && total_capacity > 0 {
             total_capacity.next_multiple_of(huge)
         } else {
             total_capacity
         };
         let alloc = platform::try_alloc_huge(cap).unwrap_or_else(|| platform::alloc_normal(cap));
-        // Best-effort THP (Linux): работает без резервирования явных huge pages.
-        platform::advise_huge(alloc.ptr, alloc.size);
+        // Best-effort THP (Linux): работает без резервирования явных huge
+        // pages. Только при активной фиче huge — иначе регион остаётся на
+        // обычных страницах и prefault его не трогает (см. prefault_local).
+        if huge_on {
+            platform::advise_huge(alloc.ptr, alloc.size);
+        }
 
         // Диагностика: если при включённой привилегии «Lock pages in memory»
         // арена всё равно легла на 4KB-страницы — виноваты не права, а либо
@@ -2592,10 +2631,17 @@ impl ThreadBump {
 
     /// First-touch: фолтим страницы ИСПОЛЬЗОВАННЫХ областей из текущего
     /// потока, чтобы они легли в локальную NUMA-ноду.
+    ///
+    /// Выполняется ТОЛЬКО при активной фиче huge (cargo-фича `huge` или
+    /// runtime-переменная `R3_HUGE=1`) и только для регионов, реально
+    /// лежащих на huge pages: без фичи память остаётся на обычных
+    /// 4KB-страницах и трогание не выполняется вовсе (demand paging делает
+    /// ядро по мере записи). На Windows large pages физически резерируются
+    /// уже в VirtualAlloc — там prefault не нужен даже с включённой фичей.
     #[hotpath::measure]
     #[cfg_attr(coverage, coverage(off))]
     fn prefault_local(&self) {
-        if self.is_huge && platform::large_pages_precommitted() {
+        if !huge_enabled() || !self.is_huge || platform::large_pages_precommitted() {
             return;
         }
         let (lo, hi) = (
@@ -3809,9 +3855,14 @@ fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
             let core = *core_id;
             sc.spawn(move || {
                 core_affinity::set_for_current(core);
-                hotpath::measure_block!("prefault", {
-                    bump.prefault_local(); // first-touch Р Р† Р В»Р С•Р С”Р В°Р В»РЎРЉР Р…Р С•Р в„– NUMA-Р Р…Р С•Р Т‘Р Вµ
-                });
+                // Prefault (трогание памяти) — только при активной фиче huge
+                // (feature `huge` или R3_HUGE=1): иначе страницы региона ядро
+                // фолтит само по мере записи (demand paging).
+                if huge_enabled() {
+                    hotpath::measure_block!("prefault", {
+                        bump.prefault_local(); // first-touch в своей NUMA-ноде
+                    });
+                }
                 for _ in 0..(3 / scale).max(1) {
                     hotpath::measure_block!("alloc", {
                         // Выделение — по заимствованию гуарда (`&bump`).
@@ -3858,9 +3909,13 @@ fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
 fn arena_run_thread<const MODE: u32, const FULL: bool>(bump: &mut BumpGuard<'_, ThreadBump>) {
     // Выделение — по `&bump` (заимствование гуарда, авто-deref до
     // `&ThreadBump`), `reset` в конце каждой итерации — по `&mut bump`.
-    hotpath::measure_block!("prefault", {
-        bump.prefault_local(); // first-touch Р Р† Р В»Р С•Р С”Р В°Р В»РЎРЉР Р…Р С•Р в„– NUMA-Р Р…Р С•Р Т‘Р Вµ
-    });
+    // Prefault (трогание памяти) — только при активной фиче huge
+    // (feature `huge` или R3_HUGE=1).
+    if huge_enabled() {
+        hotpath::measure_block!("prefault", {
+            bump.prefault_local(); // first-touch в своей NUMA-ноде
+        });
+    }
     let (vcap, outer, inner) = if FULL {
         (40000, 200, 200)
     } else {
@@ -4877,12 +4932,22 @@ pub fn run() {
     println!("Логических ядер: {}", all_cores.len());
     println!("Физических ядер: {}", num_cpus::get_physical());
     println!("Глобальный аллокатор: {}", allocator_label());
-    let huge_ok = platform::large_pages_available();
+    let huge_on = huge_enabled();
+    // Проба доступности huge pages имеет смысл только при активной фиче
+    // huge (feature `huge` или R3_HUGE=1): без неё huge-аллоки не
+    // запрашиваются, и prefault (трогание памяти) не выполняется.
+    let huge_ok = huge_on && platform::large_pages_available();
     println!(
         "Страницы: {} KB / huge pages {} MB: {}",
         platform::page_size() / 1024,
         platform::huge_page_size() / (1024 * 1024),
-        if huge_ok { "доступны" } else { "нет" }
+        if huge_ok {
+            "доступны"
+        } else if !huge_on {
+            "выключены (--features huge или R3_HUGE=1)"
+        } else {
+            "нет"
+        }
     );
     #[cfg(windows)]
     if !huge_ok {
