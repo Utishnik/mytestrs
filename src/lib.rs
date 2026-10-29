@@ -148,13 +148,13 @@ static REGION_TAKEN: AtomicUsize = AtomicUsize::new(0);
 
 /// Прочитать и обнулить накопленное потребление регионов (см. `REGION_TAKEN`).
 #[cfg(feature = "tune")]
-pub fn take_region_taken() -> usize {
+pub fn take_region_used() -> usize {
     REGION_TAKEN.swap(0, Ordering::Relaxed)
 }
 
-/// Заглушка без фичи `tune` (см. `take_region_taken`).
+/// Заглушка без фичи `tune` (см. `take_region_used`).
 #[cfg(not(feature = "tune"))]
-pub fn take_region_taken() -> usize {
+pub fn take_region_used() -> usize {
     0
 }
 
@@ -4297,6 +4297,57 @@ pub fn profile_arena_chunk_size_light() -> usize {
 //                        УТИЛИТЫ
 // ============================================================
 
+/// Точный замер потребления одного потока за ОДНУ итерацию нагрузки арены
+/// (байты) — без PGO-маржи и без каппинга через `pgo_chunk_cap()`.
+///
+/// В отличие от `profile_arena_chunk_size_*` здесь нет ни округления до МБ,
+/// ни `/2`, ни `.min(cap)`: возвращается сытое пиковое потребление региона
+/// (`allocated_bytes()`), т.е. ровно тот размер чанка, при котором поток
+/// живёт без единого обращения в `grow_fallback`. Это нужно автоподбору:
+/// маржа/каппинг профильных функций занижали `need` (вдвое!) и он мог
+/// оказаться меньше реального потребления — выбранный чанк не покрывал
+/// нагрузку.
+///
+/// Нагрузку масштабирует `bench_scale()` (как и сами бенчи): при
+/// `R3_BENCH_SCALE=N` итерации делятся на N, поэтому и потребление меряется
+/// для той же нагрузки, с которой потом гоняется основной прогон.
+///
+/// Возвращает максимум из двух прогонов (первый греет кэш/страницы).
+#[cfg_attr(coverage, coverage(off))]
+fn arena_need_bytes(full: bool) -> usize {
+    let s = bench_scale();
+    let mut best = 0usize;
+    for _ in 0..2 {
+        // Чанк заведомо больше потребления: fallback не срабатывает вовсе,
+        // поэтому allocated_bytes() = точное потребление итерации.
+        let arena = SharedArena::new(1024 * 1024 * 1024);
+        let bumps = arena.split_safe(1);
+        let bump = &bumps[0];
+        let (vcap, outer, inner) = if full { (40000, 200, 200) } else { (10000, 100, 100) };
+
+        let mut vectr: ArenaVec<ArenaVec<ArenaString>> = ArenaVec::with_capacity_in::<
+            { core::mem::align_of::<ArenaVec<ArenaString>>() },
+        >(vcap / s, bump);
+        for _ in 0..(outer / s).max(1) {
+            for _ in 0..(inner / s).max(1) {
+                let mut vec: ArenaVec<ArenaString> =
+                    ArenaVec::with_capacity_in::<{ core::mem::align_of::<ArenaString>() }>(400, bump);
+                for _ in 0..(100 / s).max(1) {
+                    vec.push::<{ core::mem::align_of::<ArenaString>() }>(
+                        ArenaString::from_str_in("stroka", bump),
+                        bump,
+                    );
+                }
+                vectr.push::<{ core::mem::align_of::<ArenaVec<ArenaString>>() }>(vec, bump);
+            }
+        }
+        best = best.max(bump.allocated_bytes());
+        core::hint::black_box(&vectr);
+        drop(vectr);
+    }
+    best.max(1024 * 1024)
+}
+
 /// Автоматический подбор per-thread размера чанка арены (`R3_ARENA_CHUNK_MB`).
 ///
 /// Диагноз по профилю: самые горячие места — `mmap`/`munmap` внутри
@@ -4310,14 +4361,24 @@ pub fn profile_arena_chunk_size_light() -> usize {
 ///    (`pgo_chunk_cap()`), т.е. самый маленький кандидат сетки.
 ///
 /// Затем сеткой кандидатов (geometric от need/2 до cap, ~2x шаг) замеряется
-/// число обращений в `grow_fallback` (счётчик `FALLBACK_CALLS`, фича `tune`) и
-/// время прогона: каждая кандидатура реально гоняет бенч со своим чанком
-/// (бенч-функции берут размер аргументом). Итог: наименьший чанк с нулём
-/// fallback-вызовов — ровно столько, чтобы покрыть need без запасных mmap;
-/// если даже cap не убирает fallback полностью (need > cap — нагрузка больше
-/// лимита памяти), берётся кандидат с минимумом fallback-вызовов.
+/// число РЕАЛЬНЫХ новых mmap-чанков (`FALLBACK_MMAPS`, фича `tune`) и время
+/// прогона: каждая кандидатура реально гоняет бенч со своим чанком (бенч-
+/// функции берут размер аргументом). Метрика именно `mmap`, а не все обращения
+/// в `grow_fallback`: после каждого `reset()` региона первый аллок и при
+/// идеальном чанке заходит в `grow_fallback` (место находится в уже
+/// существующем fallback-чанке без системного вызова), поэтому «нулём calls»
+/// нельзя было бы достичь никогда — выбирался бы всегда `cap`. Нулевые же
+/// `mmap` означают, что регион+выделенный один раз fallback-чанк покрывают
+/// нагрузку целиком.
+/// Итог: наименьший чанк с нулём новых mmap; если даже `cap` не убирает их
+/// полностью (need > cap — нагрузка больше лимита памяти), берётся кандидат с
+/// минимумом mmap (при равенстве — быстрее).
 /// Точки ниже need/2 в сетку не включаются: потребление итерации там превышает
 /// чанк, fallback гарантирован — такие точки только тратят время (mmap-шторм).
+///
+/// Нагрузку для замера `need` и для скана задаёт `R3_BENCH_SCALE` (все границы
+/// итераций делятся на scale) — тюн обязан идти при том же scale, что и
+/// основной прогон, иначе подобранный чанк не будет соответствовать нагрузке.
 ///
 /// Стили (`mono`/`dispatch`/`both`) берутся из `R3_BENCH_STYLE` (как в
 /// бенчах), повторность — из `R3_TUNE_ROUNDS` (по умолчанию 3). Возвращает
@@ -4368,27 +4429,26 @@ pub fn arena_tune_scan(smt: bool) -> usize {
     load(cap);
 
     // --- Замер need: сколько байт потребляет одна итерация нагрузки --------
-    // `profile_arena_chunk_size_*` гоняют ровно ту же нагрузку, что и бенчи
-    // (full 200x200 / light 100x100), в один поток при чанке 1 GB — fallback
-    // там не срабатывает вовсе, поэтому `allocated_bytes()` = точное пиковое
-    // потребление за итерацию. Возврат этих функций уже округлён до МБ;
-    // суммируем full+light (поток за прогон делает оба).
-    // ВАЖНО: override из R3_ARENA_CHUNK_MB имеет приоритет внутри этих функций
-    // (они возвращают его, не измеряя нагрузку) — на время замера переменную
-    // нужно убрать, иначе need станет равен текущему кандидату/оверрайду.
+    // Профильные функции PGO (`profile_arena_chunk_size_*`) для этого НЕ годятся:
+    // они применяют маржу, округление до МБ, `/2` и каппинг через
+    // `pgo_chunk_cap()`, т.е. возвращают вдвое заниженное значение — при таком
+    // `need` выбранный чанк не покрывал реальную нагрузку и основной прогон
+    // уходил в mmap-шторм. Здесь меряется сытое пиковое потребление региона за
+    // одну итерацию (тот же профиль нагрузки, что в бенчах, один поток, чанк
+    // 1 GB — fallback не срабатывает вовсе).
+    // Суммируем full+light: за один `load()` поток (фактически — каждый поток)
+    // выполняет обе нагрузки; запас сверху даёт `grid_lo = need/2` в сетке.
+    // ВАЖНО: override из R3_ARENA_CHUNK_MB на время замера убираем — точечный
+    // замер его не читает, но так безопаснее (никакие побочные пути не увидят
+    // промежуточное значение переменной).
     let prev_override = std::env::var("R3_ARENA_CHUNK_MB").ok();
     unsafe { std::env::remove_var("R3_ARENA_CHUNK_MB") };
-    let need_raw = profile_arena_chunk_size_full() + profile_arena_chunk_size_light();
+    let need_raw = arena_need_bytes(true) + arena_need_bytes(false);
     match prev_override {
         Some(v) => unsafe { std::env::set_var("R3_ARENA_CHUNK_MB", v) },
         None => {}
     }
-    // Профильные функции уже применяют маржу (115%) и каппят результат через
-    // `pgo_chunk_cap()` — повторное округление/каппинг здесь не нужен: второй
-    // round_up_mb только завышал бы need, а cap делал need == cap, из-за чего
-    // сетка теряла смысл и выбирался минимальный чанк (mmap-шторм в основном
-    // прогоне).
-    let need = need_raw.max(mb);
+    let need = round_up_mb(need_raw.max(mb));
 
     // --- Сетка кандидатов: geometric ~2x до cap ----------------------------
     // Точки ниже need/2 гарантированно дают fallback (потребление итерации
@@ -4415,45 +4475,52 @@ pub fn arena_tune_scan(smt: bool) -> usize {
     // бенч-пути не читается — рано и поздно его применяют только
     // `profile_arena_chunk_size_*`), поэтому кандидат передаётся напрямую.
     // `set_chunk` остаётся только для финального экспорта выбранного значения.
-    // Счётчик fallback-вызовов обнуляем непосредственно перед замером каждой
-    // кандидатуры.
-    let mut results: Vec<(usize, usize, f64)> = Vec::new(); // (chunk, fb_calls, ms)
+    // Счётчики обнуляем непосредственно перед замером каждой кандидатуры.
+    // Метрика выбора — НОВЫЕ mmap-чанки (`FALLBACK_MMAPS`): обращения в
+    // `grow_fallback` (`FALLBACK_CALLS`) есть всегда (первый аллок после reset
+    // региона), они печатаются только как справочная информация.
+    let mut results: Vec<(usize, usize, usize, f64)> = Vec::new(); // (chunk, calls, mmaps, ms)
     for &cand in &candidates {
         load(cand); // прогрев этой конфигурации (первые страницы/кэш) — не мерим
-        let _ = take_fallback_calls();
+        let _ = take_fallback_counters();
         let t0 = Instant::now();
         for _ in 0..rounds {
             load(cand);
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3 / rounds as f64;
-        let calls = take_fallback_calls();
-        results.push((cand, calls, ms));
+        let (calls, mmaps) = take_fallback_counters();
+        results.push((cand, calls, mmaps, ms));
         println!(
-            "[tune] chunk={:>5} MB  fallback_calls={:<6}  {:.1} ms/round",
+            "[tune] chunk={:>5} MB  fallback_calls={:<6} new_mmaps={:<5} {:.1} ms/round",
             cand / mb,
             calls,
+            mmaps,
             ms
         );
     }
 
-    // Наименьший кандидат без единого fallback-вызова; если таких нет —
-    // кандидат с минимумом вызовов (при равенстве — быстрее по времени).
+    // Наименьший кандидат без единого нового mmap; если таких нет — кандидат с
+    // минимумом mmap (при равенстве — быстрее по времени).
     let best = results
         .iter()
-        .filter(|(_, calls, _)| *calls == 0)
-        .min_by_key(|(cand, _, _)| *cand)
-        .or_else(|| results.iter().min_by(|a, b| a.1.cmp(&b.1).then(a.2.total_cmp(&b.2))))
-        .map(|&(cand, calls, ms)| (cand, calls, ms))
-        .unwrap_or((need, 0, 0.0));
+        .filter(|(_, _, mmaps, _)| *mmaps == 0)
+        .min_by_key(|(cand, _, _, _)| *cand)
+        .or_else(|| {
+            results
+                .iter()
+                .min_by(|a, b| a.2.cmp(&b.2).then(a.3.total_cmp(&b.3)))
+        })
+        .map(|&(cand, calls, mmaps, ms)| (cand, calls, mmaps, ms))
+        .unwrap_or((need, 0, 0, 0.0));
 
     set_chunk(best.0);
     println!(
-        "[tune] need={} MB; chosen chunk={} MB (fallback_calls={}, {:.1} ms/round); \
-         R3_ARENA_CHUNK_MB={}",
+        "[tune] need={} MB; chosen chunk={} MB (fallback_calls={}, new_mmaps={}, {:.1} ms/round); \\\n         R3_ARENA_CHUNK_MB={}",
         need / mb,
         best.0 / mb,
         best.1,
         best.2,
+        best.3,
         best.0 / mb
     );
     best.0
