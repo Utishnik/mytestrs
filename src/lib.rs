@@ -4262,6 +4262,11 @@ pub fn arena_tune_scan(smt: bool) -> usize {
 
     // `arena_tune_scan` вызывается из главного потока бенча до старта остальных
     // потоков, поэтому изменение env безопасно (Rust 2024: `set_var` — unsafe).
+    println!(
+        "[tune] нагрузка: R3_BENCH_SCALE={} (итерации делятся на scale), rounds={}",
+        bench_scale(),
+        rounds
+    );
     let set_chunk = |bytes: usize| {
         // SAFETY: единственный поток в этот момент; другие потоки читают env
         // только после того, как скан завершится.
