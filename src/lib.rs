@@ -4231,12 +4231,15 @@ pub fn profile_arena_chunk_size_light() -> usize {
 ///  * **floor** — минимальный размер, который ещё влезает в лимит памяти
 ///    (`pgo_chunk_cap()`), т.е. самый маленький кандидат сетки.
 ///
-/// Затем сеткой кандидатов (geometric 1 MB .. cap, ~2x шаг) замеряется число
-/// обращений в `grow_fallback` (счётчик `FALLBACK_CALLS`, фича `tune`) и время
-/// прогона. Итог: наименьший чанк с нулём fallback-вызовов — ровно столько,
-/// чтобы покрыть need без запасных mmap; если даже floor не убирает fallback
-/// полностью (need > cap — нагрузка больше лимита памяти), берётся candidate с
-/// минимумом fallback-вызовов.
+/// Затем сеткой кандидатов (geometric от need/2 до cap, ~2x шаг) замеряется
+/// число обращений в `grow_fallback` (счётчик `FALLBACK_CALLS`, фича `tune`) и
+/// время прогона: каждая кандидатура реально гоняет бенч со своим чанком
+/// (бенч-функции берут размер аргументом). Итог: наименьший чанк с нулём
+/// fallback-вызовов — ровно столько, чтобы покрыть need без запасных mmap;
+/// если даже cap не убирает fallback полностью (need > cap — нагрузка больше
+/// лимита памяти), берётся кандидат с минимумом fallback-вызовов.
+/// Точки ниже need/2 в сетку не включаются: потребление итерации там превышает
+/// чанк, fallback гарантирован — такие точки только тратят время (mmap-шторм).
 ///
 /// Стили (`mono`/`dispatch`/`both`) берутся из `R3_BENCH_STYLE` (как в
 /// бенчах), повторность — из `R3_TUNE_ROUNDS` (по умолчанию 3). Возвращает
@@ -4265,21 +4268,21 @@ pub fn arena_tune_scan(smt: bool) -> usize {
         unsafe { std::env::set_var("R3_ARENA_CHUNK_MB", (bytes / mb).max(1).to_string()) };
     };
 
-    let load = || {
+    let load = |chunk: usize| {
         if run_mono {
-            arena_m_full_forward(cap, smt);
-            arena_m_light_forward(cap, smt);
+            arena_m_full_forward(chunk, smt);
+            arena_m_light_forward(chunk, smt);
         }
         if run_dispatch {
-            arena_full(cap, smt);
-            arena_light(cap, smt);
+            arena_full(chunk, smt);
+            arena_light(chunk, smt);
         }
     };
 
     // Прогрев: JIT/кэш планировщика/первые страницы — первые прогоны всегда
-    // шумные, их не меряем.
-    load();
-    load();
+    // шумные, их не меряем. Гоняем с cap — самый тяжёлый по памяти конфиг.
+    load(cap);
+    load(cap);
 
     // --- Замер need: сколько байт потребляет одна итерация нагрузки --------
     // `profile_arena_chunk_size_*` гоняют ровно ту же нагрузку, что и бенчи
@@ -4304,12 +4307,17 @@ pub fn arena_tune_scan(smt: bool) -> usize {
     // прогоне).
     let need = need_raw.max(mb);
 
-    // --- Сетка кандидатов: geometric ~2x от 1 MB до cap --------------------
+    // --- Сетка кандидатов: geometric ~2x до cap ----------------------------
+    // Точки ниже need/2 гарантированно дают fallback (потребление итерации
+    // need > чанка), т.е. ничего полезного не измеряют — только mmap-шторм и
+    // потраченное время (на scale=1 это были десятки секунд на ROUND).
+    // Стартуем с need/2 (минимум 1 MB); need в сетке добавляется ниже.
+    let grid_lo = (need / 2).max(mb);
     let mut candidates: Vec<usize> = Vec::new();
-    let mut c = mb;
+    let mut c = grid_lo;
     while c < cap {
         candidates.push(c);
-        c *= 2;
+        c = c.saturating_mul(2);
     }
     candidates.push(cap);
     // need обязано быть в сетке: именно оно гарантированно убирает fallback.
@@ -4320,18 +4328,19 @@ pub fn arena_tune_scan(smt: bool) -> usize {
     candidates.dedup();
 
     // --- Сканирование -------------------------------------------------------
-    // Функции арены читают override при создании SharedArena, так что смена
-    // env между конфигурациями действует сразу (см. arena_chunk_override).
-    // Прогон с заведомо малым чанком тоже даёт fallback-вызовы — счётчик
-    // обнуляем непосредственно перед замером каждой кандидатуры.
+    // Бенч-функции берут размер чанка аргументом (env `R3_ARENA_CHUNK_MB` в
+    // бенч-пути не читается — рано и поздно его применяют только
+    // `profile_arena_chunk_size_*`), поэтому кандидат передаётся напрямую.
+    // `set_chunk` остаётся только для финального экспорта выбранного значения.
+    // Счётчик fallback-вызовов обнуляем непосредственно перед замером каждой
+    // кандидатуры.
     let mut results: Vec<(usize, usize, f64)> = Vec::new(); // (chunk, fb_calls, ms)
     for &cand in &candidates {
-        set_chunk(cand);
-        load(); // прогрев этой конфигурации (первые страницы/кэш) — не мерим
+        load(cand); // прогрев этой конфигурации (первые страницы/кэш) — не мерим
         let _ = take_fallback_calls();
         let t0 = Instant::now();
         for _ in 0..rounds {
-            load();
+            load(cand);
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3 / rounds as f64;
         let calls = take_fallback_calls();
