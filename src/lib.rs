@@ -430,13 +430,20 @@ mod platform {
     // unused_imports. Атрибуты внутри use-списка запрещены синтаксисом Rust,
     // поэтому выносим в отдельные import'ы.
     #[cfg(not(miri))]
-    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLargePageMinimum, GetSystemInfo, SYSTEM_INFO,
+    };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     /// Включаем SeLockMemoryPrivilege ("Lock pages in memory"), если она
     /// выдана процессу в локальной политике безопасности. Без неё
     /// VirtualAlloc(MEM_LARGE_PAGES) не работает, и мы молча откатываемся
     /// на обычные 4KB страницы.
+    ///
+    /// ВАЖНО: право входит в токен процесса только при логине. Если привилегию
+    /// включили в secpol.msc уже после запуска терминала, токен не обновится —
+    /// нужен перезапуск сессии (для WSL: `wsl --shutdown` и повторный вход,
+    /// для нативной консоли — новое окно/перелогин).
     #[cfg_attr(coverage, coverage(off))]
     fn enable_lock_memory_privilege() {
         unsafe {
@@ -627,16 +634,33 @@ mod platform {
         4096
     }
 
-    /// Минимальный размер large page (обычно 2 MB).
+    /// Минимальный размер large page (обычно 2 MB). `GetLargePageMinimum()`
+    /// возвращает 0, если система large pages не поддерживает (например, CPU
+    /// без PSE или гипервизор без этой возможности), поэтому нормализуем в
+    /// обычный размер страницы — иначе округление до кратности 0 ломает арены.
     #[cfg(not(miri))]
     pub fn huge_page_size() -> usize {
         static HUGE: OnceLock<usize> = OnceLock::new();
-        *HUGE.get_or_init(|| unsafe { GetLargePageMinimum() })
+        *HUGE.get_or_init(|| {
+            let min = unsafe { GetLargePageMinimum() };
+            if min == 0 {
+                page_size()
+            } else {
+                min as usize
+            }
+        })
     }
 
     #[cfg(miri)]
     pub fn huge_page_size() -> usize {
         2 * 1024 * 1024
+    }
+
+    /// Размер пробы доступности large pages: 2 x huge_page_size() (обычно 4 MB).
+    /// Просим больше минимальной large page, чтобы проба не давала ложный
+    /// отказ из-за требований VirtualAlloc к кратности/резерву региона.
+    fn huge_probe_bytes() -> usize {
+        2 * huge_page_size()
     }
 
     /// Физическая оперативная память системы в байтах (без учёта pagefile).
@@ -664,12 +688,17 @@ mod platform {
     /// Проба: получается ли выделить large page (обычно 2 MB). Результат
     /// кешируется: без `SeLockMemoryPrivilege` VirtualAlloc(MEM_LARGE_PAGES)
     /// всегда падает, так что одна проба за процесс достаточна.
+    ///
+    /// Пробуем сразу `huge_probe_bytes()` (= 4 MB), а не одну large page:
+    /// VirtualAlloc(MEM_LARGE_PAGES) требует, чтобы размер был КРАТЕН размеру
+    /// large page, и при запросе ровно одной страницы иногда отказывает даже
+    /// с выданной привилегией — проба давала бы ложное «нет».
     pub fn large_pages_available() -> bool {
         if cfg!(miri) {
             return false;
         }
         static HUGE_OK: OnceLock<bool> = OnceLock::new();
-        *HUGE_OK.get_or_init(|| match try_alloc_huge(huge_page_size()) {
+        *HUGE_OK.get_or_init(|| match try_alloc_huge(huge_probe_bytes()) {
             Some(a) => {
                 free(a);
                 true
@@ -845,6 +874,21 @@ mod platform {
         })
     }
 
+    /// Диагностика причины отказа MAP_HUGETLB (errno с пояснением).
+    #[cfg(target_os = "linux")]
+    fn hugetlb_errno_hint(errno: i32) -> &'static str {
+        match errno {
+            // Нет зарезервированных huge pages в пуле ядра:
+            // HugePages_Total = 0 (см. /proc/meminfo, sysctl vm.nr_hugepages).
+            libc::ENOMEM => "нет зарезервированных huge pages (vm.nr_hugepages=0)",
+            // Ядро не поддерживает MAP_HUGETLB для этой конфигурации/файловой системы.
+            libc::EINVAL => "MAP_HUGETLB не поддерживается ядром",
+            // Недостаточно прав (fs.hugetlb_shm_group / CAP_IPC_LOCK).
+            libc::EPERM => "недостаточно прав (CAP_IPC_LOCK / fs.hugetlb_shm_group)",
+            _ => "mmap(MAP_HUGETLB) вернул ошибку",
+        }
+    }
+
     /// Проба: получается ли выделить huge page (MAP_HUGETLB / Hugepagesize).
     /// Результат кешируется — одна проба за процесс достаточна.
     pub fn large_pages_available() -> bool {
@@ -852,12 +896,23 @@ mod platform {
             return false;
         }
         static HUGE_OK: OnceLock<bool> = OnceLock::new();
-        *HUGE_OK.get_or_init(|| match try_alloc_huge(huge_page_size()) {
+        *HUGE_OK.get_or_init(|| match try_alloc_huge(2 * huge_page_size()) {
             Some(a) => {
                 free(a);
                 true
             }
-            None => false,
+            None => {
+                #[cfg(target_os = "linux")]
+                if std::env::var("R3_VERBOSE").is_ok() {
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    eprintln!(
+                        "  [huge] MAP_HUGETLB недоступен: errno={} ({})",
+                        errno,
+                        hugetlb_errno_hint(errno)
+                    );
+                }
+                false
+            }
         })
     }
 
@@ -949,13 +1004,19 @@ unsafe impl Sync for SharedArena {}
 
 impl SharedArena {
     fn new(total_capacity: usize) -> Self {
-        // Размер под huge pages должен быть кратен huge_page_size(), иначе
+        // Размер под huge pages должен быть КРАТЕН huge_page_size(), иначе
         // MEM_LARGE_PAGES / MAP_HUGETLB молча не срабатывают и регион
         // выделяется обычными 4KB-страницами. Округляем только для крупных
         // арен (мелкие и так не получают huge pages и должны сохранять
-        // точный размер — иначе ломаются тесты границ/OOM).
+        // точный размер — иначе ломаются тесты границ/OOM); на Windows округляем
+        // всегда, т.к. проба доступности large pages там стоит одного syscall.
         let huge = platform::huge_page_size();
-        let cap = if total_capacity >= huge {
+        let round_up = if cfg!(windows) {
+            true
+        } else {
+            total_capacity >= huge
+        };
+        let cap = if round_up && huge.is_power_of_two() && total_capacity > 0 {
             total_capacity.next_multiple_of(huge)
         } else {
             total_capacity
@@ -963,6 +1024,23 @@ impl SharedArena {
         let alloc = platform::try_alloc_huge(cap).unwrap_or_else(|| platform::alloc_normal(cap));
         // Best-effort THP (Linux): работает без резервирования явных huge pages.
         platform::advise_huge(alloc.ptr, alloc.size);
+
+        // Диагностика: если при включённой привилегии «Lock pages in memory»
+        // арена всё равно легла на 4KB-страницы — виноваты не права, а либо
+        // размер региона (Windows требует кратности GetLargePageMinimum()),
+        // либо отсутствие достаточно больших свободных contiguous-блоков
+        // (фрагментация RAM / Hyper-V / WSL2 / динамическая память VM).
+        #[cfg(windows)]
+        if !alloc.is_huge && cap >= platform::huge_page_size() && platform::large_pages_available()
+        {
+            eprintln!(
+                "  [Arena] WARNING: large pages доступны, но регион {} MB выделен обычными страницами \
+                 (нужна кратность {} MB; причина обычно — фрагментация RAM или гипервизор: \
+                 WSL2/Hyper-V/динамическая память VM)",
+                cap / (1024 * 1024),
+                platform::huge_page_size() / (1024 * 1024),
+            );
+        }
 
         if verbose_enabled() {
             println!(
@@ -4665,16 +4743,49 @@ pub fn run() {
     println!("Логических ядер: {}", all_cores.len());
     println!("Физических ядер: {}", num_cpus::get_physical());
     println!("Глобальный аллокатор: {}", allocator_label());
+    let huge_ok = platform::large_pages_available();
     println!(
         "Страницы: {} KB / huge pages {} MB: {}",
         platform::page_size() / 1024,
         platform::huge_page_size() / (1024 * 1024),
-        if platform::large_pages_available() {
-            "доступны"
-        } else {
-            "нет"
-        }
+        if huge_ok { "доступны" } else { "нет" }
     );
+    #[cfg(windows)]
+    if !huge_ok {
+        // Самая частая причина на Windows — не отсутствующее право, а «устаревший»
+        // токен процесса: привилегии назначаются при логине.
+        println!(
+            "  Подсказка: large pages требует привилегию \"Lock pages in memory\" (secpol.msc ->\n\
+             \u{20}\u{20}Локальные правила -> Назначение прав пользователю) и ПЕРЕЗАПУСКА СЕССИИ:\n\
+             \u{20}\u{20}токен формируется при логине, для WSL нужно `wsl --shutdown` + новый вход.\n\
+             \u{20}\u{20}Проверить: whoami /priv | findstr SeLockMemoryPrivilege\n\
+             \u{20}\u{20}Подробности (статус привилегии, размеры арен): R3_VERBOSE=1"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    if !huge_ok {
+        // На Linux MAP_HUGETLB работает ТОЛЬКО с явным пулом huge pages:
+        // если HugePages_Total = 0, mmap вернёт ENOMEM независимо от THP.
+        let total = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|s| {
+                s.lines().find_map(|line| {
+                    line.strip_prefix("HugePages_Total:")
+                        .and_then(|rest| rest.trim().parse::<usize>().ok())
+                })
+            })
+            .unwrap_or(0);
+        println!(
+            "  Подсказка: MAP_HUGETLB требует зарезервированный пул huge pages\n\
+             \u{20}\u{20}(сейчас HugePages_Total: {total}). Включить (до перезагрузки):\n\
+             \u{20}\u{20}sudo sysctl vm.nr_hugepages=512   # 512 x 2 MB = 1 GB пула\n\
+             \u{20}\u{20}Постоянно: nr_hugepages=512 в /etc/sysctl.d/99-hugepages.conf\n\
+             \u{20}\u{20}Проверить: grep -i huge /proc/meminfo | head\n\
+             \u{20}\u{20}Точная причина отказа (errno): R3_VERBOSE=1\n\
+             \u{20}\u{20}Без явного пула арены всё равно могут попасть на THP (MADV_HUGEPAGE,\n\
+             \u{20}\u{20}best-effort): cat /sys/kernel/mm/transparent_hugepage/enabled"
+        );
+    }
     println!();
 
     // PGO для bumpalo
