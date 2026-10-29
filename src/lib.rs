@@ -148,13 +148,13 @@ static REGION_TAKEN: AtomicUsize = AtomicUsize::new(0);
 
 /// Прочитать и обнулить накопленное потребление регионов (см. `REGION_TAKEN`).
 #[cfg(feature = "tune")]
-pub fn take_region_taken() -> usize {
+pub fn take_region_used() -> usize {
     REGION_TAKEN.swap(0, Ordering::Relaxed)
 }
 
-/// Заглушка без фичи `tune` (см. `take_region_taken`).
+/// Заглушка без фичи `tune` (см. `take_region_used`).
 #[cfg(not(feature = "tune"))]
-pub fn take_region_taken() -> usize {
+pub fn take_region_used() -> usize {
     0
 }
 
@@ -430,13 +430,20 @@ mod platform {
     // unused_imports. Атрибуты внутри use-списка запрещены синтаксисом Rust,
     // поэтому выносим в отдельные import'ы.
     #[cfg(not(miri))]
-    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLargePageMinimum, GetSystemInfo, SYSTEM_INFO,
+    };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     /// Включаем SeLockMemoryPrivilege ("Lock pages in memory"), если она
     /// выдана процессу в локальной политике безопасности. Без неё
     /// VirtualAlloc(MEM_LARGE_PAGES) не работает, и мы молча откатываемся
     /// на обычные 4KB страницы.
+    ///
+    /// ВАЖНО: право входит в токен процесса только при логине. Если привилегию
+    /// включили в secpol.msc уже после запуска терминала, токен не обновится —
+    /// нужен перезапуск сессии (для WSL: `wsl --shutdown` и повторный вход,
+    /// для нативной консоли — новое окно/перелогин).
     #[cfg_attr(coverage, coverage(off))]
     fn enable_lock_memory_privilege() {
         unsafe {
@@ -627,16 +634,33 @@ mod platform {
         4096
     }
 
-    /// Минимальный размер large page (обычно 2 MB).
+    /// Минимальный размер large page (обычно 2 MB). `GetLargePageMinimum()`
+    /// возвращает 0, если система large pages не поддерживает (например, CPU
+    /// без PSE или гипервизор без этой возможности), поэтому нормализуем в
+    /// обычный размер страницы — иначе округление до кратности 0 ломает арены.
     #[cfg(not(miri))]
     pub fn huge_page_size() -> usize {
         static HUGE: OnceLock<usize> = OnceLock::new();
-        *HUGE.get_or_init(|| unsafe { GetLargePageMinimum() })
+        *HUGE.get_or_init(|| {
+            let min = unsafe { GetLargePageMinimum() };
+            if min == 0 {
+                page_size()
+            } else {
+                min as usize
+            }
+        })
     }
 
     #[cfg(miri)]
     pub fn huge_page_size() -> usize {
         2 * 1024 * 1024
+    }
+
+    /// Размер пробы доступности large pages: 2 x huge_page_size() (обычно 4 MB).
+    /// Просим больше минимальной large page, чтобы проба не давала ложный
+    /// отказ из-за требований VirtualAlloc к кратности/резерву региона.
+    fn huge_probe_bytes() -> usize {
+        2 * huge_page_size()
     }
 
     /// Физическая оперативная память системы в байтах (без учёта pagefile).
@@ -664,12 +688,17 @@ mod platform {
     /// Проба: получается ли выделить large page (обычно 2 MB). Результат
     /// кешируется: без `SeLockMemoryPrivilege` VirtualAlloc(MEM_LARGE_PAGES)
     /// всегда падает, так что одна проба за процесс достаточна.
+    ///
+    /// Пробуем сразу `huge_probe_bytes()` (= 4 MB), а не одну large page:
+    /// VirtualAlloc(MEM_LARGE_PAGES) требует, чтобы размер был КРАТЕН размеру
+    /// large page, и при запросе ровно одной страницы иногда отказывает даже
+    /// с выданной привилегией — проба давала бы ложное «нет».
     pub fn large_pages_available() -> bool {
         if cfg!(miri) {
             return false;
         }
         static HUGE_OK: OnceLock<bool> = OnceLock::new();
-        *HUGE_OK.get_or_init(|| match try_alloc_huge(huge_page_size()) {
+        *HUGE_OK.get_or_init(|| match try_alloc_huge(huge_probe_bytes()) {
             Some(a) => {
                 free(a);
                 true
@@ -845,6 +874,21 @@ mod platform {
         })
     }
 
+    /// Диагностика причины отказа MAP_HUGETLB (errno с пояснением).
+    #[cfg(target_os = "linux")]
+    fn hugetlb_errno_hint(errno: i32) -> &'static str {
+        match errno {
+            // Нет зарезервированных huge pages в пуле ядра:
+            // HugePages_Total = 0 (см. /proc/meminfo, sysctl vm.nr_hugepages).
+            libc::ENOMEM => "нет зарезервированных huge pages (vm.nr_hugepages=0)",
+            // Ядро не поддерживает MAP_HUGETLB для этой конфигурации/файловой системы.
+            libc::EINVAL => "MAP_HUGETLB не поддерживается ядром",
+            // Недостаточно прав (fs.hugetlb_shm_group / CAP_IPC_LOCK).
+            libc::EPERM => "недостаточно прав (CAP_IPC_LOCK / fs.hugetlb_shm_group)",
+            _ => "mmap(MAP_HUGETLB) вернул ошибку",
+        }
+    }
+
     /// Проба: получается ли выделить huge page (MAP_HUGETLB / Hugepagesize).
     /// Результат кешируется — одна проба за процесс достаточна.
     pub fn large_pages_available() -> bool {
@@ -852,12 +896,52 @@ mod platform {
             return false;
         }
         static HUGE_OK: OnceLock<bool> = OnceLock::new();
-        *HUGE_OK.get_or_init(|| match try_alloc_huge(huge_page_size()) {
+        *HUGE_OK.get_or_init(|| match try_alloc_huge(2 * huge_page_size()) {
             Some(a) => {
                 free(a);
                 true
             }
-            None => false,
+            None => {
+                #[cfg(target_os = "linux")]
+                if std::env::var("R3_VERBOSE").is_ok() {
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    eprintln!(
+                        "  [huge] MAP_HUGETLB недоступен: errno={} ({})",
+                        errno,
+                        hugetlb_errno_hint(errno)
+                    );
+                    // Дополнительная диагностика по /proc/meminfo: без явного
+                    // пула (HugePages_Total=0) mmap всегда вернёт ENOMEM, а
+                    // крошечный пул не даёт выделить пробу в 2 huge-страницы.
+                    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+                        let get = |key: &str| -> Option<usize> {
+                            meminfo.lines().find_map(|line| {
+                                line.strip_prefix(key)
+                                    .map(|rest| rest.trim_end())
+                                    .and_then(|rest| rest.split_whitespace().next())
+                                    .and_then(|num| num.parse::<usize>().ok())
+                            })
+                        };
+                        let total = get("HugePages_Total:").unwrap_or(0);
+                        let free = get("HugePages_Free:").unwrap_or(0);
+                        let sz_kb = get("Hugepagesize:").unwrap_or(2048);
+                        eprintln!(
+                            "  [huge] пул ядра: HugePages_Total={total}, HugePages_Free={free}, \
+                             Hugepagesize={sz_kb} KB (проба требует {} MB непрерывного пула)",
+                            (2 * sz_kb * 1024) / (1024 * 1024)
+                        );
+                        if total == 0 {
+                            eprintln!("  [huge] включение: sudo sysctl vm.nr_hugepages=512");
+                        } else if free < 2 {
+                            eprintln!(
+                                "  [huge] пул зарезервирован, но свободных страниц мало: \
+                                 увеличьте vm.nr_hugepages либо освободите память"
+                            );
+                        }
+                    }
+                }
+                false
+            }
         })
     }
 
@@ -949,13 +1033,19 @@ unsafe impl Sync for SharedArena {}
 
 impl SharedArena {
     fn new(total_capacity: usize) -> Self {
-        // Размер под huge pages должен быть кратен huge_page_size(), иначе
+        // Размер под huge pages должен быть КРАТЕН huge_page_size(), иначе
         // MEM_LARGE_PAGES / MAP_HUGETLB молча не срабатывают и регион
         // выделяется обычными 4KB-страницами. Округляем только для крупных
         // арен (мелкие и так не получают huge pages и должны сохранять
-        // точный размер — иначе ломаются тесты границ/OOM).
+        // точный размер — иначе ломаются тесты границ/OOM); на Windows округляем
+        // всегда, т.к. проба доступности large pages там стоит одного syscall.
         let huge = platform::huge_page_size();
-        let cap = if total_capacity >= huge {
+        let round_up = if cfg!(windows) {
+            true
+        } else {
+            total_capacity >= huge
+        };
+        let cap = if round_up && huge.is_power_of_two() && total_capacity > 0 {
             total_capacity.next_multiple_of(huge)
         } else {
             total_capacity
@@ -963,6 +1053,23 @@ impl SharedArena {
         let alloc = platform::try_alloc_huge(cap).unwrap_or_else(|| platform::alloc_normal(cap));
         // Best-effort THP (Linux): работает без резервирования явных huge pages.
         platform::advise_huge(alloc.ptr, alloc.size);
+
+        // Диагностика: если при включённой привилегии «Lock pages in memory»
+        // арена всё равно легла на 4KB-страницы — виноваты не права, а либо
+        // размер региона (Windows требует кратности GetLargePageMinimum()),
+        // либо отсутствие достаточно больших свободных contiguous-блоков
+        // (фрагментация RAM / Hyper-V / WSL2 / динамическая память VM).
+        #[cfg(windows)]
+        if !alloc.is_huge && cap >= platform::huge_page_size() && platform::large_pages_available()
+        {
+            eprintln!(
+                "  [Arena] WARNING: large pages доступны, но регион {} MB выделен обычными страницами \
+                 (нужна кратность {} MB; причина обычно — фрагментация RAM или гипервизор: \
+                 WSL2/Hyper-V/динамическая память VM)",
+                cap / (1024 * 1024),
+                platform::huge_page_size() / (1024 * 1024),
+            );
+        }
 
         if verbose_enabled() {
             println!(
@@ -4219,6 +4326,57 @@ pub fn profile_arena_chunk_size_light() -> usize {
 //                        УТИЛИТЫ
 // ============================================================
 
+/// Точный замер потребления одного потока за ОДНУ итерацию нагрузки арены
+/// (байты) — без PGO-маржи и без каппинга через `pgo_chunk_cap()`.
+///
+/// В отличие от `profile_arena_chunk_size_*` здесь нет ни округления до МБ,
+/// ни `/2`, ни `.min(cap)`: возвращается сытое пиковое потребление региона
+/// (`allocated_bytes()`), т.е. ровно тот размер чанка, при котором поток
+/// живёт без единого обращения в `grow_fallback`. Это нужно автоподбору:
+/// маржа/каппинг профильных функций занижали `need` (вдвое!) и он мог
+/// оказаться меньше реального потребления — выбранный чанк не покрывал
+/// нагрузку.
+///
+/// Нагрузку масштабирует `bench_scale()` (как и сами бенчи): при
+/// `R3_BENCH_SCALE=N` итерации делятся на N, поэтому и потребление меряется
+/// для той же нагрузки, с которой потом гоняется основной прогон.
+///
+/// Возвращает максимум из двух прогонов (первый греет кэш/страницы).
+#[cfg_attr(coverage, coverage(off))]
+fn arena_need_bytes(full: bool) -> usize {
+    let s = bench_scale();
+    let mut best = 0usize;
+    for _ in 0..2 {
+        // Чанк заведомо больше потребления: fallback не срабатывает вовсе,
+        // поэтому allocated_bytes() = точное потребление итерации.
+        let arena = SharedArena::new(1024 * 1024 * 1024);
+        let bumps = arena.split_safe(1);
+        let bump = &bumps[0];
+        let (vcap, outer, inner) = if full { (40000, 200, 200) } else { (10000, 100, 100) };
+
+        let mut vectr: ArenaVec<ArenaVec<ArenaString>> = ArenaVec::with_capacity_in::<
+            { core::mem::align_of::<ArenaVec<ArenaString>>() },
+        >(vcap / s, bump);
+        for _ in 0..(outer / s).max(1) {
+            for _ in 0..(inner / s).max(1) {
+                let mut vec: ArenaVec<ArenaString> =
+                    ArenaVec::with_capacity_in::<{ core::mem::align_of::<ArenaString>() }>(400, bump);
+                for _ in 0..(100 / s).max(1) {
+                    vec.push::<{ core::mem::align_of::<ArenaString>() }>(
+                        ArenaString::from_str_in("stroka", bump),
+                        bump,
+                    );
+                }
+                vectr.push::<{ core::mem::align_of::<ArenaVec<ArenaString>>() }>(vec, bump);
+            }
+        }
+        best = best.max(bump.allocated_bytes());
+        core::hint::black_box(&vectr);
+        drop(vectr);
+    }
+    best.max(1024 * 1024)
+}
+
 /// Автоматический подбор per-thread размера чанка арены (`R3_ARENA_CHUNK_MB`).
 ///
 /// Диагноз по профилю: самые горячие места — `mmap`/`munmap` внутри
@@ -4232,17 +4390,30 @@ pub fn profile_arena_chunk_size_light() -> usize {
 ///    (`pgo_chunk_cap()`), т.е. самый маленький кандидат сетки.
 ///
 /// Затем сеткой кандидатов (geometric от need/2 до cap, ~2x шаг) замеряется
-/// число обращений в `grow_fallback` (счётчик `FALLBACK_CALLS`, фича `tune`) и
-/// время прогона: каждая кандидатура реально гоняет бенч со своим чанком
-/// (бенч-функции берут размер аргументом). Итог: наименьший чанк с нулём
-/// fallback-вызовов — ровно столько, чтобы покрыть need без запасных mmap;
-/// если даже cap не убирает fallback полностью (need > cap — нагрузка больше
-/// лимита памяти), берётся кандидат с минимумом fallback-вызовов.
+/// число РЕАЛЬНЫХ новых mmap-чанков (`FALLBACK_MMAPS`, фича `tune`) и время
+/// прогона: каждая кандидатура реально гоняет бенч со своим чанком (бенч-
+/// функции берут размер аргументом). Метрика именно `mmap`, а не все обращения
+/// в `grow_fallback`: после каждого `reset()` региона первый аллок и при
+/// идеальном чанке заходит в `grow_fallback` (место находится в уже
+/// существующем fallback-чанке без системного вызова), поэтому «нулём calls»
+/// нельзя было бы достичь никогда — выбирался бы всегда `cap`. Нулевые же
+/// `mmap` означают, что регион+выделенный один раз fallback-чанк покрывают
+/// нагрузку целиком.
+/// Итог: наименьший чанк с нулём новых mmap; если даже `cap` не убирает их
+/// полностью (need > cap — нагрузка больше лимита памяти), берётся кандидат с
+/// минимумом mmap (при равенстве — быстрее).
 /// Точки ниже need/2 в сетку не включаются: потребление итерации там превышает
 /// чанк, fallback гарантирован — такие точки только тратят время (mmap-шторм).
 ///
-/// Стили (`mono`/`dispatch`/`both`) берутся из `R3_BENCH_STYLE` (как в
-/// бенчах), повторность — из `R3_TUNE_ROUNDS` (по умолчанию 3). Возвращает
+/// Нагрузку для замера `need` и для скана задаёт `R3_BENCH_SCALE` (все границы
+/// итераций делятся на scale) — тюн обязан идти при том же scale, что и
+/// основной прогон, иначе подобранный чанк не будет соответствовать нагрузке.
+///
+/// Стили: время прогона меряется на том стиле, который выбран `R3_BENCH_STYLE`
+/// (mono/dispatch/both), но метрика выбора (mmap + потребление) ВСЕГДА
+/// снимается с dispatch-прогона той же нагрузки — мономорфный путь не проходит
+/// через `grow_fallback`, где стоят счётчики (см. комментарий у `load`).
+/// Повторность — из `R3_TUNE_ROUNDS` (по умолчанию 3). Возвращает
 /// выбранный размер в байтах и выставляет `R3_ARENA_CHUNK_MB` для процесса,
 /// чтобы все последующие прогоны (в т.ч. pprof) использовали подобранный чанк.
 #[cfg_attr(coverage, coverage(off))]
@@ -4273,15 +4444,25 @@ pub fn arena_tune_scan(smt: bool) -> usize {
         unsafe { std::env::set_var("R3_ARENA_CHUNK_MB", (bytes / mb).max(1).to_string()) };
     };
 
+    // ВАЖНО: при скане сетки ВСЕГДА гоняем dispatch-варианты (`arena_*`),
+    // независимо от R3_BENCH_STYLE. Причина: мономорфный путь (`arena_m_*`)
+    // использует alloc_raw_m и НЕ проходит через grow_fallback, где стоят
+    // счётчики FALLBACK_MMAPS/REGION_TAKEN — при style=mono счётчики всегда
+    // показывали бы 0 mmap'ов даже для чанка в 1 MB (мусорная метрика ->
+    // выбирался минимальный кандидат сетки -> основной прогон уходил в
+    // mmap-шторм). Время прогона при этом зависит от реального пути аллокаций,
+    // поэтому mono-кандидатуры меряются только ВРЕМЕНЕМ (метрика `ms`), а по
+    // mmap/потреблению судим по dispatch-прогону той же нагрузки.
     let load = |chunk: usize| {
+        arena_full(chunk, smt);
+        arena_light(chunk, smt);
+    };
+    let load_all = |chunk: usize| {
         if run_mono {
             arena_m_full_forward(chunk, smt);
             arena_m_light_forward(chunk, smt);
         }
-        if run_dispatch {
-            arena_full(chunk, smt);
-            arena_light(chunk, smt);
-        }
+        load(chunk);
     };
 
     // Прогрев: JIT/кэш планировщика/первые страницы — первые прогоны всегда
@@ -4290,27 +4471,26 @@ pub fn arena_tune_scan(smt: bool) -> usize {
     load(cap);
 
     // --- Замер need: сколько байт потребляет одна итерация нагрузки --------
-    // `profile_arena_chunk_size_*` гоняют ровно ту же нагрузку, что и бенчи
-    // (full 200x200 / light 100x100), в один поток при чанке 1 GB — fallback
-    // там не срабатывает вовсе, поэтому `allocated_bytes()` = точное пиковое
-    // потребление за итерацию. Возврат этих функций уже округлён до МБ;
-    // суммируем full+light (поток за прогон делает оба).
-    // ВАЖНО: override из R3_ARENA_CHUNK_MB имеет приоритет внутри этих функций
-    // (они возвращают его, не измеряя нагрузку) — на время замера переменную
-    // нужно убрать, иначе need станет равен текущему кандидату/оверрайду.
+    // Профильные функции PGO (`profile_arena_chunk_size_*`) для этого НЕ годятся:
+    // они применяют маржу, округление до МБ, `/2` и каппинг через
+    // `pgo_chunk_cap()`, т.е. возвращают вдвое заниженное значение — при таком
+    // `need` выбранный чанк не покрывал реальную нагрузку и основной прогон
+    // уходил в mmap-шторм. Здесь меряется сытое пиковое потребление региона за
+    // одну итерацию (тот же профиль нагрузки, что в бенчах, один поток, чанк
+    // 1 GB — fallback не срабатывает вовсе).
+    // Суммируем full+light: за один `load()` поток (фактически — каждый поток)
+    // выполняет обе нагрузки; запас сверху даёт `grid_lo = need/2` в сетке.
+    // ВАЖНО: override из R3_ARENA_CHUNK_MB на время замера убираем — точечный
+    // замер его не читает, но так безопаснее (никакие побочные пути не увидят
+    // промежуточное значение переменной).
     let prev_override = std::env::var("R3_ARENA_CHUNK_MB").ok();
     unsafe { std::env::remove_var("R3_ARENA_CHUNK_MB") };
-    let need_raw = profile_arena_chunk_size_full() + profile_arena_chunk_size_light();
+    let need_raw = arena_need_bytes(true) + arena_need_bytes(false);
     match prev_override {
         Some(v) => unsafe { std::env::set_var("R3_ARENA_CHUNK_MB", v) },
         None => {}
     }
-    // Профильные функции уже применяют маржу (115%) и каппят результат через
-    // `pgo_chunk_cap()` — повторное округление/каппинг здесь не нужен: второй
-    // round_up_mb только завышал бы need, а cap делал need == cap, из-за чего
-    // сетка теряла смысл и выбирался минимальный чанк (mmap-шторм в основном
-    // прогоне).
-    let need = need_raw.max(mb);
+    let need = round_up_mb(need_raw.max(mb));
 
     // --- Сетка кандидатов: geometric ~2x до cap ----------------------------
     // Точки ниже need/2 гарантированно дают fallback (потребление итерации
@@ -4337,45 +4517,77 @@ pub fn arena_tune_scan(smt: bool) -> usize {
     // бенч-пути не читается — рано и поздно его применяют только
     // `profile_arena_chunk_size_*`), поэтому кандидат передаётся напрямую.
     // `set_chunk` остаётся только для финального экспорта выбранного значения.
-    // Счётчик fallback-вызовов обнуляем непосредственно перед замером каждой
-    // кандидатуры.
-    let mut results: Vec<(usize, usize, f64)> = Vec::new(); // (chunk, fb_calls, ms)
+    // Счётчики обнуляем непосредственно перед замером каждой кандидатуры.
+    // Метрика выбора — НОВЫЕ mmap-чанки (`FALLBACK_MMAPS`): обращения в
+    // `grow_fallback` (`FALLBACK_CALLS`) есть всегда (первый аллок после reset
+    // региона), они печатаются только как справочная информация.
+    let mut results: Vec<(usize, usize, usize, f64)> = Vec::new(); // (chunk, calls, mmaps, ms)
     for &cand in &candidates {
-        load(cand); // прогрев этой конфигурации (первые страницы/кэш) — не мерим
-        let _ = take_fallback_calls();
+        load_all(cand); // прогрев этой конфигурации (первые страницы/кэш) — не мерим
+        let _ = take_fallback_counters();
         let t0 = Instant::now();
         for _ in 0..rounds {
-            load(cand);
+            load_all(cand);
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3 / rounds as f64;
-        let calls = take_fallback_calls();
-        results.push((cand, calls, ms));
+        let (calls, mmaps) = take_fallback_counters();
+        results.push((cand, calls, mmaps, ms));
         println!(
-            "[tune] chunk={:>5} MB  fallback_calls={:<6}  {:.1} ms/round",
+            "[tune] chunk={:>5} MB  fallback_calls={:<6} new_mmaps={:<5} {:.1} ms/round",
             cand / mb,
             calls,
+            mmaps,
             ms
         );
     }
 
-    // Наименьший кандидат без единого fallback-вызова; если таких нет —
-    // кандидат с минимумом вызовов (при равенстве — быстрее по времени).
+    // Потолок чанка: cap — это размер НА ПОТОК, т.е. threads×cap ≈ 80% RAM.
+    // Такой прогон уходит в свопинг/перебитие кэшей и выглядит «арена хуже
+    // mimalloc» (у mimalloc тред-локи держат только реально используемые
+    // страницы). Поэтому из zero-mmap кандидатов берём наименьший, но не
+    // больше `need` — ровно столько, сколько нагрузка потребляет за итерацию;
+    // fallback при этом остаётся нулевым (чанк >= need).
+    let chunk_cap = need.min(cap);
+    // Наименьший кандидат без единого нового mmap; если таких нет — кандидат с
+    // минимумом mmap (при равенстве — быстрее по времени).
     let best = results
         .iter()
-        .filter(|(_, calls, _)| *calls == 0)
-        .min_by_key(|(cand, _, _)| *cand)
-        .or_else(|| results.iter().min_by(|a, b| a.1.cmp(&b.1).then(a.2.total_cmp(&b.2))))
-        .map(|&(cand, calls, ms)| (cand, calls, ms))
-        .unwrap_or((need, 0, 0.0));
+        .filter(|(cand, _, mmaps, _)| *mmaps == 0 && *cand <= chunk_cap)
+        .min_by_key(|(cand, _, _, _)| *cand)
+        .or_else(|| {
+            results
+                .iter()
+                .filter(|(cand, _, _, _)| *cand <= chunk_cap)
+                .min_by(|a, b| a.2.cmp(&b.2).then(a.3.total_cmp(&b.3)))
+        })
+        .or_else(|| {
+            results
+                .iter()
+                .min_by(|a, b| a.2.cmp(&b.2).then(a.3.total_cmp(&b.3)))
+        })
+        .map(|&(cand, calls, mmaps, ms)| (cand, calls, mmaps, ms))
+        .unwrap_or((need, 0, 0, 0.0));
 
     set_chunk(best.0);
+    if best.0 > cap / 2 {
+        println!(
+            "[tune] WARNING: выбран чанк {} MB/поток (суммарно ~{} MB на {} потоков) — \
+             близок к лимиту памяти {}, начнётся свопинг и арена гарантированно проиграет \
+             mimalloc. Увеличьте R3_BENCH_SCALE (меньше нагрузка -> меньше need) или \
+             уменьшите число потоков (SMT off).",
+            best.0 / mb,
+            best.0 * num_cpus::get().max(1) / mb,
+            num_cpus::get(),
+            cap / mb,
+        );
+    }
     println!(
-        "[tune] need={} MB; chosen chunk={} MB (fallback_calls={}, {:.1} ms/round); \
-         R3_ARENA_CHUNK_MB={}",
+        "[tune] need={} MB; chosen chunk={} MB (fallback_calls={}, new_mmaps={}, {:.1} ms/round); \\\n         R3_ARENA_CHUNK_MB={}",
         need / mb,
         best.0 / mb,
         best.1,
         best.2,
+        best.3,
         best.0 / mb
     );
     best.0
@@ -4665,16 +4877,49 @@ pub fn run() {
     println!("Логических ядер: {}", all_cores.len());
     println!("Физических ядер: {}", num_cpus::get_physical());
     println!("Глобальный аллокатор: {}", allocator_label());
+    let huge_ok = platform::large_pages_available();
     println!(
         "Страницы: {} KB / huge pages {} MB: {}",
         platform::page_size() / 1024,
         platform::huge_page_size() / (1024 * 1024),
-        if platform::large_pages_available() {
-            "доступны"
-        } else {
-            "нет"
-        }
+        if huge_ok { "доступны" } else { "нет" }
     );
+    #[cfg(windows)]
+    if !huge_ok {
+        // Самая частая причина на Windows — не отсутствующее право, а «устаревший»
+        // токен процесса: привилегии назначаются при логине.
+        println!(
+            "  Подсказка: large pages требует привилегию \"Lock pages in memory\" (secpol.msc ->\n\
+             \u{20}\u{20}Локальные правила -> Назначение прав пользователю) и ПЕРЕЗАПУСКА СЕССИИ:\n\
+             \u{20}\u{20}токен формируется при логине, для WSL нужно `wsl --shutdown` + новый вход.\n\
+             \u{20}\u{20}Проверить: whoami /priv | findstr SeLockMemoryPrivilege\n\
+             \u{20}\u{20}Подробности (статус привилегии, размеры арен): R3_VERBOSE=1"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    if !huge_ok {
+        // На Linux MAP_HUGETLB работает ТОЛЬКО с явным пулом huge pages:
+        // если HugePages_Total = 0, mmap вернёт ENOMEM независимо от THP.
+        let total = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|s| {
+                s.lines().find_map(|line| {
+                    line.strip_prefix("HugePages_Total:")
+                        .and_then(|rest| rest.trim().parse::<usize>().ok())
+                })
+            })
+            .unwrap_or(0);
+        println!(
+            "  Подсказка: MAP_HUGETLB требует зарезервированный пул huge pages\n\
+             \u{20}\u{20}(сейчас HugePages_Total: {total}). Включить (до перезагрузки):\n\
+             \u{20}\u{20}sudo sysctl vm.nr_hugepages=512   # 512 x 2 MB = 1 GB пула\n\
+             \u{20}\u{20}Постоянно: nr_hugepages=512 в /etc/sysctl.d/99-hugepages.conf\n\
+             \u{20}\u{20}Проверить: grep -i huge /proc/meminfo | head\n\
+             \u{20}\u{20}Точная причина отказа (errno): R3_VERBOSE=1\n\
+             \u{20}\u{20}Без явного пула арены всё равно могут попасть на THP (MADV_HUGEPAGE,\n\
+             \u{20}\u{20}best-effort): cat /sys/kernel/mm/transparent_hugepage/enabled"
+        );
+    }
     println!();
 
     // PGO для bumpalo
