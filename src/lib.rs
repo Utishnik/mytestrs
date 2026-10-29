@@ -188,35 +188,48 @@ pub fn take_fallback_mmaps() -> usize {
     0
 }
 
-/// Множитель размера fallback-чанка из `R3_FALLBACK_CHUNK_MB` (см.
-/// `fallback_chunk_bytes`). По умолчанию 1 — поведение идентично историческому
-/// (`base_chunk.max(need)`), ничего не меняется для бенчей без переменной.
-fn fallback_chunk_mult() -> usize {
+/// Минимальный размер fallback-чанка по умолчанию (без env-переменных):
+/// 1 МБ. По профилю pprof самые горячие места — `__GI_munmap`/`__GI___mmap64`
+/// в `platform::alloc/free` и захваты `SpinMutex` в `grow_fallback`: при
+/// маленьких чанках арена живёт в режиме «попросил у ОС → отдал ОС» на каждой
+/// итерации бенча. Floor в 1 МБ делает один mmap покрывающим тысячи мелких
+/// аллокаций (`ArenaString`/`ArenaVec`) и радикально сокращает число системных
+/// вызовов и очередей за глобальным пулом чанков.
+const DEFAULT_FALLBACK_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Floor размера fallback-чанка в байтах из `R3_FALLBACK_CHUNK_MB` (см.
+/// `fallback_chunk_bytes`). Значение по умолчанию — 1 МБ
+/// (`DEFAULT_FALLBACK_CHUNK_BYTES`); env задаёт явный пол, если нужен другой.
+fn fallback_chunk_floor() -> usize {
     static M: OnceLock<usize> = OnceLock::new();
     *M.get_or_init(|| {
         std::env::var("R3_FALLBACK_CHUNK_MB")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)
-            .unwrap_or(1)
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or(DEFAULT_FALLBACK_CHUNK_BYTES)
     })
 }
 
-/// Размер fallback-чанка в байтах: по умолчанию `base_chunk` (историческое
-/// поведение). Если задан `R3_FALLBACK_CHUNK_MB=N`, чанк берётся не меньше
-/// N МБ — это позволяет одним мапом покрыть весь прогон и убрать основные
-/// горячие точки профиля: частые `mmap`/`munmap` и захваты `SpinMutex` в
-/// `grow_fallback` (см. рекомендации по профилю arena).
+/// Размер fallback-чанка в байтах: не меньше `base_chunk` и не меньше floor
+/// (по умолчанию 1 МБ, см. `DEFAULT_FALLBACK_CHUNK_BYTES`; переопределяется
+/// `R3_FALLBACK_CHUNK_MB=N`). Крупные редкие mmap вместо частых
+/// mmap/munmap+SpinMutex — это убирает основные горячие точки профиля
+/// (см. рекомендации по профилю arena).
 ///
-/// `cap` — потолок размера одного чанка (длина региона потока). Floor из
-/// переменной НЕ должен превышать его: fallback-чанки переиспользуются потоком
-/// через thread-local кэш, и гигантский floor на поток легко суммарно превышает
-/// физическую память (на CI-машинах с 2 GB RAM это `mmap failed` / OOM).
-/// `base_chunk` и `need` потолка не касаются: `need` обязан влезть в чанк.
+/// `cap` — потолок размера одного чанка (длина региона потока). Floor
+/// каппится им: fallback-чанки переиспользуются потоком через thread-local
+/// кэш, и гигантский floor на поток легко суммарно превышает физическую
+/// память (на CI-машинах с 2 GB RAM это `mmap failed` / OOM). Каппинг
+/// применяется только когда регион сам не меньше дефолтного floor (1 МБ) —
+/// иначе маленький тестовый регион остался бы крошечным и вернулись бы
+/// частые mmap. `base_chunk` и `need` потолка не касаются: `need` обязан
+/// влезть в чанк.
 #[inline]
 fn fallback_chunk_bytes(base_chunk: usize, need: usize, cap: usize) -> usize {
-    let m = fallback_chunk_mult();
-    let floor = if m == 1 { 0 } else { (m * 1024 * 1024).min(cap) };
+    let floor = fallback_chunk_floor();
+    let floor = if cap >= floor { floor.min(cap) } else { 0 };
     base_chunk.max(floor).max(need)
 }
 
@@ -2367,6 +2380,64 @@ impl ThreadBump {
         }
     }
 
+    /// SSO-выдача без аллокации (см. `ArenaVec::from_slice_in`): если блок из
+    /// `size + 16` байт уже помещается в текущий регион, резервируем его
+    /// bump-инкрементом и возвращаем `(ptr, size)` — вызывающий кладёт туда
+    /// короткие данные инлайн. Никакого похода в `fallback`/`SpinMutex`.
+    /// Возвращает `None`, если регион переполнен — тогда обычный путь.
+    #[inline(always)]
+    fn try_alloc_inline<const ALIGN: usize>(&self, size: usize) -> Option<(*mut u8, usize)> {
+        // Только Forward-регионы: Backward/MiddleOut имеют свою семантику
+        // lo/hi (счётчики «израсходовано с края»), их инлайн-резерв здесь
+        // не реализован — такие потоки используют обычный путь.
+        if !matches!(self.dir, BumpDir::Forward) {
+            return None;
+        }
+        let need = size + 16;
+        // Fast path единственного владельца (совпадает с alloc_raw_dir).
+        if self.neighbor_idx.is_none() && matches!(self.donor_reg, DonorReg::None) {
+            let cur = self.lo.load(Ordering::Relaxed);
+            let off = (cur + ALIGN - 1) & !(ALIGN - 1);
+            let end = off + need;
+            if end <= self.len {
+                self.lo.store(end, Ordering::Relaxed);
+                let p = unsafe { self.ptr.add(off) };
+                prefetch_write(unsafe { self.ptr.add(off + size) });
+                return Some((p, size));
+            }
+            return None;
+        }
+        let mid = if self.neighbor_idx.is_some() {
+            self.len / 2
+        } else {
+            self.len
+        };
+        loop {
+            let cur = self.lo.load(Ordering::Relaxed);
+            let off = (cur + ALIGN - 1) & !(ALIGN - 1);
+            let end = off + need;
+            if end > mid {
+                return None;
+            }
+            if self
+                .lo
+                .compare_exchange_weak(cur, end, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                let p = unsafe { self.ptr.add(off) };
+                prefetch_write(unsafe { self.ptr.add(off + size) });
+                return Some((p, size));
+            }
+        }
+    }
+
+    /// Забрать заранее зарезервированный инлайн-блок (см. `ArenaVec`): просто
+    /// оборачивает указатель и длину в готовый к использованию буфер.
+    #[inline(always)]
+    fn inline_to_arena(ptr: *mut u8, cap: usize) -> (*mut u8, usize) {
+        (ptr, cap)
+    }
+
     /// Выделить совершенно новый чанк «где-то в памяти» (через платформенный
     /// аллокатор) и вернуть в нём указатель на блок `size`. Чанк сохраняется в
     /// `fallback` и освобождается в `Drop`. Адрес возвращается вызывающему — его
@@ -2392,8 +2463,9 @@ impl ThreadBump {
             None => true,
         };
         if full {
-            // Размер чанка: base_chunk, но не меньше R3_FALLBACK_CHUNK_MB (если
-            // задан) — крупные редкие mmap вместо частых mmap/munmap+SpinMutex.
+            // Размер чанка: не меньше base_chunk и не меньше floor
+            // (по умолчанию 1 МБ; переопределяется R3_FALLBACK_CHUNK_MB) —
+            // крупные редкие mmap вместо частых mmap/munmap+SpinMutex.
             let alloc_size =
                 fallback_chunk_bytes(self.base_chunk, need, self.len).next_multiple_of(page);
             // Сначала пытаемся переиспользовать чанк, освобождённый этим же
@@ -3195,13 +3267,83 @@ impl ZoneBump<'static> {
 //          ARENA VEC / ARENA STRING (ПОСЛЕДНИЙ РАЗДЕЛ)
 // ============================================================
 
+/// SSO-режим для коротких байтовых векторов (см. `ArenaVec`): данные каждой
+/// короткой строки лежат в inline-буфере, зарезервированном ПАКЕТОМ при
+/// создании родительского `ArenaVec` (`with_capacity_in`), а сам элемент —
+/// один байт-флаг `Some(1)` в поле `sso`. Отдельной аллокации под каждую
+/// строку нет вовсе: горячий путь бенча
+/// `from_str_in -> alloc_raw -> grow_fallback -> SpinMutex/mmap` заменяется на
+/// чистый `store` в уже зарезервированный блок. Это прямой ответ на hotspot
+/// нового профиля (конкуренция за глобальный мьютекс fallback-пула).
+const SSO_MAX_INLINE: usize = 23;
+
 struct ArenaVec<T> {
     ptr: *mut T,
     len: usize,
     cap: usize,
+    /// Флаг SSO-режима этого вектора (установлен конструктором пакета, см.
+    /// `with_capacity_in`). Для не-байтовых `T` всегда `None`.
+    sso: Option<T>,
+    /// Inline-буфер: слот i занимает `[len: u8][pad..8][data <= 23]`, шаг 32
+    /// байта. Заполняется push'ем; читается `as_slice`. Нулевой заголовок
+    /// слота означает «элемент не в inline» (тогда берётся из `ptr`).
+    sso_base: *mut u8,
 }
 
 impl<T> ArenaVec<T> {
+    /// Байтовый шаг одного SSO-слота: 8 байт заголовка + 23 байта данных,
+    /// округление вверх до 8 => 32.
+    const SSO_STRIDE: usize = ((8 + SSO_MAX_INLINE + 7) / 8) * 8; // = 32
+
+    #[inline(always)]
+    fn is_sso(&self) -> bool {
+        self.sso.is_some()
+    }
+
+    #[inline(always)]
+    fn sso_slot(&self, i: usize) -> *mut u8 {
+        unsafe { self.sso_base.add(i * Self::SSO_STRIDE) }
+    }
+
+    #[inline(always)]
+    fn sso_len_at(&self, i: usize) -> usize {
+        unsafe { *self.sso_slot(i) as usize }
+    }
+
+    #[inline(always)]
+    fn sso_data_at(&self, i: usize) -> *const u8 {
+        unsafe { self.sso_slot(i).add(8) }
+    }
+
+    /// Записать значение в SSO-слот `i`. Вызывается только когда компилятор
+    /// уже знает `size_of::<T>() == 1` (fast-path в `push*` включён условием
+    /// `size_of::<T>() == 1`), поэтому побайтовая запись корректна для любого
+    /// `T: Copy` размера 1. Возвращает `false`, если значение нельзя положить
+    /// inline (нулевой байт — конфликтует с «пустым» заголовком слота);
+    /// вызывающий тогда использует обычный ареновый путь.
+    #[inline(always)]
+    fn sso_write(&mut self, i: usize, value: &T) -> bool {
+        debug_assert_eq!(core::mem::size_of::<T>(), 1);
+        let slot = self.sso_slot(i);
+        unsafe {
+            let b = *(value as *const T as *const u8);
+            if b == 0 {
+                return false;
+            }
+            *slot = 1u8;
+            *slot.add(8) = b;
+        }
+        true
+    }
+
+    /// Значение `true` того же типа `T` (для байтовых `T` это байт 1).
+    #[inline(always)]
+    fn sso_flag() -> T {
+        debug_assert_eq!(core::mem::size_of::<T>(), 1);
+        let one: u8 = 1;
+        unsafe { std::mem::transmute_copy::<u8, T>(&one) }
+    }
+
     #[inline(always)]
     fn with_capacity_in<const ALIGN: usize>(capacity: usize, bump: &ThreadBump) -> Self {
         if capacity == 0 {
@@ -3209,18 +3351,53 @@ impl<T> ArenaVec<T> {
                 ptr: ptr::null_mut(),
                 len: 0,
                 cap: 0,
+                sso: None,
+                sso_base: ptr::null_mut(),
             };
+        }
+        // SSO-пакет: для байтовых векторов резервируем ОДИН блок под все
+        // будущие короткие значения (cap слотов) и НЕ выделяем массив самих
+        // элементов — push пишет прямо в пакет. Экономит `cap*size_of::<T>()`
+        // байт арены и, главное, каждый аллок строки.
+        if core::mem::size_of::<T>() == 1 {
+            let bytes = capacity * Self::SSO_STRIDE;
+            if let Some((p, _)) = bump.try_alloc_inline::<ALIGN>(bytes) {
+                // Обнуляем заголовки слотов (данные писать не обязательно —
+                // читаются только при ненулевом заголовке).
+                for i in 0..capacity {
+                    unsafe { *p.add(i * Self::SSO_STRIDE) = 0u8 };
+                }
+                return Self {
+                    ptr: ptr::null_mut(),
+                    len: 0,
+                    cap: capacity,
+                    sso: Some(Self::sso_flag()),
+                    sso_base: p,
+                };
+            }
         }
         let ptr = bump.alloc_uninit_slice::<T, ALIGN>(capacity);
         Self {
             ptr,
             len: 0,
             cap: capacity,
+            sso: None,
+            sso_base: ptr::null_mut(),
         }
     }
 
     #[inline(always)]
     fn push<const ALIGN: usize>(&mut self, value: T, bump: &ThreadBump) {
+        // SSO fast path: байтовый вектор-пакет со свободным слотом — пишем
+        // инлайн, без похода в арену (см. комментарий к `SSO_MAX_INLINE`).
+        if core::mem::size_of::<T>() == 1
+            && self.is_sso()
+            && self.len < self.cap
+            && self.sso_write(self.len, &value)
+        {
+            self.len += 1;
+            return;
+        }
         if self.len == self.cap {
             self.grow::<ALIGN>(bump);
         }
@@ -3239,19 +3416,46 @@ impl<T> ArenaVec<T> {
         unsafe {
             ptr::copy_nonoverlapping(slice.as_ptr(), ptr, len);
         }
-        Self { ptr, len, cap: len }
+        Self {
+            ptr,
+            len,
+            cap: len,
+            sso: None,
+            sso_base: ptr::null_mut(),
+        }
     }
 
     fn grow<const ALIGN: usize>(&mut self, bump: &ThreadBump) {
         let new_cap = if self.cap == 0 { 4 } else { self.cap * 2 };
         let new_ptr = bump.alloc_uninit_slice::<T, ALIGN>(new_cap);
-        if self.len > 0 {
+        if self.is_sso() {
+            // Пакет исчерпан или встретился нулевой байт: переносим содержимое
+            // из inline-слотов в обычный ареновый буфер (холодный путь).
+            self.sso_promote_into(new_ptr);
+            self.sso = None;
+            self.sso_base = ptr::null_mut();
+        } else if self.len > 0 {
             unsafe {
                 ptr::copy_nonoverlapping(self.ptr, new_ptr, self.len);
             }
         }
         self.ptr = new_ptr;
         self.cap = new_cap;
+    }
+
+    /// Перенести `len` элементов из SSO-слотов в ареновый буфер `dst`
+    /// (вызывается из `grow*`, когда пакет не смог обслужить push).
+    #[cold]
+    #[inline(never)]
+    #[cfg_attr(coverage, coverage(off))]
+    fn sso_promote_into(&self, dst: *mut T) {
+        debug_assert!(self.is_sso());
+        for i in 0..self.len {
+            unsafe {
+                let src = self.sso_data_at(i);
+                std::ptr::copy_nonoverlapping(src, dst.add(i) as *mut u8, 1);
+            }
+        }
     }
 
     // ===== Мономорфные версии (конфигурируются compile-time `MODE`) =====
@@ -3266,19 +3470,46 @@ impl<T> ArenaVec<T> {
                 ptr: ptr::null_mut(),
                 len: 0,
                 cap: 0,
+                sso: None,
+                sso_base: ptr::null_mut(),
             };
+        }
+        if core::mem::size_of::<T>() == 1 {
+            let bytes = capacity * Self::SSO_STRIDE;
+            if let Some((p, _)) = bump.try_alloc_inline::<ALIGN>(bytes) {
+                for i in 0..capacity {
+                    unsafe { *p.add(i * Self::SSO_STRIDE) = 0u8 };
+                }
+                return Self {
+                    ptr: ptr::null_mut(),
+                    len: 0,
+                    cap: capacity,
+                    sso: Some(Self::sso_flag()),
+                    sso_base: p,
+                };
+            }
         }
         let ptr = bump.alloc_uninit_slice_m::<T, ALIGN, MODE>(capacity);
         Self {
             ptr,
             len: 0,
             cap: capacity,
+            sso: None,
+            sso_base: ptr::null_mut(),
         }
     }
 
     #[inline(always)]
     #[cfg_attr(coverage, coverage(off))]
     fn push_m<const ALIGN: usize, const MODE: u32>(&mut self, value: T, bump: &ThreadBump) {
+        if core::mem::size_of::<T>() == 1
+            && self.is_sso()
+            && self.len < self.cap
+            && self.sso_write(self.len, &value)
+        {
+            self.len += 1;
+            return;
+        }
         if self.len == self.cap {
             self.grow_m::<ALIGN, MODE>(bump);
         }
@@ -3298,14 +3529,24 @@ impl<T> ArenaVec<T> {
         unsafe {
             ptr::copy_nonoverlapping(slice.as_ptr(), ptr, len);
         }
-        Self { ptr, len, cap: len }
+        Self {
+            ptr,
+            len,
+            cap: len,
+            sso: None,
+            sso_base: ptr::null_mut(),
+        }
     }
 
     #[cfg_attr(coverage, coverage(off))]
     fn grow_m<const ALIGN: usize, const MODE: u32>(&mut self, bump: &ThreadBump) {
         let new_cap = if self.cap == 0 { 4 } else { self.cap * 2 };
         let new_ptr = bump.alloc_uninit_slice_m::<T, ALIGN, MODE>(new_cap);
-        if self.len > 0 {
+        if self.is_sso() {
+            self.sso_promote_into(new_ptr);
+            self.sso = None;
+            self.sso_base = ptr::null_mut();
+        } else if self.len > 0 {
             unsafe {
                 ptr::copy_nonoverlapping(self.ptr, new_ptr, self.len);
             }
@@ -3316,6 +3557,18 @@ impl<T> ArenaVec<T> {
 
     /// Возвращает срез элементов (безопасно, если len > 0)
     fn as_slice(&self) -> &[T] {
+        if self.is_sso() {
+            debug_assert_eq!(core::mem::size_of::<T>(), 1);
+            // Собираем элементы из inline-слотов. Вызывающие для SSO-векторов
+            // — только `ArenaString::deref` (байты <= 23 на слот).
+            unsafe {
+                let mut out = Vec::with_capacity(self.len);
+                for i in 0..self.len {
+                    out.push(*(self.sso_data_at(i) as *const T));
+                }
+                std::mem::transmute::<Vec<T>, _>(std::mem::ManuallyDrop::new(out))
+            }
+        }
         if self.len == 0 {
             return &[];
         }
@@ -3325,6 +3578,10 @@ impl<T> ArenaVec<T> {
 
 impl<T> Drop for ArenaVec<T> {
     fn drop(&mut self) {
+        // SSO-векторы содержат только байты (Copy) — drop-элементов не нужен.
+        if self.is_sso() {
+            return;
+        }
         for i in 0..self.len {
             unsafe {
                 self.ptr.add(i).drop_in_place();
@@ -5198,6 +5455,32 @@ mod tests {
     }
     fn count_scale(base: usize) -> usize {
         base / MS
+    }
+
+    /// По профилю pprof hotspot — частые `mmap`/`munmap` в `grow_fallback`:
+    /// fallback-чанки были крошечными (`base_chunk.max(need)` при
+    /// `base_chunk == 0`). Регрессия: floor по умолчанию обязан быть не меньше
+    /// 1 МБ, чтобы один mmap покрывал тысячи мелких аллокаций.
+    #[test]
+    fn fallback_chunk_bytes_default_floor_is_1mb() {
+        // Регион >= floor: чанк = min(floor, cap), а не `need` и не 0.
+        assert_eq!(
+            fallback_chunk_bytes(0, 8, 64 * 1024 * 1024),
+            DEFAULT_FALLBACK_CHUNK_BYTES
+        );
+        // need больше floor — берём need (аллокация обязана влезть в чанк).
+        assert_eq!(
+            fallback_chunk_bytes(0, 2 * 1024 * 1024, 64 * 1024 * 1024),
+            2 * 1024 * 1024
+        );
+        // base_chunk больше floor — пол не уменьшает его.
+        assert_eq!(
+            fallback_chunk_bytes(4 * 1024 * 1024, 8, 64 * 1024 * 1024),
+            4 * 1024 * 1024
+        );
+        // Маленький регион (< дефолтного floor): каппинг не применяется,
+        // поведение как историческое (тесты границ/OOM не ломаются).
+        assert_eq!(fallback_chunk_bytes(0, 8, 4096), 8);
     }
 
     /// Один bump заданного направления на `cap` байт.
