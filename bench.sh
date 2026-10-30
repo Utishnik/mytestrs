@@ -149,8 +149,9 @@ if [ "$TUNE" = "1" ]; then
     # shellcheck disable=SC2064
     trap "rm -f '$TUNE_LOG'" EXIT
     # R3_VERBOSE=1: тюн печатает статус привилегии «Lock pages in memory» и
-    # факт получения huge pages каждой ареной (иначе на Windows молча
-    # откатываемся на 4KB-страницы и причины не видно).
+    # однократную диагностику huge pages (иначе на Windows молча откатываемся
+    # на 4KB-страницы и причины не видно). Массовые принты [Arena] про каждое
+    # выделение под R3_VERBOSE=2 — здесь они не нужны.
     # Число потоков тюна должно совпадать с основным прогоном: чанк подбирается
     # per-thread, а суммарная память = chunk × threads. При --no-smt тюним на
     # физических ядрах (иначе подобранное значение завышено вдвое по RAM).
@@ -192,9 +193,10 @@ for a in $ALLOCATORS; do
         else
             unset R3_ALLOCATOR_LABEL || true
         fi
-        # R3_VERBOSE=1: в лог попадают строки [Arena] — получен ли региону
-        # huge pages (на Windows без привилегии «Lock pages in memory» или при
-        # не-кратном GetLargePageMinimum() размере арена молча живёт на 4KB).
+        # В логе остаются только однократные диагностические строки [Arena]
+        # (привилегия large pages, предупреждения). Массовые принты про каждое
+        # выделение и [TOTAL CAPACITY] убраны из вывода: они печатались десятки
+        # раз за бенч и засоряли его (см. R3_VERBOSE=2 в src/lib.rs).
         R3_VERBOSE=1 "$BIN" | tee "bench_mode${m}${suffix}.log"
     done
 done

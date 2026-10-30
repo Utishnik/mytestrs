@@ -1111,7 +1111,12 @@ impl SharedArena {
             );
         }
 
-        if verbose_enabled() {
+        // Принт про каждое выделение по умолчанию убран: арены создаются
+        // десятки раз за бенч, и эти строки засоряли вывод. Включается только
+        // явным R3_VERBOSE=2 (при R3_VERBOSE=1 остаются лишь однократные
+        // диагностические сообщения — см. WARNING выше и `[huge]` в
+        // platform::large_pages_available).
+        if std::env::var("R3_VERBOSE").as_deref() == Ok("2") {
             println!(
                 "  [Arena] Выделено {} MB (запрошено {} MB), huge pages: {}",
                 cap / (1024 * 1024),
@@ -3811,9 +3816,8 @@ fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
     install_ctrlc_handler();
     let core_ids = get_cores(smt);
     let total_capacity = chunk_size * core_ids.len();
-    if verbose_enabled() {
-        println!("[TOTAL CAPACITY]:  {}", total_capacity);
-    }
+    // Принт [TOTAL CAPACITY] убран: он дублировал информацию про каждое
+    // создание арены и засорял вывод бенча (см. R3_VERBOSE=2 выше).
     let arena = SharedArena::new(total_capacity);
     let mut bumps: Split<'_> = match layout {
         ArenaLayout::Uniform(dir) => arena.split_with_safe(core_ids.len(), dir),
@@ -4653,17 +4657,19 @@ pub fn arena_tune_scan(smt: bool) -> usize {
     best.0
 }
 
-/// Отладочные принты арены (`[Arena] ...`, `[TOTAL CAPACITY] ...`) по
-/// умолчанию ВЫКЛЮЧЕНЫ, чтобы не засорять вывод `cargo bench` и обычный прогон
-/// бинаря: эти строки печатаются при каждом создании арены, то есть десятки
-/// раз за бенч. Включаются явным `R3_VERBOSE=1` (так их и включает bench.sh).
-/// Если процессу пришёл SIGINT (Ctrl+C) — печать дополнительно гасится:
-/// прерванный прогон не должен генерировать новый вывод.
+/// Отладочные принты арены (`[Arena] ...`) по умолчанию ВЫКЛЮЧЕНЫ, чтобы не
+/// засорять вывод `cargo bench` и обычный прогон бинаря: эти строки печатаются
+/// при каждом создании арены, то есть десятки раз за бенч. Однократная
+/// диагностика (привилегия large pages, `[huge]` errno) включается явным
+/// `R3_VERBOSE=1` (так её включает bench.sh); массовые принты про каждое
+/// выделение — только `R3_VERBOSE=2`. Если процессу пришёл SIGINT (Ctrl+C) —
+/// печать гасится полностью: прерванный прогон не должен генерировать новый
+/// вывод.
 fn verbose_enabled() -> bool {
     if interrupted().load(std::sync::atomic::Ordering::Relaxed) {
         return false;
     }
-    std::env::var("R3_VERBOSE").as_deref() == Ok("1")
+    matches!(std::env::var("R3_VERBOSE").as_deref(), Ok("1") | Ok("2"))
 }
 
 /// Флаг «получили SIGINT». Ставится обработчиком сигнала (см.
@@ -6854,7 +6860,7 @@ mod tests {
 
     #[test]
     fn cov_verbose_println_arena_new() {
-        unsafe { std::env::set_var("R3_VERBOSE", "1") };
+        unsafe { std::env::set_var("R3_VERBOSE", "2") };
         let _a = SharedArena::new(4096);
         unsafe { std::env::remove_var("R3_VERBOSE") };
     }
