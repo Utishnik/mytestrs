@@ -25,7 +25,12 @@ use std::sync::OnceLock;
 /// override — кеш здесь безопасен: tune-скан выполняется до первого вызова.
 fn arena_pgo() -> (usize, usize) {
     static P: OnceLock<(usize, usize)> = OnceLock::new();
-    *P.get_or_init(|| (profile_arena_chunk_size_full(), profile_arena_chunk_size_light()))
+    *P.get_or_init(|| {
+        (
+            profile_arena_chunk_size_full(),
+            profile_arena_chunk_size_light(),
+        )
+    })
 }
 
 #[hotpath::main]
