@@ -433,7 +433,7 @@ impl DonorPolicy {
 
 #[cfg(windows)]
 mod platform {
-    use super::{RawAllocation, verbose_enabled};
+    use super::{huge_enabled, RawAllocation, verbose_enabled};
     use std::ptr;
     use std::sync::OnceLock;
     use windows_sys::Win32::Foundation::{
@@ -452,9 +452,10 @@ mod platform {
     // unused_imports. Атрибуты внутри use-списка запрещены синтаксисом Rust,
     // поэтому выносим в отдельные import'ы.
     #[cfg(not(miri))]
-    use windows_sys::Win32::System::SystemInformation::{
-        GetLargePageMinimum, GetSystemInfo, SYSTEM_INFO,
-    };
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    // GetLargePageMinimum живёт в Win32_System_Memory (попал сюда через
+    // glob-импорт `Memory::*` выше), а НЕ в SystemInformation — прямой
+    // импорт оттуда ломает сборку на Windows (E0432).
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     /// Включаем SeLockMemoryPrivilege ("Lock pages in memory"), если она
@@ -506,7 +507,7 @@ mod platform {
                     if enabled {
                         "ENABLED"
                     } else {
-                        "Р Р…Р ВµР Т‘Р С•РЎРѓРЎвЂљРЎС“Р С—Р Р…Р В° (large pages Р Р†РЎвЂ№Р С”Р В»РЎР‹РЎвЂЎР ВµР Р…РЎвЂ№)"
+                        "недоступна (large pages выключены)"
                     }
                 );
             }
@@ -1112,7 +1113,7 @@ impl SharedArena {
 
         if verbose_enabled() {
             println!(
-                "  [Arena] Р вЂ™РЎвЂ№Р Т‘Р ВµР В»Р ВµР Р…Р С• {} MB (Р В·Р В°Р С—РЎР‚Р С•РЎв‚¬Р ВµР Р…Р С• {} MB), huge pages: {}",
+                "  [Arena] Выделено {} MB (запрошено {} MB), huge pages: {}",
                 cap / (1024 * 1024),
                 total_capacity / (1024 * 1024),
                 alloc.is_huge
@@ -2441,7 +2442,7 @@ impl ThreadBump {
                 let cur = d.lo.load(Ordering::Relaxed);
                 let hi = d.hi.load(Ordering::Relaxed);
                 if hi > d.len {
-                    return None; // Р Т‘Р С•Р Р…Р С•РЎР‚ Р С‘Р В·РЎР‚Р В°РЎРѓРЎвЂ¦Р С•Р Т‘Р С•Р Р†Р В°Р Р… РІР‚вЂќ Р В·Р В°РЎвЂ°Р С‘РЎвЂљР В° Р С•РЎвЂљ underflow
+                    return None; // донор израсходован — защита от underflow
                 }
                 let off = (cur + ALIGN - 1) & !(ALIGN - 1);
                 let end = off + size;
@@ -2916,7 +2917,7 @@ impl ThreadBump {
         children
     }
 
-    /// Р В Р В°Р В·Р Т‘Р ВµР В»Р С‘РЎвЂљРЎРЉ РЎР‚Р ВµР С–Р С‘Р С•Р Р… Р Р…Р В° `n` Р Р…Р ВµР С—Р ВµРЎР‚Р ВµРЎРѓР ВµР С”Р В°РЎР‹РЎвЂ°Р С‘РЎвЂ¦РЎРѓРЎРЏ Р СњР вЂў-Send Р В·Р С•Р Р… (`ZoneBump`).
+    /// Разделить регион на `n` непересекающихся НЕ-Send зон (`ZoneBump`).
     #[allow(dead_code)]
     pub fn split_local(&self, n: usize, dir: BumpDir) -> Vec<ZoneBump<'static>> {
         let base = self.ptr;
@@ -3353,7 +3354,7 @@ impl ZoneBump<'static> {
     #[allow(private_interfaces)]
     pub fn into_thread(self) -> CachePadded<ThreadBump> {
         let data = Rc::try_unwrap(self.inner)
-            .unwrap_or_else(|_| panic!("into_thread: РЎС“ Р В·Р С•Р Р…РЎвЂ№ Р ВµРЎРѓРЎвЂљРЎРЉ Р В¶Р С‘Р Р†РЎвЂ№Р Вµ Р С”Р В»Р С•Р Р…РЎвЂ№"));
+            .unwrap_or_else(|_| panic!("into_thread: у зоны есть живые клоны"));
         CachePadded::new(ThreadBump::restore_from_zone(data))
     }
 }
@@ -3807,6 +3808,7 @@ enum ArenaLayout {
 /// (FULL: 200×200×100, LIGHT: 100×100×100), `layout` — направлением заполнения.
 #[cfg_attr(coverage, coverage(off))]
 fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
+    install_ctrlc_handler();
     let core_ids = get_cores(smt);
     let total_capacity = chunk_size * core_ids.len();
     if verbose_enabled() {
@@ -4479,7 +4481,10 @@ pub fn arena_tune_scan(smt: bool) -> usize {
     let cap = pgo_chunk_cap().max(mb);
     let style = bench_style();
     let run_mono = style != BenchStyle::Dispatch;
-    let run_dispatch = style != BenchStyle::Mono;
+    // dispatch-нагрузки (`load`) гоняются ВСЕГДА (см. комментарий у `load_all`:
+    // по mmap-счётчикам судим только по dispatch-прогону), поэтому отдельный
+    // флаг `run_dispatch` нигде не читается — `_`, чтобы не шуметь warning'ом.
+    let _run_dispatch = style != BenchStyle::Mono;
     let rounds = std::env::var("R3_TUNE_ROUNDS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
@@ -4649,10 +4654,50 @@ pub fn arena_tune_scan(smt: bool) -> usize {
 }
 
 /// Отладочные принты арены показываются только при R3_VERBOSE=1,
-/// чтобы не засорять вывод `cargo bench`.
+/// чтобы не засорять вывод `cargo bench`. Если процессу пришёл SIGINT
+/// (Ctrl+C) — печать полностью выключается: прерванный прогон больше не
+/// должен генерировать вывод (иначе терминал превращается в кашу из
+/// сообщений, как на Windows без Ctrl-C handler'а).
 fn verbose_enabled() -> bool {
+    if interrupted().load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
     std::env::var("R3_VERBOSE").is_ok()
 }
+
+/// Флаг «получили SIGINT». Ставится обработчиком сигнала (см.
+/// `install_ctrlc_handler`); читается `verbose_enabled()`, чтобы после
+/// Ctrl+C не печатать ничего нового.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+fn interrupted() -> &'static AtomicBool {
+    &INTERRUPTED
+}
+
+/// Обработчик Ctrl+C. На Unix ставится через `sigaction` с флагом
+/// `SA_RESTART` (прерванные системные вызовы перезапускаются, поведение
+/// потоков не меняется); на Windows и в miri — no-op (на Windows shell
+/// обрабатывает Ctrl+C сама). Вызов идемпотентен.
+#[cfg(all(unix, not(miri)))]
+fn install_ctrlc_handler() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        unsafe extern "C" fn on_sigint(_sig: libc::c_int) {
+            INTERRUPTED.store(true, Ordering::Relaxed);
+        }
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_sigint as usize;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(libc::SIGINT, &sa, ptr::null_mut());
+        }
+    });
+}
+
+#[cfg(any(windows, miri))]
+fn install_ctrlc_handler() {}
 
 /// Какую версию бенчмарка «shared arena» гонять: полностью мономорфную
 /// (`alloc_raw_m`, `arena_m_*`), с runtime-диспетчером (`arena_bench`,
@@ -4711,17 +4756,17 @@ fn run_arena_variant<M: Fn(usize, bool) -> (), D: Fn(usize, bool) -> ()>(
     match style {
         BenchStyle::Mono => {
             let t = bench(&|c, s| mono(c, s));
-            println!("  {:<12} mono     : {} Р’Вµs", label, median(&t));
+            println!("  {:<12} mono     : {} µs", label, median(&t));
         }
         BenchStyle::Dispatch => {
             let t = bench(&|c, s| dispatch(c, s));
-            println!("  {:<12} dispatch : {} Р’Вµs", label, median(&t));
+            println!("  {:<12} dispatch : {} µs", label, median(&t));
         }
         BenchStyle::Both => {
             let t_mono = bench(&|c, s| mono(c, s));
             let t_disp = bench(&|c, s| dispatch(c, s));
             println!(
-                "  {:<12} mono {:>6} Р’Вµs | dispatch {:>6} Р’Вµs",
+                "  {:<12} mono {:>6} µs | dispatch {:>6} µs",
                 label,
                 median(&t_mono),
                 median(&t_disp)
@@ -5142,6 +5187,9 @@ pub fn pgo_train() {
 
 #[cfg_attr(coverage, coverage(off))]
 fn run_directional_benchmarks(smt: bool, pgo_full_arena: usize, pgo_light_arena: usize) {
+    // Ctrl+C во время длинного прогона: ставим обработчик и гасим весь
+    // дальнейший verbose-вывод (см. `verbose_enabled`). Идемпотентно.
+    install_ctrlc_handler();
     let mode_str = if smt {
         "SMT (all logical cores)"
     } else {
@@ -5432,7 +5480,7 @@ fn run_benchmarks(
 
         match style {
             BenchStyle::Mono => println!(
-                "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena(mono) = {} Р’Вµs",
+                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena(mono) = {} µs",
                 round + 1,
                 median(&mimm_times),
                 median(&bump_times),
@@ -5440,7 +5488,7 @@ fn run_benchmarks(
                 arena_mono_us
             ),
             BenchStyle::Dispatch => println!(
-                "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena(dispatch) = {} Р’Вµs",
+                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena(dispatch) = {} µs",
                 round + 1,
                 median(&mimm_times),
                 median(&bump_times),
@@ -5448,7 +5496,7 @@ fn run_benchmarks(
                 arena_disp_us
             ),
             BenchStyle::Both => println!(
-                "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena mono|dispatch = {}|{} Р’Вµs",
+                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena mono|dispatch = {}|{} µs",
                 round + 1,
                 median(&mimm_times),
                 median(&bump_times),
@@ -5486,7 +5534,7 @@ fn run_benchmarks(
 
         match style {
             BenchStyle::Mono => println!(
-                "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena(mono) = {} Р’Вµs",
+                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena(mono) = {} µs",
                 round + 1,
                 median(&mimm_times),
                 median(&bump_times),
@@ -5494,7 +5542,7 @@ fn run_benchmarks(
                 arena_mono_us
             ),
             BenchStyle::Dispatch => println!(
-                "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena(dispatch) = {} Р’Вµs",
+                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena(dispatch) = {} µs",
                 round + 1,
                 median(&mimm_times),
                 median(&bump_times),
@@ -5502,7 +5550,7 @@ fn run_benchmarks(
                 arena_disp_us
             ),
             BenchStyle::Both => println!(
-                "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena mono|dispatch = {}|{} Р’Вµs",
+                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena mono|dispatch = {}|{} µs",
                 round + 1,
                 median(&mimm_times),
                 median(&bump_times),
