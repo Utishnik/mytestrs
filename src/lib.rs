@@ -10,8 +10,8 @@ use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use triomphe::Arc;
 
 /// Подсказка префетчеру: блок по `addr` будет сразу записан вызывающим.
@@ -212,10 +212,7 @@ const DEFAULT_FALLBACK_CHUNK_BYTES: usize = 1024 * 1024;
 fn huge_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        cfg!(feature = "huge")
-            || std::env::var("R3_HUGE")
-                .map(|v| v == "1")
-                .unwrap_or(false)
+        cfg!(feature = "huge") || std::env::var("R3_HUGE").map(|v| v == "1").unwrap_or(false)
     })
 }
 
@@ -433,7 +430,7 @@ impl DonorPolicy {
 
 #[cfg(windows)]
 mod platform {
-    use super::{huge_enabled, RawAllocation, verbose_enabled};
+    use super::{RawAllocation, huge_enabled, verbose_enabled};
     use std::ptr;
     use std::sync::OnceLock;
     use windows_sys::Win32::Foundation::{
@@ -444,9 +441,7 @@ mod platform {
         TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
     };
     use windows_sys::Win32::System::Memory::*;
-    use windows_sys::Win32::System::SystemInformation::{
-        GlobalMemoryStatusEx, MEMORYSTATUSEX,
-    };
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // GetSystemInfo/SYSTEM_INFO нужны только вне Miri (page_size); под
     // Miri-сборкой с кросс-таргетом на windows это вызвало бы warning
     // unused_imports. Атрибуты внутри use-списка запрещены синтаксисом Rust,
@@ -671,11 +666,7 @@ mod platform {
         static HUGE: OnceLock<usize> = OnceLock::new();
         *HUGE.get_or_init(|| {
             let min = unsafe { GetLargePageMinimum() };
-            if min == 0 {
-                page_size()
-            } else {
-                min as usize
-            }
+            if min == 0 { page_size() } else { min as usize }
         })
     }
 
@@ -780,7 +771,7 @@ mod platform {
 
 #[cfg(unix)]
 mod platform {
-    use super::{huge_enabled, RawAllocation};
+    use super::{RawAllocation, huge_enabled};
     use std::ptr;
     use std::sync::OnceLock;
 
@@ -3226,8 +3217,7 @@ impl ZoneBump<'static> {
             None => true,
         };
         if full {
-            let alloc_size =
-                fallback_chunk_bytes(d.base_chunk, need, d.len).next_multiple_of(page);
+            let alloc_size = fallback_chunk_bytes(d.base_chunk, need, d.len).next_multiple_of(page);
             fb.chunks.push(platform::alloc_normal(alloc_size));
             fb.used = 0;
         }
@@ -4304,9 +4294,8 @@ pub fn profile_arena_chunk_size_full() -> usize {
     // выдаваться — тогда откатываемся к половинкам, пока арена не влезет.
     let mut cap_probe = 1024 * 1024 * 1024;
     let arena = loop {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            SharedArena::new(cap_probe)
-        })) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| SharedArena::new(cap_probe)))
+        {
             Ok(a) => break a,
             Err(_) if cap_probe > 16 * 1024 * 1024 => cap_probe /= 2,
             Err(_) => panic!("profile_arena_chunk_size_full: не удалось выделить арену"),
@@ -4409,15 +4398,20 @@ fn arena_need_bytes(full: bool) -> usize {
         let arena = SharedArena::new(1024 * 1024 * 1024);
         let bumps = arena.split_safe(1);
         let bump = &bumps[0];
-        let (vcap, outer, inner) = if full { (40000, 200, 200) } else { (10000, 100, 100) };
+        let (vcap, outer, inner) = if full {
+            (40000, 200, 200)
+        } else {
+            (10000, 100, 100)
+        };
 
         let mut vectr: ArenaVec<ArenaVec<ArenaString>> = ArenaVec::with_capacity_in::<
             { core::mem::align_of::<ArenaVec<ArenaString>>() },
         >(vcap / s, bump);
         for _ in 0..(outer / s).max(1) {
             for _ in 0..(inner / s).max(1) {
-                let mut vec: ArenaVec<ArenaString> =
-                    ArenaVec::with_capacity_in::<{ core::mem::align_of::<ArenaString>() }>(400, bump);
+                let mut vec: ArenaVec<ArenaString> = ArenaVec::with_capacity_in::<
+                    { core::mem::align_of::<ArenaString>() },
+                >(400, bump);
                 for _ in 0..(100 / s).max(1) {
                     vec.push::<{ core::mem::align_of::<ArenaString>() }>(
                         ArenaString::from_str_in("stroka", bump),
@@ -4822,8 +4816,7 @@ impl PprofGuard {
             .unwrap_or(false);
         let hz: i32 = if half { (base_hz / 2).max(1) } else { base_hz }.clamp(1, 10_000);
 
-        let out = std::env::var("R3_PPROF_FILE")
-            .unwrap_or_else(|_| "r3-pprof.svg".to_string());
+        let out = std::env::var("R3_PPROF_FILE").unwrap_or_else(|_| "r3-pprof.svg".to_string());
 
         match pprof::ProfilerGuardBuilder::default().frequency(hz).build() {
             Ok(guard) => {
@@ -4835,10 +4828,7 @@ impl PprofGuard {
             }
             Err(e) => {
                 eprintln!("[pprof] failed to start profiler: {e}");
-                Self {
-                    guard: None,
-                    out,
-                }
+                Self { guard: None, out }
             }
         }
     }
