@@ -258,21 +258,36 @@ fn fallback_chunk_bytes(base_chunk: usize, need: usize, cap: usize) -> usize {
 // `Drop for ThreadBump`) и `__mmap64` из `grow_fallback`: арена живёт в режиме
 // «попросил у ОС → отдал ОС» на каждой итерации бенча (new → alloc → Drop).
 // Кэш возвращает освобождённые чанки во владение тому же потоку без обращения
-// к ОС (ни `munmap` на drop, ни нового `mmap` на grow). Хранится ровно один
-// чанок на поток — этого достаточно для steady-state «создал арену → уронил
-// арену», где каждый новый чанк совпадает по размеру с предыдущим.
+// к ОС (ни `munmap` на drop, ни нового `mmap` на grow).
+//
+// A4-фикс (было: ровно один слот): кэш хранит до `RAW_CACHE_SLOTS` чанков.
+// Прежняя однослотовая схема при чередовании размеров (например, автоподбор
+// `arena_tune_scan` гоняет сетку кандидатов: 8 МБ → 16 МБ → 32 МБ → ...)
+// вытесняла каждый новый чанк прежним через `munmap`, т.е. на КАЖДОМ росте
+// fallback всё равно происходил системный вызов — ровно тот hotspot, ради
+// которого кэш заводился. С несколькими слотами переиспользуется каждый
+// ранее освобождавшийся размер.
+//
+// Выбор слота при `take` — best-fit (наименьший подходящий по размеру), а не
+// LIFO: иначе большой чанк (например, гигантский кандидат скана или need-чанк)
+// осел бы единственным жителем кэша и все мелкие аллокации следующей конфигурации
+// снова уходили бы в `mmap` (регресс относительно старого поведения).
+//
+// Вытеснение при переполнении — по наименьшему размеру: он хуже всего подходит
+// будущим крупным запросам (best-fit всё равно не смог бы его отдать) и
+// освобождает больше памяти ОС за один `munmap`.
 //
 // ВАЖНО (падал `miri (windows-latest)` из-за `memory leaked`): thread_local с
 // деструктором не может быть `const`-инициализирован, поэтому раньше кэш был
 // `Cell<Option<RawAllocation>>` без Drop и никогда не дренировался при
 // завершении процесса — Miri репортит утечку каждой оставшейся в кэше
-// std-аллокации. Теперь кэш хранит `Cell<Option<Box<ChunkSlot>>>`, где
-// `ChunkSlot` освобождает чанк в своём `Drop`.
+// std-аллокации. Теперь кэш хранит `Option<Box<ChunkSlot>>`, где `ChunkSlot`
+// освобождает чанк в своём `Drop`; массив опций дропается вместе с тред-локалью.
 //
-// Оговорка про «Box уничтожается вместе с потоком/процессом автоматически»:
+// Оговорка про «значения уничтожаются вместе с потоком/процессом автоматически»:
 // это верно только для типов БЕЗ деструктора. `ChunkSlot` содержит `Drop`,
-// поэтому обычный `thread_local!` гарантированно вызывает деструктор слота
-// при завершении потока (в том числе под Miri) — на этом и построен фикс.
+// поэтому обычный `thread_local!` гарантированно вызывает деструктор каждого
+// слота при завершении потока (в том числе под Miri) — на этом и построен фикс.
 // Именно поэтому здесь НЕ используется `const`-инициализация тред-локали:
 // `thread_local! { static X: T = const { ... } }` запрещена для типов с
 // деструктором (E0730), а если бы компилировалась, то деструктор вообще не
@@ -288,39 +303,97 @@ impl Drop for ChunkSlot {
     }
 }
 
+/// Максимум чанков в thread-local кэше. Больше — уже смысл теряет: кэш нужен
+/// для steady-state переиспользования нескольких типоразмеров fallback-чанков
+/// одним потоком, а не для удержания всей памяти процесса (лишённая слота
+/// память возвращается ОС тем же `munmap`, что и раньше).
+const RAW_CACHE_SLOTS: usize = 8;
+
 thread_local! {
-    static FREED_CHUNK_CACHE: RawAllocationCache = const { RawAllocationCache(std::cell::Cell::new(None)) };
+    static FREED_CHUNK_CACHE: RawAllocationCache = const { RawAllocationCache::new() };
 }
 
-struct RawAllocationCache(std::cell::Cell<Option<Box<ChunkSlot>>>);
+struct RawAllocationCache {
+    slots: [std::cell::Option<Box<ChunkSlot>>; RAW_CACHE_SLOTS],
+}
 
 impl RawAllocationCache {
+    /// `const`-конструктор: `[const { ... }; N]` копирует элемент, а `Option`
+    /// не `Copy`, поэтому раскрываем массив литералом.
+    const fn new() -> Self {
+        RawAllocationCache {
+            slots: [
+                std::cell::Option::new(None),
+                std::cell::Option::new(None),
+                std::cell::Option::new(None),
+                std::cell::Option::new(None),
+                std::cell::Option::new(None),
+                std::cell::Option::new(None),
+                std::cell::Option::new(None),
+                std::cell::Option::new(None),
+            ],
+        }
+    }
+
     /// Забрать закэшированный чанк подходящего размера (иначе `None`).
+    /// Best-fit: отдаётся НАИМЕНЬШИЙ подходящий чанк — большие слоты берегутся
+    /// под большие запросы (см. комментарий к модулю кэша).
     #[inline]
     fn take(&self, size: usize) -> Option<RawAllocation> {
-        match self.0.take() {
-            Some(slot) if slot.0.size >= size => {
-                // Достаём чанк из Box без запуска Drop слота: `slot` — owned
+        let mut best: Option<usize> = None;
+        for (i, slot) in self.slots.iter().enumerate() {
+            if let Some(ch) = slot.get_ref() {
+                let cs = ch.0.size;
+                if cs >= size && best.map_or(true, |b| cs < self.slots[b].get_ref().unwrap().0.size)
+                {
+                    best = Some(i);
+                }
+            }
+        }
+        let slot = best?.to_owned();
+        match slot.take() {
+            Some(ch) if ch.0.size >= size => {
+                // Достаём чанк из Box без запуска Drop слота: `ch` — owned
                 // значение (`Box<ChunkSlot>`), поле читается напрямую,
                 // `ptr::read`/`forget` не нужны.
-                let a = slot.0;
-                drop(slot); // освобождается только сам Box-«ящик»
+                let a = ch.0;
+                drop(ch); // освобождается только сам Box-«ящик»
                 Some(a)
             }
+            // Гонки нет: кэш thread-local, а `&self` требует `&ThreadBump`,
+            // которая требует `&self` того же bump'а — т.е. этот же поток.
             other => {
-                // Не подошёл по размеру (или его нет) — при вытеснении `other`
-                // чанк будет освобождён автоматически Drop'ом слота.
                 drop(other);
                 None
             }
         }
     }
 
-    /// Положить чанк в кэш; прежний содержимец кэша освобождается через ОС
-    /// (Drop слота при уничтожении вытесненного `Box`).
+    /// Положить чанк в кэш. Если все слоты заняты, вытесняется чанк НАИМЕНЬШЕГО
+    /// размера (он освобождается через ОС Drop'ом вытесненного слота).
     #[inline]
     fn put(&self, alloc: RawAllocation) {
-        self.0.replace(Some(Box::new(ChunkSlot(alloc))));
+        let box_slot = Box::new(ChunkSlot(alloc));
+        let mut smallest: Option<usize> = None;
+        for (i, slot) in self.slots.iter().enumerate() {
+            match slot.get_ref() {
+                None => {
+                    *self.slots[i].borrow_mut() = Some(box_slot);
+                    return;
+                }
+                Some(ch) => {
+                    if smallest.map_or(true, |s| {
+                        ch.0.size < self.slots[s].get_ref().unwrap().0.size
+                    }) {
+                        smallest = Some(i);
+                    }
+                }
+            }
+        }
+        // Все слоты заняты — вытесняем наименьший (его Drop освободит память
+        // через ОС; наш чанк встанет на его место).
+        let s = smallest.expect("RAW_CACHE_SLOTS > 0");
+        *self.slots[s].borrow_mut() = Some(box_slot);
     }
 }
 
