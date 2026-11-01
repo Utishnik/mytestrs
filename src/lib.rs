@@ -6241,7 +6241,11 @@ mod tests {
             fb.chunks.len()
         );
         for c in fb.chunks.iter() {
-            assert!(c.size >= 64 * 1024, "fallback-чанк {} B — слишком мелкий", c.size);
+            assert!(
+                c.size >= 64 * 1024,
+                "fallback-чанк {} B — слишком мелкий",
+                c.size
+            );
         }
     }
 
