@@ -566,7 +566,7 @@ mod platform {
     }
 
     /// Быстрый prefault на запись одним syscall (Linux >= 5.14). Страницы
-    /// фолтятся в контексте вызывающего потока, поэтому NUMA first-touch
+    /// фолтятся в контексте вызывающего потока, поэтому NUMA first-touch в локальную NUMA-ноду
     /// сохраняется. На старых ядрах вернёт EINVAL -> false -> fallback.
     pub fn populate_write(ptr: *mut u8, len: usize) -> bool {
         if cfg!(miri) {
@@ -638,6 +638,19 @@ fn split_size_step(sz: usize) -> usize {
     }
 }
 
+/// Размер блока, который `grow_fallback` выделяет, когда в основном чанке
+/// кончилось место.
+///
+/// Раньше в `split_with`/`split_alternating`/`split_paired` стоял `base_chunk:
+/// 0`, и `grow_fallback` вырождался в `VirtualAlloc` по одной 4 KB странице на
+/// каждые ~680 мелких аллокаций (замер: дефицит 2–5% места в чанке давал
+/// замедление в 2–2.3 раза: 360 MiB → 1752 ms против 410 MiB → 784 ms).
+/// Сверху ограничиваем 8 MiB, чтобы исчерпание основного чанка не приводило к
+/// ещё одному многогигабайтному резерву.
+fn fallback_chunk_size(chunk_size: usize) -> usize {
+    chunk_size.min(8 * 1024 * 1024).max(64 * 1024)
+}
+
 struct SharedArena {
     alloc: RawAllocation,
 }
@@ -673,7 +686,7 @@ impl SharedArena {
 
         // Глобальный pre-fault убран: страницы теперь трогает каждый поток
         // самостоятельно (arena_full/arena_light -> bump.prefault_local()),
-        // чтобы обеспечить first-touch в локальной NUMA-ноде.
+        // чтобы обеспечить first-touch в локальную NUMA-ноду
 
         // Lock в RAM (best effort) - закомментировано по желанию
         /*
@@ -734,7 +747,6 @@ impl SharedArena {
                     is_huge: self.alloc.is_huge,
                     neighbor_idx: None,
                     array: ptr::null(),
-                    #[cfg(test)]
                     can_give: false,
                     self_index: 0,
                     donor_array: ptr::null(),
@@ -743,7 +755,7 @@ impl SharedArena {
                     donor_static_len: 0,
                     donor_bump: None,
                     use_priority: false,
-                    base_chunk: 0,
+                    base_chunk: fallback_chunk_size(chunk_size),
                     fallback: SpinMutex::new(FallbackChunks {
                         chunks: Vec::new(),
                         used: 0,
@@ -800,7 +812,6 @@ impl SharedArena {
                     is_huge: self.alloc.is_huge,
                     neighbor_idx: None,
                     array: ptr::null(),
-                    #[cfg(test)]
                     can_give: false,
                     self_index: 0,
                     donor_array: ptr::null(),
@@ -809,7 +820,7 @@ impl SharedArena {
                     donor_static_len: 0,
                     donor_bump: None,
                     use_priority: false,
-                    base_chunk: 0,
+                    base_chunk: fallback_chunk_size(chunk_size),
                     fallback: SpinMutex::new(FallbackChunks {
                         chunks: Vec::new(),
                         used: 0,
@@ -864,7 +875,6 @@ impl SharedArena {
                         is_huge,
                         neighbor_idx: None,
                         array: ptr::null(),
-                        #[cfg(test)]
                         can_give: false,
                         self_index: 0,
                         donor_array: ptr::null(),
@@ -873,7 +883,7 @@ impl SharedArena {
                         donor_static_len: 0,
                         donor_bump: None,
                         use_priority: false,
-                        base_chunk: 0,
+                        base_chunk: fallback_chunk_size(chunk_size),
                         fallback: SpinMutex::new(FallbackChunks {
                             chunks: Vec::new(),
                             used: 0,
@@ -896,7 +906,6 @@ impl SharedArena {
                         is_huge,
                         neighbor_idx: None,
                         array: ptr::null(),
-                        #[cfg(test)]
                         can_give: false,
                         self_index: 0,
                         donor_array: ptr::null(),
@@ -905,7 +914,7 @@ impl SharedArena {
                         donor_static_len: 0,
                         donor_bump: None,
                         use_priority: false,
-                        base_chunk: 0,
+                        base_chunk: fallback_chunk_size(chunk_size),
                         fallback: SpinMutex::new(FallbackChunks {
                             chunks: Vec::new(),
                             used: 0,
@@ -1063,7 +1072,6 @@ impl SharedArena {
 
         let mut bumps: Vec<CachePadded<ThreadBump>> = (0..num_threads)
             .map(|i| {
-                #[cfg(test)]
                 let can_give = policy.every > 0 && i % policy.every == 0;
                 // Длина последнего чанка ограничена концом арены (защита
                 // от OOB под Miri).
@@ -1078,7 +1086,6 @@ impl SharedArena {
                     is_huge,
                     neighbor_idx: None,
                     array: ptr::null(),
-                    #[cfg(test)]
                     can_give,
                     self_index: i,
                     donor_array: ptr::null(), // заполним ниже
@@ -1087,7 +1094,7 @@ impl SharedArena {
                     donor_static_len,
                     donor_bump: donor_bump.clone(),
                     use_priority: policy.use_priority,
-                    base_chunk: chunk_size,
+                    base_chunk: fallback_chunk_size(chunk_size),
                     fallback: SpinMutex::new(FallbackChunks {
                         chunks: Vec::new(),
                         used: 0,
@@ -1324,7 +1331,13 @@ pub struct ThreadBump {
     array: *const CachePadded<ThreadBump>,
     // ===== Поля режима «доноры» (отдельная версия) =====
     /// Помечен ли этот bump как способный отдавать память («донор»).
-    #[cfg(test)]
+    ///
+    /// В hot-path это признак «мои счётчики могут менять другие потоки»:
+    /// донора обходят заёмщики (`take_from_donor`) и CAS-ят его `lo`/`hi`,
+    /// поэтому только донору нужен CAS-цикл. Чужой (не-донорский) чанк не
+    /// трогает никто, и ему достаточно relaxed load+store — раньше признаком
+    /// служил `donor_reg != None`, который выставлен у ВСЕХ потоков в режиме
+    /// доноров, и весь режим зря платил за `lock cmpxchg` на каждой аллокации.
     can_give: bool,
     /// Собственный индекс в массиве bumps (чтобы не брать у самого себя).
     self_index: usize,
@@ -1439,20 +1452,20 @@ impl ThreadBump {
             // Обновление `lo` делаем через CAS, потому что тот же счётчик
             // параллельно может расширять сосед (заём памяти), см. `try_borrow`.
             BumpDir::Forward => {
-                // Быстрый путь: bump без пары и без доноров — этот поток
-                // единственный владелец `lo`, поэтому CAS-цикл не нужен
-                // (relaxed load+store быстрее lock-prefixed cmpxchg).
-                if self.neighbor_idx.is_none() && matches!(self.donor_reg, DonorReg::None) {
+                // Быстрый путь: чанк без пары, счётчики которого не меняет никто
+                // (ни сосед по паре, ни заёмщик-донор) — relaxed load+store
+                // дешевле lock-prefixed cmpxchg. Как только место кончилось,
+                // ПАДАЕМ в общий путь ниже: там попытка взять у соседа/доноров
+                // и только потом `grow_fallback`.
+                if self.neighbor_idx.is_none() && !self.can_give {
                     let cur = self.lo.load(Ordering::Relaxed);
                     let off = (cur + ALIGN - 1) & !(ALIGN - 1);
                     let end = off + size;
                     if end <= self.len {
                         self.lo.store(end, Ordering::Relaxed);
                         let p = unsafe { self.ptr.add(off) };
-                        prefetch_write(unsafe { self.ptr.add(off + size) });
                         return p;
                     }
-                    return self.grow_fallback::<ALIGN>(size);
                 }
                 let mid = if self.neighbor_idx.is_some() {
                     self.len / 2
@@ -1472,7 +1485,6 @@ impl ThreadBump {
                             // Forward-заполнение идёт вверх: префетчим следующий блок,
                             // в который будем писать при следующем выделении.
                             let p = unsafe { self.ptr.add(off) };
-                            prefetch_write(unsafe { self.ptr.add(off + size) });
                             return p;
                         }
                     } else if let Some(p) = self.try_borrow::<ALIGN>(size) {
@@ -1494,21 +1506,20 @@ impl ThreadBump {
             // половина — верхняя [mid, len). Обновление `hi` — через CAS
             // (тот же счётчик параллельно может расширять сосед-заёмщик).
             BumpDir::Backward => {
-                // Быстрый путь: без пары и доноров — единственный владелец `hi`.
-                if self.neighbor_idx.is_none() && matches!(self.donor_reg, DonorReg::None) {
+                // Быстрый путь: счётчики `hi` у этого чанка никто, кроме
+                // владельца, не меняет (ни сосед по паре, ни заёмщик-донор).
+                // Нет места — падаем в общий путь (заём у соседа/доноров,
+                // затем `grow_fallback`).
+                if self.neighbor_idx.is_none() && !self.can_give {
                     let cur = self.hi.load(Ordering::Relaxed);
                     let free = self.len.saturating_sub(cur);
-                    if size > free {
-                        return self.grow_fallback::<ALIGN>(size);
+                    if size <= free {
+                        let off = (self.len - cur - size) & !(ALIGN - 1);
+                        let new_hi = self.len - off;
+                        self.hi.store(new_hi, Ordering::Relaxed);
+                        let p = unsafe { self.ptr.add(off) };
+                        return p;
                     }
-                    let off = (self.len - cur - size) & !(ALIGN - 1);
-                    let new_hi = self.len - off;
-                    self.hi.store(new_hi, Ordering::Relaxed);
-                    let p = unsafe { self.ptr.add(off) };
-                    if off >= size {
-                        prefetch_write(unsafe { self.ptr.add(off - size) });
-                    }
-                    return p;
                 }
                 let mid = if self.neighbor_idx.is_some() {
                     self.len / 2
@@ -1537,9 +1548,6 @@ impl ThreadBump {
                                 // Backward-заполнение идёт вниз: префетчим следующий
                                 // блок (по меньшему адресу), в который будем писать.
                                 let p = unsafe { self.ptr.add(off) };
-                                if off >= size {
-                                    prefetch_write(unsafe { self.ptr.add(off - size) });
-                                }
                                 return p;
                             }
                             continue;
@@ -1620,25 +1628,32 @@ impl ThreadBump {
         let pair = MODE & ThreadBump::MODE_PAIR != 0;
         let donor = (MODE & ThreadBump::MODE_DONOR_MASK) >> 3;
         let dir = MODE & ThreadBump::MODE_DIR_MASK;
+        // В режиме пары направление задаётся не MODE, а тем, какую половину
+        // общего региона отдал `split_paired` (чётный — Backward, нечётный —
+        // Forward). Раньше mono-путь гонял MODE_PAIR_FWD для обоих потоков,
+        // и оба писали в [0, mid) — перекрытие и data race. Ловим рассинхрон
+        // в debug-сборках (в release проверка исчезает).
+        debug_assert!(
+            !pair || dir == self.dir as u32,
+            "MODE_DIR_* не совпадает с ThreadBump::dir в режиме пары"
+        );
         match dir {
             ThreadBump::MODE_DIR_FORWARD => {
-                if !pair && donor == 0 {
+                if !pair && (donor == 0 || !self.can_give) {
                     // Полный fast path: единственный владелец `lo` — ни CAS, ни
-                    // try_borrow/donor-веток, только load+store.
+                    // try_borrow/donor-веток, только load+store. В режиме доноров
+                    // так идёт любой НЕ-донорский чанк (его счётчики никто, кроме
+                    // владельца, не меняет), CAS остаётся только у самих доноров.
                     let cur = self.lo.load(Ordering::Relaxed);
                     let off = (cur + ALIGN - 1) & !(ALIGN - 1);
                     let end = off + size;
                     if end <= self.len {
                         self.lo.store(end, Ordering::Relaxed);
                         let p = unsafe { self.ptr.add(off) };
-                        prefetch_write(unsafe { self.ptr.add(off + size) });
                         return p;
                     }
-                    // Mono-путь бенча: при нехватке региона не паникуем, а
-                    // берём дополнительный чанк (иначе directional middle-out
-                    // падает при чётном числе аллокаций в итерации, см.
-                    // profile_arena_chunk_size_full).
-                    return self.grow_fallback::<ALIGN>(size);
+                    // Нет места — общий путь: заём у соседа/доноров, затем
+                    // дополнительный чанк из `grow_fallback`.
                 }
                 let mid = if pair { self.len / 2 } else { self.len };
                 loop {
@@ -1652,7 +1667,6 @@ impl ThreadBump {
                             .is_ok()
                         {
                             let p = unsafe { self.ptr.add(off) };
-                            prefetch_write(unsafe { self.ptr.add(off + size) });
                             return p;
                         }
                     } else if pair {
@@ -1675,19 +1689,16 @@ impl ThreadBump {
                 }
             }
             ThreadBump::MODE_DIR_BACKWARD => {
-                if !pair && donor == 0 {
+                if !pair && (donor == 0 || !self.can_give) {
                     let cur = self.hi.load(Ordering::Relaxed);
-                    if size > self.len.saturating_sub(cur) {
-                        return self.grow_fallback::<ALIGN>(size);
+                    let free = self.len.saturating_sub(cur);
+                    if size <= free {
+                        let off = (self.len - cur - size) & !(ALIGN - 1);
+                        let new_hi = self.len - off;
+                        self.hi.store(new_hi, Ordering::Relaxed);
+                        let p = unsafe { self.ptr.add(off) };
+                        return p;
                     }
-                    let off = (self.len - cur - size) & !(ALIGN - 1);
-                    let new_hi = self.len - off;
-                    self.hi.store(new_hi, Ordering::Relaxed);
-                    let p = unsafe { self.ptr.add(off) };
-                    if off >= size {
-                        prefetch_write(unsafe { self.ptr.add(off - size) });
-                    }
-                    return p;
                 }
                 let mid = if pair { self.len / 2 } else { 0 };
                 loop {
@@ -1709,9 +1720,6 @@ impl ThreadBump {
                                 .is_ok()
                             {
                                 let p = unsafe { self.ptr.add(off) };
-                                if off >= size {
-                                    prefetch_write(unsafe { self.ptr.add(off - size) });
-                                }
                                 return p;
                             }
                             continue;
@@ -1807,7 +1815,6 @@ impl ThreadBump {
                     // Сосед-Forward отдаёт с низкой стороны (растёт вверх):
                     // следующий заём — по большему адресу.
                     let p = unsafe { self.ptr.add(off) };
-                    prefetch_write(unsafe { self.ptr.add(off + size) });
                     return Some(p);
                 }
             }
@@ -1834,9 +1841,6 @@ impl ThreadBump {
                     // Сосед-Backward отдаёт с высокой стороны (растёт вниз):
                     // следующий заём — по меньшему адресу.
                     let p = unsafe { self.ptr.add(off) };
-                    if off >= size {
-                        prefetch_write(unsafe { self.ptr.add(off - size) });
-                    }
                     return Some(p);
                 }
             }
@@ -2138,6 +2142,10 @@ impl ThreadBump {
 
     /// First-touch: фолтим страницы ИСПОЛЬЗОВАННЫХ областей из текущего
     /// потока, чтобы они легли в локальную NUMA-ноду.
+    ///
+    /// Бенчмарк использует `prefault_own_region` (фолтит весь чанк ДО раундов);
+    /// этот вариант остаётся для «дофолта уже использованного» диапазона.
+    #[allow(dead_code)]
     #[hotpath::measure]
     #[cfg_attr(coverage, coverage(off))]
     fn prefault_local(&self) {
@@ -2166,6 +2174,32 @@ impl ThreadBump {
                 }
             }
         }
+    }
+
+    /// First-touch ВСЕГО собственного региона чанка (а не только уже
+    /// использованной части). Нужен бенчмарку: `prefault_local()` вызывается
+    /// сразу после `split`, когда `lo = hi = 0`, поэтому не фолтит ничего, и
+    /// первый раунд затем платит за page faults в разы больше, чем за сами
+    /// аллокации (замер: LIGHT 108 ms против 15 ms на тёплых страницах).
+    ///
+    /// Страницы трогает поток-владелец чанка (first-touch в локальную NUMA-ноду
+    /// включённой фиче `win-prefetch-pages` дополнительно отдаём диапазон
+    /// `PrefetchVirtualMemory` — ядро заполняет его батчем, параллельно с
+    /// работой потока.
+    #[cfg_attr(coverage, coverage(off))]
+    fn prefault_own_region(&self) {
+        if self.is_huge && platform::large_pages_precommitted() {
+            return;
+        }
+        let pair = self.neighbor_idx.is_some();
+        let (start, end) = match self.dir {
+            // В режиме пары собственный диапазон — нижняя половина.
+            BumpDir::Forward => (0, if pair { self.len / 2 } else { self.len }),
+            // В режиме пары собственный диапазон — верхняя половина.
+            BumpDir::Backward => (if pair { self.len / 2 } else { 0 }, self.len),
+            BumpDir::MiddleOut => (0, self.len),
+        };
+        self.prefault_range(start, end);
     }
 
     /// Фолт поддиапазона [start, end) с OS-оптимизациями и touch-loop fallback.
@@ -2220,7 +2254,6 @@ impl ThreadBump {
             is_huge,
             neighbor_idx: None,
             array: ptr::null(),
-            #[cfg(test)]
             can_give: false,
             self_index: 0,
             donor_array: ptr::null(),
@@ -2261,7 +2294,6 @@ impl ThreadBump {
             is_huge,
             neighbor_idx: None,
             array: ptr::null(),
-            #[cfg(test)]
             can_give: true,
             self_index,
             donor_array: ptr::null(),
@@ -2542,7 +2574,6 @@ impl ThreadBump {
             is_huge: z.is_huge,
             neighbor_idx: None,
             array: ptr::null(),
-            #[cfg(test)]
             can_give: false,
             self_index: 0,
             donor_array: ptr::null(),
@@ -3355,7 +3386,7 @@ fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
             sc.spawn(move || {
                 core_affinity::set_for_current(core);
                 hotpath::measure_block!("prefault", {
-                    bump.prefault_local(); // first-touch Р Р† Р В»Р С•Р С”Р В°Р В»РЎРЉР Р…Р С•Р в„– NUMA-Р Р…Р С•Р Т‘Р Вµ
+                    bump.prefault_own_region(); // first-touch в локальную NUMA-ноду
                 });
                 for _ in 0..(3 / scale).max(1) {
                     hotpath::measure_block!("alloc", {
@@ -3404,7 +3435,7 @@ fn arena_run_thread<const MODE: u32, const FULL: bool>(bump: &mut BumpGuard<'_, 
     // Выделение — по `&bump` (заимствование гуарда, авто-deref до
     // `&ThreadBump`), `reset` в конце каждой итерации — по `&mut bump`.
     hotpath::measure_block!("prefault", {
-        bump.prefault_local(); // first-touch Р Р† Р В»Р С•Р С”Р В°Р В»РЎРЉР Р…Р С•Р в„– NUMA-Р Р…Р С•Р Т‘Р Вµ
+        bump.prefault_own_region(); // first-touch в локальную NUMA-ноду
     });
     let (vcap, outer, inner) = if FULL {
         (40000, 200, 200)
@@ -3497,7 +3528,19 @@ const MODE_FWD: u32 = ThreadBump::MODE_DIR_FORWARD;
 const MODE_BWD: u32 = ThreadBump::MODE_DIR_BACKWARD;
 const MODE_MO: u32 = ThreadBump::MODE_DIR_MIDDLEOUT;
 
-const MODE_PAIR_FWD: u32 = ThreadBump::MODE_PAIR | ThreadBump::MODE_DIR_FORWARD;
+/// MODE для потока `i` в паре. Обязан совпадать с направлением, которое
+/// выдаёт `SharedArena::split_paired`: чётный поток владеет верхней половиной
+/// объединённого региона (Backward, `hi` растёт вниз от `len`), нечётный —
+/// нижней (Forward, `lo` растёт вверх от 0). Раньше здесь для обоих потоков
+/// использовался `MODE_PAIR_FWD`, из-за чего оба писали в [0, mid) — UB.
+#[inline]
+const fn pair_mode_for_index(i: usize) -> u32 {
+    if i % 2 == 0 {
+        ThreadBump::MODE_PAIR | ThreadBump::MODE_DIR_BACKWARD
+    } else {
+        ThreadBump::MODE_PAIR | ThreadBump::MODE_DIR_FORWARD
+    }
+}
 
 const MODE_DONORS_STATIC: u32 = ThreadBump::MODE_DONOR_STATIC | ThreadBump::MODE_DIR_FORWARD;
 const MODE_DONORS_STATIC_PRIO: u32 = MODE_DONORS_STATIC | ThreadBump::MODE_PRIO;
@@ -3533,6 +3576,33 @@ fn arena_bench_neighbors_impl<const FULL: bool>(chunk_size: usize, smt: bool) {
     });
 }
 
+/// Pair: два потока делят ОДИН регион `2*chunk` и заполняют его с внешних
+/// краёв к середине. Направление у потоков разное (см. `pair_mode_for_index`),
+/// поэтому, как и для `Neighbors`, нужны две мономорфные инстанциации: гнать
+/// `MODE_PAIR_FWD` для обоих нельзя — чётный обязан заполнять верхнюю половину
+/// `Backward`, иначе потоки пишут в одни и те же адреса.
+#[cfg_attr(coverage, coverage(off))]
+fn arena_bench_pair_impl<const FULL: bool>(chunk_size: usize, smt: bool) {
+    let core_ids = get_cores(smt);
+    let total_capacity = chunk_size * core_ids.len();
+    let arena = SharedArena::new(total_capacity);
+    let mut bumps = arena.split_paired_safe(core_ids.len());
+    let guards = bumps.guards();
+    std::thread::scope(|s| {
+        for (core_id, (i, mut bump)) in core_ids.iter().zip(guards.into_iter().enumerate()) {
+            let core = *core_id;
+            s.spawn(move || {
+                core_affinity::set_for_current(core);
+                if i % 2 == 0 {
+                    arena_run_thread::<{ pair_mode_for_index(0) }, FULL>(&mut bump);
+                } else {
+                    arena_run_thread::<{ pair_mode_for_index(1) }, FULL>(&mut bump);
+                }
+            });
+        }
+    });
+}
+
 /// `full` — объём работы (FULL или LIGHT).
 macro_rules! mono_bench_wrappers {
     ($($full_tot:ident: $name:ident = $mode:expr;)*) => {
@@ -3549,7 +3619,6 @@ mono_bench_wrappers! {
     true: arena_m_full_forward = MODE_FWD;
     true: arena_m_full_backward = MODE_BWD;
     true: arena_m_full_middleout = MODE_MO;
-    true: arena_m_full_pair = MODE_PAIR_FWD;
     true: arena_m_full_donors = MODE_DONORS_STATIC;
     true: arena_m_full_donors_prio = MODE_DONORS_STATIC_PRIO;
     true: arena_m_full_donors_orx = MODE_DONORS_ORX;
@@ -3559,13 +3628,23 @@ mono_bench_wrappers! {
     false: arena_m_light_forward = MODE_FWD;
     false: arena_m_light_backward = MODE_BWD;
     false: arena_m_light_middleout = MODE_MO;
-    false: arena_m_light_pair = MODE_PAIR_FWD;
     false: arena_m_light_donors = MODE_DONORS_STATIC;
     false: arena_m_light_donors_prio = MODE_DONORS_STATIC_PRIO;
     false: arena_m_light_donors_orx = MODE_DONORS_ORX;
     false: arena_m_light_donors_orx_prio = MODE_DONORS_ORX_PRIO;
     false: arena_m_light_donors_boxcar = MODE_DONORS_BOXCAR;
     false: arena_m_light_donors_boxcar_prio = MODE_DONORS_BOXCAR_PRIO;
+}
+
+/// Pair — отдельный impl: направление зависит от индекса потока.
+#[cfg_attr(coverage, coverage(off))]
+pub fn arena_m_full_pair(chunk_size: usize, smt: bool) {
+    arena_bench_pair_impl::<true>(chunk_size, smt);
+}
+
+#[cfg_attr(coverage, coverage(off))]
+pub fn arena_m_light_pair(chunk_size: usize, smt: bool) {
+    arena_bench_pair_impl::<false>(chunk_size, smt);
 }
 
 #[cfg_attr(coverage, coverage(off))]
@@ -5008,6 +5087,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pair_mono_mode_matches_split_direction() {
+        // Регрессия: mono-бенч раньше гонял MODE_PAIR_FWD для ОБОИХ потоков
+        // пары, хотя split_paired отдаёт чётному Backward. Оба тогда писали
+        // в [0, mid) — перекрытие и data race. MODE обязан совпадать с dir.
+        let arena = SharedArena::new(arena_scale(1 << 16));
+        let bumps = split_pair_raw(&arena, 4);
+        for (i, b) in bumps.iter().enumerate() {
+            let mode = pair_mode_for_index(i);
+            assert_eq!(mode & ThreadBump::MODE_PAIR, ThreadBump::MODE_PAIR);
+            assert_eq!(
+                mode & ThreadBump::MODE_DIR_MASK,
+                b.dir as u32,
+                "MODE_DIR потока {i} не совпадает с dir из split_paired"
+            );
+        }
+    }
+
+    #[test]
+    fn pair_mono_alloc_halves_disjoint() {
+        let arena = SharedArena::new(arena_scale(1 << 16));
+        let bumps = split_pair_raw(&arena, 2);
+        let base = arena.alloc.ptr as usize;
+        let len = bumps[0].len;
+        assert_eq!(bumps[1].len, len);
+
+        let e = bumps[0].alloc_uninit_slice_m::<u8, 1, { pair_mode_for_index(0) }>(1024) as usize;
+        let o = bumps[1].alloc_uninit_slice_m::<u8, 1, { pair_mode_for_index(1) }>(1024) as usize;
+
+        assert_eq!(o, base, "Forward-поток стартует с начала региона");
+        assert_eq!(e, base + len - 1024, "Backward-поток стартует с конца");
+        assert!(o + 1024 <= e, "половины пары не должны пересекаться");
+    }
+
     // Под Miri `alloc_normal` идёт через std::alloc (align 16, не страница) —
     // проверка page-alignment регионов имеет смысл только в нативном режиме.
     #[cfg(not(miri))]
@@ -5173,6 +5286,42 @@ mod tests {
         }
         // У донора своя память свободна (lo не трогали).
         assert_eq!(donor.lo.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn fallback_chunk_size_is_not_a_page() {
+        // Регрессия: в `split_with`/`split_alternating`/`split_paired` стоял
+        // `base_chunk: 0`, и `grow_fallback` выделял по одной 4 KB странице на
+        // каждые ~680 мелких аллокаций (замер: дефицит 2–5% места в чанке
+        // замедлял раунд в 2–2.3 раза).
+        assert_eq!(fallback_chunk_size(0), 64 * 1024, "снизу — минимум 64 KiB");
+        assert_eq!(
+            fallback_chunk_size(1 << 20),
+            1 << 20,
+            "не больше самого чанка"
+        );
+        assert_eq!(
+            fallback_chunk_size(1 << 30),
+            8 * 1024 * 1024,
+            "сверху — 8 MiB, чтобы не резервировать гигабайты"
+        );
+
+        // Чанк 1 MiB, просим 2 MiB: должно хватить одного крупного
+        // fallback-чанка, а не ~256 страниц по 4 KB.
+        let (_arena, bump) = make_one(BumpDir::Forward, arena_scale(1 << 20));
+        for _ in 0..count_scale(2 * 1024 * 1024 / 8) {
+            let p = bump.alloc_raw::<8>(8);
+            assert!(!p.is_null());
+        }
+        let fb = bump.fallback.lock();
+        assert!(
+            fb.chunks.len() <= 2,
+            "fallback выделил {} чанков вместо 1–2 крупных",
+            fb.chunks.len()
+        );
+        for c in fb.chunks.iter() {
+            assert!(c.size >= 64 * 1024, "fallback-чанк {} B — слишком мелкий", c.size);
+        }
     }
 
     #[test]
