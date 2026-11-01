@@ -10,6 +10,7 @@ use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use triomphe::Arc;
 
@@ -29,10 +30,65 @@ fn prefetch_write(_addr: *const u8) {}
 //               ПЛАТФОРМЕННЫЙ СЛОЙ ВЫДЕЛЕНИЯ ПАМЯТИ
 // ============================================================
 
-struct RawAllocation {
+pub(crate) struct RawAllocation {
     ptr: *mut u8,
     size: usize,
     is_huge: bool,
+    /// Под Miri Windows-сборки `alloc_normal` идёт через `std::alloc` и
+    /// аллоцирует буфер размером `max(MIRI_VIRT_SIZE, size)` с выравниванием
+    /// по странице — фактический Layout аллокации может отличаться от
+    /// логического `size` (вызывающий код округляет чанки вверх до страницы).
+    /// `free` deallocает строго Layout'ом `(virt_size, virt_align)` — тем же,
+    /// что использовался в `alloc_normal`, чтобы не получить UB
+    /// «dealloc with a different layout».
+    /// Заполняется ТОЛЬКО в `platform::alloc_normal` под Miri на Windows;
+    /// во всех остальных конструкторах (в т.ч. unix-ветках и huge-аллоках)
+    /// обязано быть нулём — дефолт через `..Default::default()` снимает
+    /// необходимость перечислять cfg-поля в каждом литерале (иначе новый
+    /// литерал без полей ломает сборку `cargo miri test --target
+    /// x86_64-pc-windows-msvc`, которая компилирует windows-код даже на
+    /// linux-раннере).
+    #[cfg(all(miri, windows))]
+    virt_size: usize,
+    #[cfg(all(miri, windows))]
+    virt_align: usize,
+}
+
+impl Default for RawAllocation {
+    fn default() -> Self {
+        RawAllocation {
+            ptr: ptr::null_mut(),
+            size: 0,
+            is_huge: false,
+            #[cfg(all(miri, windows))]
+            virt_size: 0,
+            #[cfg(all(miri, windows))]
+            virt_align: 0,
+        }
+    }
+}
+
+impl Clone for RawAllocation {
+    #[inline]
+    fn clone(&self) -> Self {
+        // Копируем поля, а не конструируем литералом: набор cfg-полей
+        // (`virt_size`/`virt_align`) зависит от платформы и Miri.
+        RawAllocation { ..*self }
+    }
+}
+impl Copy for RawAllocation {}
+
+impl RawAllocation {
+    /// Освободить чанк через платформенный слой. В кэшах и контейнерах храним
+    /// `Option<RawAllocation>`; при вытеснении/замене элемента старый чанк
+    /// обязан быть освобождён — иначе Miri репортит «memory leaked» (падал
+    /// `miri (windows-latest)` из-за thread-local кэша freed-чанков, который
+    /// никогда не дренируется при завершении тестового процесса).
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn release(self) {
+        platform::free(self);
+    }
 }
 
 /// Список дополнительных чанков, выделенных «где-то в памяти» в режиме доноров,
@@ -42,6 +98,230 @@ struct FallbackChunks {
     chunks: Vec<RawAllocation>,
     /// Байт занято в последнем чанке (`chunks.last()`).
     used: usize,
+}
+
+/// Счётчик обращений в `grow_fallback` (переполнение региона). Включён
+/// только с фичей `tune` — используется автоподбором chunk size
+/// (`arena_tune_scan`). Статика ради этого одна: счёт глобальный, но он нам
+/// и нужен глобальный (на весь прогон).
+#[cfg(feature = "tune")]
+static FALLBACK_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Счётчик РЕАЛЬНЫХ новых mmap-чанков внутри `grow_fallback` (ветка `full`:
+/// регион исчерпан и в последнем fallback-чанке тоже не хватило места).
+/// Именно это — hotspot из профиля (`mmap`/`munmap` + `SpinMutex`), поэтому
+/// автотюн выбирает размер чанка по нулю именно этих вызовов, а не по всем
+/// обращениям в `grow_fallback`: последние случаются и при достаточно большом
+/// чанке — каждая итерация нагрузки начинается с reset'а региона, и первый же
+/// аллок после него идёт в grow_fallback, где место находится в уже
+/// существующем чанке (без mmap).
+#[cfg(feature = "tune")]
+static FALLBACK_MMAPS: AtomicUsize = AtomicUsize::new(0);
+
+/// Прочитать и обнулить счётчики `grow_fallback` (см. `FALLBACK_CALLS` /
+/// `FALLBACK_MMAPS`). Возвращает `(обращения, новые mmap-чанки)`.
+#[cfg(feature = "tune")]
+pub fn take_fallback_counters() -> (usize, usize) {
+    (
+        FALLBACK_CALLS.swap(0, Ordering::Relaxed),
+        FALLBACK_MMAPS.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// Прочитать и обнулить счётчик `grow_fallback` (см. `FALLBACK_CALLS`).
+#[cfg(feature = "tune")]
+pub fn take_fallback_calls() -> usize {
+    take_fallback_counters().0
+}
+
+/// Накопленное (НЕ обнуляемое reset'ом) потребление памяти потоками: байты,
+/// выданные из fallback-чанков (`grow_fallback`). Счёт `FALLBACK_CALLS`
+/// считается на каждое обращение в `grow_fallback`, включая те, что
+/// обслуживаются уже существующим чанком без `mmap`; байты же выдаются только
+/// там, где регион потока исчерпан. Автоподбор измеряет по этой метрике
+/// реальное потребление многопоточной нагрузки: `reset` региона обнуляет
+/// per-thread счётчики, поэтому пик одной итерации снаружи не виден, а сумма
+/// выдач через fallback — видна полностью (при огромном candidate-чанке весь
+/// прогон живёт на fallback).
+#[cfg(feature = "tune")]
+static REGION_TAKEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Прочитать и обнулить накопленное потребление регионов (см. `REGION_TAKEN`).
+#[cfg(feature = "tune")]
+pub fn take_region_used() -> usize {
+    REGION_TAKEN.swap(0, Ordering::Relaxed)
+}
+
+/// Заглушка без фичи `tune` (см. `take_region_used`).
+#[cfg(not(feature = "tune"))]
+pub fn take_region_used() -> usize {
+    0
+}
+
+/// Прочитать и обнулить счётчик РЕАЛЬНЫХ новых mmap-чанков в `grow_fallback`
+/// (см. `FALLBACK_MMAPS`). Именно он — метрика hotspot'а для автоподбора:
+/// обращения в `grow_fallback` случаются и при идеальном чанке (первый аллок
+/// после reset региона), а вот новые `mmap` при достаточно большом чанке
+/// исчезают полностью.
+#[cfg(feature = "tune")]
+pub fn take_fallback_mmaps() -> usize {
+    take_fallback_counters().1
+}
+
+/// Заглушка без фичи `tune`: счётчиков нет — всегда 0, чтобы `arena_tune_scan`
+/// компилировался при любой комбинации флагов (в т.ч. при `--all-features`,
+/// где `tune` включена).
+#[cfg(not(feature = "tune"))]
+pub fn take_fallback_counters() -> (usize, usize) {
+    (0, 0)
+}
+
+/// Заглушка без фичи `tune` (см. `take_fallback_counters`).
+#[cfg(not(feature = "tune"))]
+pub fn take_fallback_calls() -> usize {
+    0
+}
+
+/// Заглушка без фичи `tune` (см. `take_fallback_mmaps`).
+#[cfg(not(feature = "tune"))]
+pub fn take_fallback_mmaps() -> usize {
+    0
+}
+
+/// Минимальный размер fallback-чанка по умолчанию (без env-переменных):
+/// 1 МБ. По профилю pprof самые горячие места — `__GI_munmap`/`__GI___mmap64`
+/// в `platform::alloc/free` и захваты `SpinMutex` в `grow_fallback`: при
+/// маленьких чанках арена живёт в режиме «попросил у ОС → отдал ОС» на каждой
+/// итерации бенча. Floor в 1 МБ делает один mmap покрывающим тысячи мелких
+/// аллокаций (`ArenaString`/`ArenaVec`) и радикально сокращает число системных
+/// вызовов и очередей за глобальным пулом чанков.
+const DEFAULT_FALLBACK_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Активна ли возможность huge pages: compile-time фича cargo `huge`
+/// (`cargo build --features huge`) ИЛИ runtime-переменная `R3_HUGE=1`.
+///
+/// Фича управляет двумя связанными поведениями:
+///   * арены запрашивают huge pages (MAP_HUGETLB / MEM_LARGE_PAGES),
+///     если ОС их даёт;
+///   * prefault (трогание памяти) выполняется только при активной фиче —
+///     и то лишь для регионов, реально лежащих на huge pages.
+///
+/// Runtime-переменная работает и в бинаре, собранном без фичи (порог
+/// `R3_HUGE=0` не включает режим). Результат кешируется в `OnceLock`:
+/// переменная окружения читается один раз за процесс.
+fn huge_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "huge") || std::env::var("R3_HUGE").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+/// Floor размера fallback-чанка в байтах из `R3_FALLBACK_CHUNK_MB` (см.
+/// `fallback_chunk_bytes`). Значение по умолчанию — 1 МБ
+/// (`DEFAULT_FALLBACK_CHUNK_BYTES`); env задаёт явный пол, если нужен другой.
+fn fallback_chunk_floor() -> usize {
+    static M: OnceLock<usize> = OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("R3_FALLBACK_CHUNK_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or(DEFAULT_FALLBACK_CHUNK_BYTES)
+    })
+}
+
+/// Размер fallback-чанка в байтах: не меньше `base_chunk` и не меньше floor
+/// (по умолчанию 1 МБ, см. `DEFAULT_FALLBACK_CHUNK_BYTES`; переопределяется
+/// `R3_FALLBACK_CHUNK_MB=N`). Крупные редкие mmap вместо частых
+/// mmap/munmap+SpinMutex — это убирает основные горячие точки профиля
+/// (см. рекомендации по профилю arena).
+///
+/// `cap` — потолок размера одного чанка (длина региона потока). Floor
+/// каппится им: fallback-чанки переиспользуются потоком через thread-local
+/// кэш, и гигантский floor на поток легко суммарно превышает физическую
+/// память (на CI-машинах с 2 GB RAM это `mmap failed` / OOM). Каппинг
+/// применяется только когда регион сам не меньше дефолтного floor (1 МБ) —
+/// иначе маленький тестовый регион остался бы крошечным и вернулись бы
+/// частые mmap. `base_chunk` и `need` потолка не касаются: `need` обязан
+/// влезть в чанк.
+#[inline]
+fn fallback_chunk_bytes(base_chunk: usize, need: usize, cap: usize) -> usize {
+    let floor = fallback_chunk_floor();
+    let floor = if cap >= floor { floor.min(cap) } else { 0 };
+    base_chunk.max(floor).max(need)
+}
+
+// ===== Thread-local кэш freed fallback-чанков =====
+//
+// По профилю hottest места — `munmap` из `platform::free` (вызывается из
+// `Drop for ThreadBump`) и `__mmap64` из `grow_fallback`: арена живёт в режиме
+// «попросил у ОС → отдал ОС» на каждой итерации бенча (new → alloc → Drop).
+// Кэш возвращает освобождённые чанки во владение тому же потоку без обращения
+// к ОС (ни `munmap` на drop, ни нового `mmap` на grow). Хранится ровно один
+// чанок на поток — этого достаточно для steady-state «создал арену → уронил
+// арену», где каждый новый чанк совпадает по размеру с предыдущим.
+//
+// ВАЖНО (падал `miri (windows-latest)` из-за `memory leaked`): thread_local с
+// деструктором не может быть `const`-инициализирован, поэтому раньше кэш был
+// `Cell<Option<RawAllocation>>` без Drop и никогда не дренировался при
+// завершении процесса — Miri репортит утечку каждой оставшейся в кэше
+// std-аллокации. Теперь кэш хранит `Cell<Option<Box<ChunkSlot>>>`, где
+// `ChunkSlot` освобождает чанк в своём `Drop`.
+//
+// Оговорка про «Box уничтожается вместе с потоком/процессом автоматически»:
+// это верно только для типов БЕЗ деструктора. `ChunkSlot` содержит `Drop`,
+// поэтому обычный `thread_local!` гарантированно вызывает деструктор слота
+// при завершении потока (в том числе под Miri) — на этом и построен фикс.
+// Именно поэтому здесь НЕ используется `const`-инициализация тред-локали:
+// `thread_local! { static X: T = const { ... } }` запрещена для типов с
+// деструктором (E0730), а если бы компилировалась, то деструктор вообще не
+// запускался бы и утечка вернулась.
+struct ChunkSlot(RawAllocation);
+
+impl Drop for ChunkSlot {
+    #[inline]
+    fn drop(&mut self) {
+        // Забираем чанк через ptr::read (поля RawAllocation Copy) и отдаём ОС.
+        let a = unsafe { std::ptr::read(&self.0) };
+        platform::free(a);
+    }
+}
+
+thread_local! {
+    static FREED_CHUNK_CACHE: RawAllocationCache = const { RawAllocationCache(std::cell::Cell::new(None)) };
+}
+
+struct RawAllocationCache(std::cell::Cell<Option<Box<ChunkSlot>>>);
+
+impl RawAllocationCache {
+    /// Забрать закэшированный чанк подходящего размера (иначе `None`).
+    #[inline]
+    fn take(&self, size: usize) -> Option<RawAllocation> {
+        match self.0.take() {
+            Some(slot) if slot.0.size >= size => {
+                // Достаём чанк из Box без запуска Drop слота: `slot` — owned
+                // значение (`Box<ChunkSlot>`), поле читается напрямую,
+                // `ptr::read`/`forget` не нужны.
+                let a = slot.0;
+                drop(slot); // освобождается только сам Box-«ящик»
+                Some(a)
+            }
+            other => {
+                // Не подошёл по размеру (или его нет) — при вытеснении `other`
+                // чанк будет освобождён автоматически Drop'ом слота.
+                drop(other);
+                None
+            }
+        }
+    }
+
+    /// Положить чанк в кэш; прежний содержимец кэша освобождается через ОС
+    /// (Drop слота при уничтожении вытесненного `Box`).
+    #[inline]
+    fn put(&self, alloc: RawAllocation) {
+        self.0.replace(Some(Box::new(ChunkSlot(alloc))));
+    }
 }
 
 /// Запись о доноре в реестре: индекс в массиве bumps, его приоритет и флаг
@@ -150,7 +430,7 @@ impl DonorPolicy {
 
 #[cfg(windows)]
 mod platform {
-    use super::{RawAllocation, verbose_enabled};
+    use super::{RawAllocation, huge_enabled, verbose_enabled};
     use std::ptr;
     use std::sync::OnceLock;
     use windows_sys::Win32::Foundation::{
@@ -161,15 +441,27 @@ mod platform {
         TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
     };
     use windows_sys::Win32::System::Memory::*;
-    use windows_sys::Win32::System::SystemInformation::{
-        GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
-    };
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // GetSystemInfo/SYSTEM_INFO нужны только вне Miri (page_size); под
+    // Miri-сборкой с кросс-таргетом на windows это вызвало бы warning
+    // unused_imports. Атрибуты внутри use-списка запрещены синтаксисом Rust,
+    // поэтому выносим в отдельные import'ы.
+    #[cfg(not(miri))]
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    // GetLargePageMinimum живёт в Win32_System_Memory (попал сюда через
+    // glob-импорт `Memory::*` выше), а НЕ в SystemInformation — прямой
+    // импорт оттуда ломает сборку на Windows (E0432).
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     /// Включаем SeLockMemoryPrivilege ("Lock pages in memory"), если она
     /// выдана процессу в локальной политике безопасности. Без неё
     /// VirtualAlloc(MEM_LARGE_PAGES) не работает, и мы молча откатываемся
     /// на обычные 4KB страницы.
+    ///
+    /// ВАЖНО: право входит в токен процесса только при логине. Если привилегию
+    /// включили в secpol.msc уже после запуска терминала, токен не обновится —
+    /// нужен перезапуск сессии (для WSL: `wsl --shutdown` и повторный вход,
+    /// для нативной консоли — новое окно/перелогин).
     #[cfg_attr(coverage, coverage(off))]
     fn enable_lock_memory_privilege() {
         unsafe {
@@ -210,7 +502,7 @@ mod platform {
                     if enabled {
                         "ENABLED"
                     } else {
-                        "Р Р…Р ВµР Т‘Р С•РЎРѓРЎвЂљРЎС“Р С—Р Р…Р В° (large pages Р Р†РЎвЂ№Р С”Р В»РЎР‹РЎвЂЎР ВµР Р…РЎвЂ№)"
+                        "недоступна (large pages выключены)"
                     }
                 );
             }
@@ -229,6 +521,11 @@ mod platform {
 
     #[cfg_attr(coverage, coverage(off))]
     pub fn try_alloc_huge(size: usize) -> Option<RawAllocation> {
+        // Huge pages активны только при feature `huge` или R3_HUGE=1
+        // (см. `huge_enabled`).
+        if !huge_enabled() {
+            return None;
+        }
         // Под Miri нет шимов для Windows-привилегий (AdjustTokenPrivileges и
         // др.), поэтому huge-страницы просто не пытаемся — упадём на обычный
         // VirtualAlloc через alloc_normal.
@@ -251,6 +548,7 @@ mod platform {
                     ptr: ptr as *mut u8,
                     size,
                     is_huge: true,
+                    ..Default::default()
                 })
             }
         }
@@ -271,6 +569,7 @@ mod platform {
                 ptr: ptr as *mut u8,
                 size,
                 is_huge: false,
+                ..Default::default()
             }
         }
     }
@@ -279,16 +578,38 @@ mod platform {
     // чтобы проверить логику (в первую очередь реестр доноров) через Miri.
     // База должна быть выровнена не хуже страницы (как VirtualAlloc), иначе
     // указатели вида `ptr + off` окажутся невыровненными (UB под Tree Borrows).
+    //
+    // ВАЖНО (падал miri (windows-latest) в CI): вызывающий код (grow_fallback)
+    // округляет размер чанка вверх до страницы (`next_multiple_of(page)`), а
+    // границы чанков в логике считаются по полю `size`. Если аллоцировать ровно
+    // `size`, то dealloc с Layout(alloc.size) мог бы разойтись с alloc, а любые
+    // расхождения округлений дали бы «dealloc with a different layout» = UB.
+    // Поэтому выделяем буфер размером max(MIRI_VIRT_SIZE, запрошенный size) с
+    // выравниванием по странице, фактический Layout запоминаем в полях
+    // virt_size/virt_align, а в RawAllocation.size кладём запрошенный size —
+    // логические границы чанков остаются корректными, а alloc/dealloc
+    // используют строго идентичный Layout.
+    #[cfg(miri)]
+    const MIRI_VIRT_SIZE: usize = 1 << 24; // 16 MiB
+
     #[cfg(miri)]
     pub fn alloc_normal(size: usize) -> RawAllocation {
         use std::alloc::{Layout, alloc};
-        let layout = Layout::from_size_align(size, 16).unwrap();
+        let virt_size = size.max(MIRI_VIRT_SIZE);
+        let virt_align = page_size();
+        let layout = Layout::from_size_align(virt_size, virt_align).unwrap();
         let ptr = unsafe { alloc(layout) };
         assert!(!ptr.is_null(), "std alloc failed (miri)");
         RawAllocation {
             ptr,
             size,
             is_huge: false,
+            // Поля есть только под `cfg(all(miri, windows))` — на unix-раннере
+            // с кросс-таргетом на windows их задаём явно.
+            #[cfg(all(miri, windows))]
+            virt_size,
+            #[cfg(all(miri, windows))]
+            virt_align,
         }
     }
 
@@ -307,7 +628,16 @@ mod platform {
     #[cfg(miri)]
     pub fn free(alloc: RawAllocation) {
         use std::alloc::{Layout, dealloc};
-        let layout = Layout::from_size_align(alloc.size, 16).unwrap();
+        // Layout строго идентичный тому, что был в `alloc_normal`: иначе Miri
+        // репортит «dealloc with a different layout» = UB (падал
+        // `miri (windows-latest)`). Под windows-таргетом берём сохранённые
+        // virt_size/virt_align; на unix-таргетах этих полей нет — там
+        // alloc_normal выделял ровно `size` с выравниванием по странице.
+        #[cfg(all(miri, windows))]
+        let (vsize, valign) = (alloc.virt_size, alloc.virt_align);
+        #[cfg(not(windows))]
+        let (vsize, valign) = (alloc.size.max(MIRI_VIRT_SIZE), page_size());
+        let layout = Layout::from_size_align(vsize, valign).unwrap();
         unsafe { dealloc(alloc.ptr, layout) };
     }
 
@@ -327,16 +657,29 @@ mod platform {
         4096
     }
 
-    /// Минимальный размер large page (обычно 2 MB).
+    /// Минимальный размер large page (обычно 2 MB). `GetLargePageMinimum()`
+    /// возвращает 0, если система large pages не поддерживает (например, CPU
+    /// без PSE или гипервизор без этой возможности), поэтому нормализуем в
+    /// обычный размер страницы — иначе округление до кратности 0 ломает арены.
     #[cfg(not(miri))]
     pub fn huge_page_size() -> usize {
         static HUGE: OnceLock<usize> = OnceLock::new();
-        *HUGE.get_or_init(|| unsafe { GetLargePageMinimum() })
+        *HUGE.get_or_init(|| {
+            let min = unsafe { GetLargePageMinimum() };
+            if min == 0 { page_size() } else { min as usize }
+        })
     }
 
     #[cfg(miri)]
     pub fn huge_page_size() -> usize {
         2 * 1024 * 1024
+    }
+
+    /// Размер пробы доступности large pages: 2 x huge_page_size() (обычно 4 MB).
+    /// Просим больше минимальной large page, чтобы проба не давала ложный
+    /// отказ из-за требований VirtualAlloc к кратности/резерву региона.
+    fn huge_probe_bytes() -> usize {
+        2 * huge_page_size()
     }
 
     /// Физическая оперативная память системы в байтах (без учёта pagefile).
@@ -364,12 +707,17 @@ mod platform {
     /// Проба: получается ли выделить large page (обычно 2 MB). Результат
     /// кешируется: без `SeLockMemoryPrivilege` VirtualAlloc(MEM_LARGE_PAGES)
     /// всегда падает, так что одна проба за процесс достаточна.
+    ///
+    /// Пробуем сразу `huge_probe_bytes()` (= 4 MB), а не одну large page:
+    /// VirtualAlloc(MEM_LARGE_PAGES) требует, чтобы размер был КРАТЕН размеру
+    /// large page, и при запросе ровно одной страницы иногда отказывает даже
+    /// с выданной привилегией — проба давала бы ложное «нет».
     pub fn large_pages_available() -> bool {
         if cfg!(miri) {
             return false;
         }
         static HUGE_OK: OnceLock<bool> = OnceLock::new();
-        *HUGE_OK.get_or_init(|| match try_alloc_huge(huge_page_size()) {
+        *HUGE_OK.get_or_init(|| match try_alloc_huge(huge_probe_bytes()) {
             Some(a) => {
                 free(a);
                 true
@@ -423,11 +771,16 @@ mod platform {
 
 #[cfg(unix)]
 mod platform {
-    use super::RawAllocation;
+    use super::{RawAllocation, huge_enabled};
     use std::ptr;
     use std::sync::OnceLock;
 
     pub fn try_alloc_huge(size: usize) -> Option<RawAllocation> {
+        // Huge pages активны только при feature `huge` или R3_HUGE=1
+        // (см. `huge_enabled`).
+        if !huge_enabled() {
+            return None;
+        }
         if cfg!(miri) {
             // Под Miri huge pages не моделируем: MAP_HUGETLB не поддержан.
             return None;
@@ -450,6 +803,7 @@ mod platform {
                     ptr: ptr as *mut u8,
                     size,
                     is_huge: true,
+                    ..Default::default()
                 })
             }
         }
@@ -476,6 +830,7 @@ mod platform {
                 ptr: ptr as *mut u8,
                 size,
                 is_huge: false,
+                ..Default::default()
             }
         }
     }
@@ -543,6 +898,21 @@ mod platform {
         })
     }
 
+    /// Диагностика причины отказа MAP_HUGETLB (errno с пояснением).
+    #[cfg(target_os = "linux")]
+    fn hugetlb_errno_hint(errno: i32) -> &'static str {
+        match errno {
+            // Нет зарезервированных huge pages в пуле ядра:
+            // HugePages_Total = 0 (см. /proc/meminfo, sysctl vm.nr_hugepages).
+            libc::ENOMEM => "нет зарезервированных huge pages (vm.nr_hugepages=0)",
+            // Ядро не поддерживает MAP_HUGETLB для этой конфигурации/файловой системы.
+            libc::EINVAL => "MAP_HUGETLB не поддерживается ядром",
+            // Недостаточно прав (fs.hugetlb_shm_group / CAP_IPC_LOCK).
+            libc::EPERM => "недостаточно прав (CAP_IPC_LOCK / fs.hugetlb_shm_group)",
+            _ => "mmap(MAP_HUGETLB) вернул ошибку",
+        }
+    }
+
     /// Проба: получается ли выделить huge page (MAP_HUGETLB / Hugepagesize).
     /// Результат кешируется — одна проба за процесс достаточна.
     pub fn large_pages_available() -> bool {
@@ -550,12 +920,52 @@ mod platform {
             return false;
         }
         static HUGE_OK: OnceLock<bool> = OnceLock::new();
-        *HUGE_OK.get_or_init(|| match try_alloc_huge(huge_page_size()) {
+        *HUGE_OK.get_or_init(|| match try_alloc_huge(2 * huge_page_size()) {
             Some(a) => {
                 free(a);
                 true
             }
-            None => false,
+            None => {
+                #[cfg(target_os = "linux")]
+                if std::env::var("R3_VERBOSE").is_ok() {
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    eprintln!(
+                        "  [huge] MAP_HUGETLB недоступен: errno={} ({})",
+                        errno,
+                        hugetlb_errno_hint(errno)
+                    );
+                    // Дополнительная диагностика по /proc/meminfo: без явного
+                    // пула (HugePages_Total=0) mmap всегда вернёт ENOMEM, а
+                    // крошечный пул не даёт выделить пробу в 2 huge-страницы.
+                    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+                        let get = |key: &str| -> Option<usize> {
+                            meminfo.lines().find_map(|line| {
+                                line.strip_prefix(key)
+                                    .map(|rest| rest.trim_end())
+                                    .and_then(|rest| rest.split_whitespace().next())
+                                    .and_then(|num| num.parse::<usize>().ok())
+                            })
+                        };
+                        let total = get("HugePages_Total:").unwrap_or(0);
+                        let free = get("HugePages_Free:").unwrap_or(0);
+                        let sz_kb = get("Hugepagesize:").unwrap_or(2048);
+                        eprintln!(
+                            "  [huge] пул ядра: HugePages_Total={total}, HugePages_Free={free}, \
+                             Hugepagesize={sz_kb} KB (проба требует {} MB непрерывного пула)",
+                            (2 * sz_kb * 1024) / (1024 * 1024)
+                        );
+                        if total == 0 {
+                            eprintln!("  [huge] включение: sudo sysctl vm.nr_hugepages=512");
+                        } else if free < 2 {
+                            eprintln!(
+                                "  [huge] пул зарезервирован, но свободных страниц мало: \
+                                 увеличьте vm.nr_hugepages либо освободите память"
+                            );
+                        }
+                    }
+                }
+                false
+            }
         })
     }
 
@@ -660,24 +1070,59 @@ unsafe impl Sync for SharedArena {}
 
 impl SharedArena {
     fn new(total_capacity: usize) -> Self {
-        // Размер под huge pages должен быть кратен huge_page_size(), иначе
+        // Размер под huge pages должен быть КРАТЕН huge_page_size(), иначе
         // MEM_LARGE_PAGES / MAP_HUGETLB молча не срабатывают и регион
-        // выделяется обычными 4KB-страницами. Округляем только для крупных
+        // выделяется обычными 4KB-страницами. Округляем только при активной
+        // фиче huge (feature `huge` или R3_HUGE=1) и только для крупных
         // арен (мелкие и так не получают huge pages и должны сохранять
-        // точный размер — иначе ломаются тесты границ/OOM).
+        // точный размер — иначе ломаются тесты границ/OOM); на Windows
+        // округляем всегда при активной фиче, т.к. проба доступности large
+        // pages там стоит одного syscall.
+        let huge_on = huge_enabled();
         let huge = platform::huge_page_size();
-        let cap = if total_capacity >= huge {
+        let round_up = if cfg!(windows) {
+            true
+        } else {
+            total_capacity >= huge
+        };
+        let cap = if huge_on && round_up && huge.is_power_of_two() && total_capacity > 0 {
             total_capacity.next_multiple_of(huge)
         } else {
             total_capacity
         };
         let alloc = platform::try_alloc_huge(cap).unwrap_or_else(|| platform::alloc_normal(cap));
-        // Best-effort THP (Linux): работает без резервирования явных huge pages.
-        platform::advise_huge(alloc.ptr, alloc.size);
+        // Best-effort THP (Linux): работает без резервирования явных huge
+        // pages. Только при активной фиче huge — иначе регион остаётся на
+        // обычных страницах и prefault его не трогает (см. prefault_local).
+        if huge_on {
+            platform::advise_huge(alloc.ptr, alloc.size);
+        }
 
-        if verbose_enabled() {
+        // Диагностика: если при включённой привилегии «Lock pages in memory»
+        // арена всё равно легла на 4KB-страницы — виноваты не права, а либо
+        // размер региона (Windows требует кратности GetLargePageMinimum()),
+        // либо отсутствие достаточно больших свободных contiguous-блоков
+        // (фрагментация RAM / Hyper-V / WSL2 / динамическая память VM).
+        #[cfg(windows)]
+        if !alloc.is_huge && cap >= platform::huge_page_size() && platform::large_pages_available()
+        {
+            eprintln!(
+                "  [Arena] WARNING: large pages доступны, но регион {} MB выделен обычными страницами \
+                 (нужна кратность {} MB; причина обычно — фрагментация RAM или гипервизор: \
+                 WSL2/Hyper-V/динамическая память VM)",
+                cap / (1024 * 1024),
+                platform::huge_page_size() / (1024 * 1024),
+            );
+        }
+
+        // Принт про каждое выделение по умолчанию убран: арены создаются
+        // десятки раз за бенч, и эти строки засоряли вывод. Включается только
+        // явным R3_VERBOSE=2 (при R3_VERBOSE=1 остаются лишь однократные
+        // диагностические сообщения — см. WARNING выше и `[huge]` в
+        // platform::large_pages_available).
+        if std::env::var("R3_VERBOSE").as_deref() == Ok("2") {
             println!(
-                "  [Arena] Р вЂ™РЎвЂ№Р Т‘Р ВµР В»Р ВµР Р…Р С• {} MB (Р В·Р В°Р С—РЎР‚Р С•РЎв‚¬Р ВµР Р…Р С• {} MB), huge pages: {}",
+                "  [Arena] Выделено {} MB (запрошено {} MB), huge pages: {}",
                 cap / (1024 * 1024),
                 total_capacity / (1024 * 1024),
                 alloc.is_huge
@@ -757,7 +1202,7 @@ impl SharedArena {
                     use_priority: false,
                     base_chunk: fallback_chunk_size(chunk_size),
                     fallback: SpinMutex::new(FallbackChunks {
-                        chunks: Vec::new(),
+                        chunks: Vec::with_capacity(4),
                         used: 0,
                     }),
                 })
@@ -822,7 +1267,7 @@ impl SharedArena {
                     use_priority: false,
                     base_chunk: fallback_chunk_size(chunk_size),
                     fallback: SpinMutex::new(FallbackChunks {
-                        chunks: Vec::new(),
+                        chunks: Vec::with_capacity(4),
                         used: 0,
                     }),
                 })
@@ -885,7 +1330,7 @@ impl SharedArena {
                         use_priority: false,
                         base_chunk: fallback_chunk_size(chunk_size),
                         fallback: SpinMutex::new(FallbackChunks {
-                            chunks: Vec::new(),
+                            chunks: Vec::with_capacity(4),
                             used: 0,
                         }),
                     })
@@ -916,7 +1361,7 @@ impl SharedArena {
                         use_priority: false,
                         base_chunk: fallback_chunk_size(chunk_size),
                         fallback: SpinMutex::new(FallbackChunks {
-                            chunks: Vec::new(),
+                            chunks: Vec::with_capacity(4),
                             used: 0,
                         }),
                     })
@@ -1096,7 +1541,7 @@ impl SharedArena {
                     use_priority: policy.use_priority,
                     base_chunk: fallback_chunk_size(chunk_size),
                     fallback: SpinMutex::new(FallbackChunks {
-                        chunks: Vec::new(),
+                        chunks: Vec::with_capacity(4),
                         used: 0,
                     }),
                 })
@@ -1125,11 +1570,9 @@ impl SharedArena {
 
 impl Drop for SharedArena {
     fn drop(&mut self) {
-        let alloc = RawAllocation {
-            ptr: self.alloc.ptr,
-            size: self.alloc.size,
-            is_huge: self.alloc.is_huge,
-        };
+        // `alloc` забираем из `&mut self` напрямую (Copy-поля, конструктор
+        // полей не нужен — так фикс не зависит от cfg-полей RawAllocation).
+        let alloc = unsafe { std::ptr::read(&self.alloc) };
         platform::free(alloc);
     }
 }
@@ -1384,9 +1827,26 @@ impl Drop for ThreadBump {
     fn drop(&mut self) {
         // Первичный регион арены освобождает `SharedArena`; здесь — только
         // дополнительные fallback-чанки, выделенные «где-то в памяти».
+        // Самый последний (самый большой/свежий) чанк отдаём в thread-local
+        // кэш для мгновенного переиспользования этим же потоком (без
+        // `munmap` + нового `mmap` на следующей итерации бенча); остальные
+        // освобождаем через ОС.
         let mut fb = self.fallback.lock();
+        let last = fb.chunks.pop();
         for a in fb.chunks.drain(..) {
             platform::free(a);
+        }
+        drop(fb);
+        if let Some(a) = last {
+            // `try_with` может НЕ вызвать замыкание: если тред-локаль уже
+            // удалена (поток завершается) или инициализация провалилась.
+            // Раньше результат просто выбрасывался (`let _ = ...`) — чанк
+            // терялся, и Miri репортил «memory leaked». Теперь при отказе
+            // освобождаем чанк напрямую через платформенный слой.
+            match FREED_CHUNK_CACHE.try_with(|c| c.put(a)) {
+                Ok(()) => {}
+                Err(_) => a.release(),
+            }
         }
     }
 }
@@ -1982,7 +2442,7 @@ impl ThreadBump {
                 let cur = d.lo.load(Ordering::Relaxed);
                 let hi = d.hi.load(Ordering::Relaxed);
                 if hi > d.len {
-                    return None; // Р Т‘Р С•Р Р…Р С•РЎР‚ Р С‘Р В·РЎР‚Р В°РЎРѓРЎвЂ¦Р С•Р Т‘Р С•Р Р†Р В°Р Р… РІР‚вЂќ Р В·Р В°РЎвЂ°Р С‘РЎвЂљР В° Р С•РЎвЂљ underflow
+                    return None; // донор израсходован — защита от underflow
                 }
                 let off = (cur + ALIGN - 1) & !(ALIGN - 1);
                 let end = off + size;
@@ -2074,6 +2534,13 @@ impl ThreadBump {
     #[hotpath::measure]
     #[inline(always)]
     fn grow_fallback<const ALIGN: usize>(&self, size: usize) -> *mut u8 {
+        #[cfg(feature = "tune")]
+        {
+            FALLBACK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Выдача из fallback — это тоже потребление нагрузки потоком
+            // (см. `REGION_TAKEN`: по нему автоподбор меряет `need`).
+            REGION_TAKEN.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+        }
         let page = platform::page_size();
         // Размер чанка — хотя бы базовый чанк, выровнен по странице; блок `size`
         // выровнен внутри.
@@ -2085,8 +2552,22 @@ impl ThreadBump {
             None => true,
         };
         if full {
-            let alloc_size = need.max(self.base_chunk).next_multiple_of(page);
-            let alloc = platform::alloc_normal(alloc_size);
+            // Размер чанка: не меньше base_chunk и не меньше floor
+            // (по умолчанию 1 МБ; переопределяется R3_FALLBACK_CHUNK_MB) —
+            // крупные редкие mmap вместо частых mmap/munmap+SpinMutex.
+            let alloc_size =
+                fallback_chunk_bytes(self.base_chunk, need, self.len).next_multiple_of(page);
+            // Сначала пытаемся переиспользовать чанк, освобождённый этим же
+            // потоком ранее (thread-local кэш): без `mmap` вообще. Счётчик
+            // `FALLBACK_MMAPS` инкрементируется только при реальном мапе.
+            let alloc = match FREED_CHUNK_CACHE.try_with(|c| c.take(alloc_size)) {
+                Ok(Some(a)) => a,
+                _ => {
+                    #[cfg(feature = "tune")]
+                    FALLBACK_MMAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    platform::alloc_normal(alloc_size)
+                }
+            };
             fb.chunks.push(alloc);
             fb.used = 0;
         }
@@ -2122,6 +2603,15 @@ impl ThreadBump {
         self.alloc_raw_m::<ALIGN, MODE>(size) as *mut T
     }
 
+    /// Тестовый/профилировочный доступ к `alloc_uninit_slice` (счётчик
+    /// `grow_fallback` в автотюне выделяет блоки ровно так же, как реальный
+    /// бенч — через `ArenaVec`, т.е. кратные размеру элемента).
+    #[cfg(feature = "tune")]
+    #[allow(dead_code)]
+    pub fn alloc_slice_for_tune<T, const ALIGN: usize>(&self, count: usize) -> *mut T {
+        self.alloc_uninit_slice::<T, ALIGN>(count)
+    }
+
     /// Обнулить счётчики региона: регион переиспользуется с нуля (уже
     /// выданные блоки становятся валидными только после того, как владелец
     /// разберётся со своими указателями). Fallback-чанки не трогаются.
@@ -2143,13 +2633,14 @@ impl ThreadBump {
     /// First-touch: фолтим страницы ИСПОЛЬЗОВАННЫХ областей из текущего
     /// потока, чтобы они легли в локальную NUMA-ноду.
     ///
+  dev1
     /// Бенчмарк использует `prefault_own_region` (фолтит весь чанк ДО раундов);
     /// этот вариант остаётся для «дофолта уже использованного» диапазона.
     #[allow(dead_code)]
     #[hotpath::measure]
     #[cfg_attr(coverage, coverage(off))]
     fn prefault_local(&self) {
-        if self.is_huge && platform::large_pages_precommitted() {
+        if !huge_enabled() || !self.is_huge || platform::large_pages_precommitted() {
             return;
         }
         let (lo, hi) = (
@@ -2264,7 +2755,7 @@ impl ThreadBump {
             use_priority: false,
             base_chunk,
             fallback: SpinMutex::new(FallbackChunks {
-                chunks: Vec::new(),
+                chunks: Vec::with_capacity(4),
                 used: 0,
             }),
         }
@@ -2304,7 +2795,7 @@ impl ThreadBump {
             use_priority,
             base_chunk,
             fallback: SpinMutex::new(FallbackChunks {
-                chunks: Vec::new(),
+                chunks: Vec::with_capacity(4),
                 used: 0,
             }),
         }
@@ -2448,7 +2939,7 @@ impl ThreadBump {
         children
     }
 
-    /// Р В Р В°Р В·Р Т‘Р ВµР В»Р С‘РЎвЂљРЎРЉ РЎР‚Р ВµР С–Р С‘Р С•Р Р… Р Р…Р В° `n` Р Р…Р ВµР С—Р ВµРЎР‚Р ВµРЎРѓР ВµР С”Р В°РЎР‹РЎвЂ°Р С‘РЎвЂ¦РЎРѓРЎРЏ Р СњР вЂў-Send Р В·Р С•Р Р… (`ZoneBump`).
+    /// Разделить регион на `n` непересекающихся НЕ-Send зон (`ZoneBump`).
     #[allow(dead_code)]
     pub fn split_local(&self, n: usize, dir: BumpDir) -> Vec<ZoneBump<'static>> {
         let base = self.ptr;
@@ -2647,7 +3138,7 @@ impl ZoneBump<'static> {
                 is_huge,
                 base_chunk,
                 fallback: SpinMutex::new(FallbackChunks {
-                    chunks: Vec::new(),
+                    chunks: Vec::with_capacity(4),
                     used: 0,
                 }),
             }),
@@ -2756,7 +3247,7 @@ impl ZoneBump<'static> {
             None => true,
         };
         if full {
-            let alloc_size = need.max(d.base_chunk).next_multiple_of(page);
+            let alloc_size = fallback_chunk_bytes(d.base_chunk, need, d.len).next_multiple_of(page);
             fb.chunks.push(platform::alloc_normal(alloc_size));
             fb.used = 0;
         }
@@ -2883,7 +3374,7 @@ impl ZoneBump<'static> {
     #[allow(private_interfaces)]
     pub fn into_thread(self) -> CachePadded<ThreadBump> {
         let data = Rc::try_unwrap(self.inner)
-            .unwrap_or_else(|_| panic!("into_thread: РЎС“ Р В·Р С•Р Р…РЎвЂ№ Р ВµРЎРѓРЎвЂљРЎРЉ Р В¶Р С‘Р Р†РЎвЂ№Р Вµ Р С”Р В»Р С•Р Р…РЎвЂ№"));
+            .unwrap_or_else(|_| panic!("into_thread: у зоны есть живые клоны"));
         CachePadded::new(ThreadBump::restore_from_zone(data))
     }
 }
@@ -3337,11 +3828,11 @@ enum ArenaLayout {
 /// (FULL: 200×200×100, LIGHT: 100×100×100), `layout` — направлением заполнения.
 #[cfg_attr(coverage, coverage(off))]
 fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
+    install_ctrlc_handler();
     let core_ids = get_cores(smt);
     let total_capacity = chunk_size * core_ids.len();
-    if verbose_enabled() {
-        println!("[TOTAL CAPACITY]:  {}", total_capacity);
-    }
+    // Принт [TOTAL CAPACITY] убран: он дублировал информацию про каждое
+    // создание арены и засорял вывод бенча (см. R3_VERBOSE=2 выше).
     let arena = SharedArena::new(total_capacity);
     let mut bumps: Split<'_> = match layout {
         ArenaLayout::Uniform(dir) => arena.split_with_safe(core_ids.len(), dir),
@@ -3814,7 +4305,9 @@ pub fn profile_bump_chunk_size_full() -> usize {
     let used = bump.allocated_bytes().saturating_sub(bump.chunk_capacity());
     core::hint::black_box(&vectr);
     drop(vectr);
-    let recommended = (used * 110 / 100).min(pgo_chunk_cap());
+    // /2: выделяем вдвое меньше памяти под PGO-чанки bump full (см. git-историю;
+    // при нехватке bump просто доаллоцирует следующий чанк).
+    let recommended = (used * 110 / 100 / 2).min(pgo_chunk_cap());
     round_up_mb(recommended)
 }
 
@@ -3837,13 +4330,45 @@ pub fn profile_bump_chunk_size_light() -> usize {
     let used = bump.allocated_bytes().saturating_sub(bump.chunk_capacity());
     core::hint::black_box(&vectr);
     drop(vectr);
-    let recommended = (used * 110 / 100).min(pgo_chunk_cap());
+    // /2: вдвое меньше памяти под PGO-чанки bump light (см. profile_bump_chunk_size_full).
+    let recommended = (used * 110 / 100 / 2).min(pgo_chunk_cap());
     round_up_mb(recommended)
+}
+
+/// Override per-thread чанка арены из `R3_ARENA_CHUNK_MB=N` (МБ). Нужен для
+/// профилировочных прогонов: вручную заданный крупный чанк уменьшает число
+/// `grow_fallback`/mmap и захватов SpinMutex на fallback-реестре. Без
+/// переменной — None, поведение как раньше.
+///
+/// Override НЕ кешируется в OnceLock: автоподбор (`arena_tune_scan`) меняет
+/// переменную между конфигурациями внутри одного процесса, поэтому значение
+/// читается при каждом вызове. Чтение env — редкий путь (только инициализация
+/// арены/профильного замера), в hot-loop аллокаций его нет.
+fn arena_chunk_override() -> Option<usize> {
+    std::env::var("R3_ARENA_CHUNK_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .map(|mb| mb * 1024 * 1024)
 }
 
 #[cfg_attr(coverage, coverage(off))]
 pub fn profile_arena_chunk_size_full() -> usize {
-    let arena = SharedArena::new(1024 * 1024 * 1024);
+    if let Some(mb) = arena_chunk_override() {
+        return mb;
+    }
+    // Огромный чанк нужен, чтобы за прогон не было ни одного `mmap` в
+    // grow_fallback; но на машинах с малой RAM (CI: 2 GB) 1 GB сразу может не
+    // выдаваться — тогда откатываемся к половинкам, пока арена не влезет.
+    let mut cap_probe = 1024 * 1024 * 1024;
+    let arena = loop {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| SharedArena::new(cap_probe)))
+        {
+            Ok(a) => break a,
+            Err(_) if cap_probe > 16 * 1024 * 1024 => cap_probe /= 2,
+            Err(_) => panic!("profile_arena_chunk_size_full: не удалось выделить арену"),
+        }
+    };
     let bumps = arena.split_safe(1);
     let bump = &bumps[0];
     let s = bench_scale();
@@ -3872,12 +4397,16 @@ pub fn profile_arena_chunk_size_full() -> usize {
     let used = bump.allocated_bytes();
     core::hint::black_box(&vectr);
     drop(vectr);
-    let recommended = (used * 115 / 100).min(pgo_chunk_cap());
+    // /2: вдвое меньше памяти под PGO-чанки arena full (см. profile_bump_chunk_size_full).
+    let recommended = (used * 115 / 100 / 2).min(pgo_chunk_cap());
     round_up_mb(recommended)
 }
 
 #[cfg_attr(coverage, coverage(off))]
 pub fn profile_arena_chunk_size_light() -> usize {
+    if let Some(mb) = arena_chunk_override() {
+        return mb;
+    }
     let arena = SharedArena::new(512 * 1024 * 1024);
     let bumps = arena.split_safe(1);
     let bump = &bumps[0];
@@ -3902,7 +4431,8 @@ pub fn profile_arena_chunk_size_light() -> usize {
     let used = bump.allocated_bytes();
     core::hint::black_box(&vectr);
     drop(vectr);
-    let recommended = (used * 115 / 100).min(pgo_chunk_cap());
+    // /2: вдвое меньше памяти под PGO-чанки arena light (см. profile_bump_chunk_size_full).
+    let recommended = (used * 115 / 100 / 2).min(pgo_chunk_cap());
     round_up_mb(recommended)
 }
 
@@ -3910,11 +4440,329 @@ pub fn profile_arena_chunk_size_light() -> usize {
 //                        УТИЛИТЫ
 // ============================================================
 
-/// Отладочные принты арены показываются только при R3_VERBOSE=1,
-/// чтобы не засорять вывод `cargo bench`.
-fn verbose_enabled() -> bool {
-    std::env::var("R3_VERBOSE").is_ok()
+/// Точный замер потребления одного потока за ОДНУ итерацию нагрузки арены
+/// (байты) — без PGO-маржи и без каппинга через `pgo_chunk_cap()`.
+///
+/// В отличие от `profile_arena_chunk_size_*` здесь нет ни округления до МБ,
+/// ни `/2`, ни `.min(cap)`: возвращается сытое пиковое потребление региона
+/// (`allocated_bytes()`), т.е. ровно тот размер чанка, при котором поток
+/// живёт без единого обращения в `grow_fallback`. Это нужно автоподбору:
+/// маржа/каппинг профильных функций занижали `need` (вдвое!) и он мог
+/// оказаться меньше реального потребления — выбранный чанк не покрывал
+/// нагрузку.
+///
+/// Нагрузку масштабирует `bench_scale()` (как и сами бенчи): при
+/// `R3_BENCH_SCALE=N` итерации делятся на N, поэтому и потребление меряется
+/// для той же нагрузки, с которой потом гоняется основной прогон.
+///
+/// Возвращает максимум из двух прогонов (первый греет кэш/страницы).
+#[cfg_attr(coverage, coverage(off))]
+fn arena_need_bytes(full: bool) -> usize {
+    let s = bench_scale();
+    let mut best = 0usize;
+    for _ in 0..2 {
+        // Чанк заведомо больше потребления: fallback не срабатывает вовсе,
+        // поэтому allocated_bytes() = точное потребление итерации.
+        let arena = SharedArena::new(1024 * 1024 * 1024);
+        let bumps = arena.split_safe(1);
+        let bump = &bumps[0];
+        let (vcap, outer, inner) = if full {
+            (40000, 200, 200)
+        } else {
+            (10000, 100, 100)
+        };
+
+        let mut vectr: ArenaVec<ArenaVec<ArenaString>> = ArenaVec::with_capacity_in::<
+            { core::mem::align_of::<ArenaVec<ArenaString>>() },
+        >(vcap / s, bump);
+        for _ in 0..(outer / s).max(1) {
+            for _ in 0..(inner / s).max(1) {
+                let mut vec: ArenaVec<ArenaString> = ArenaVec::with_capacity_in::<
+                    { core::mem::align_of::<ArenaString>() },
+                >(400, bump);
+                for _ in 0..(100 / s).max(1) {
+                    vec.push::<{ core::mem::align_of::<ArenaString>() }>(
+                        ArenaString::from_str_in("stroka", bump),
+                        bump,
+                    );
+                }
+                vectr.push::<{ core::mem::align_of::<ArenaVec<ArenaString>>() }>(vec, bump);
+            }
+        }
+        best = best.max(bump.allocated_bytes());
+        core::hint::black_box(&vectr);
+        drop(vectr);
+    }
+    best.max(1024 * 1024)
 }
+
+/// Автоматический подбор per-thread размера чанка арены (`R3_ARENA_CHUNK_MB`).
+///
+/// Диагноз по профилю: самые горячие места — `mmap`/`munmap` внутри
+/// `grow_fallback` и захваты `SpinMutex` на fallback-реестре. Причина — чанк
+/// слишком мал и поток постоянно просит у ОС новый. Подбор делает два замера:
+///
+///  * **need** — сколько байт реально использует поток за одну итерацию
+///    нагрузки (полный профильный прогон при огромном чанке: mmap нет вовсе,
+///    поэтому `allocated_bytes()` = точное потребление);
+///  * **floor** — минимальный размер, который ещё влезает в лимит памяти
+///    (`pgo_chunk_cap()`), т.е. самый маленький кандидат сетки.
+///
+/// Затем сеткой кандидатов (geometric от need/2 до cap, ~2x шаг) замеряется
+/// число РЕАЛЬНЫХ новых mmap-чанков (`FALLBACK_MMAPS`, фича `tune`) и время
+/// прогона: каждая кандидатура реально гоняет бенч со своим чанком (бенч-
+/// функции берут размер аргументом). Метрика именно `mmap`, а не все обращения
+/// в `grow_fallback`: после каждого `reset()` региона первый аллок и при
+/// идеальном чанке заходит в `grow_fallback` (место находится в уже
+/// существующем fallback-чанке без системного вызова), поэтому «нулём calls»
+/// нельзя было бы достичь никогда — выбирался бы всегда `cap`. Нулевые же
+/// `mmap` означают, что регион+выделенный один раз fallback-чанк покрывают
+/// нагрузку целиком.
+/// Итог: наименьший чанк с нулём новых mmap; если даже `cap` не убирает их
+/// полностью (need > cap — нагрузка больше лимита памяти), берётся кандидат с
+/// минимумом mmap (при равенстве — быстрее).
+/// Точки ниже need/2 в сетку не включаются: потребление итерации там превышает
+/// чанк, fallback гарантирован — такие точки только тратят время (mmap-шторм).
+///
+/// Нагрузку для замера `need` и для скана задаёт `R3_BENCH_SCALE` (все границы
+/// итераций делятся на scale) — тюн обязан идти при том же scale, что и
+/// основной прогон, иначе подобранный чанк не будет соответствовать нагрузке.
+///
+/// Стили: время прогона меряется на том стиле, который выбран `R3_BENCH_STYLE`
+/// (mono/dispatch/both), но метрика выбора (mmap + потребление) ВСЕГДА
+/// снимается с dispatch-прогона той же нагрузки — мономорфный путь не проходит
+/// через `grow_fallback`, где стоят счётчики (см. комментарий у `load`).
+/// Повторность — из `R3_TUNE_ROUNDS` (по умолчанию 3). Возвращает
+/// выбранный размер в байтах и выставляет `R3_ARENA_CHUNK_MB` для процесса,
+/// чтобы все последующие прогоны (в т.ч. pprof) использовали подобранный чанк.
+#[cfg_attr(coverage, coverage(off))]
+pub fn arena_tune_scan(smt: bool) -> usize {
+    use std::time::Instant;
+
+    let mb = 1024 * 1024;
+    let cap = pgo_chunk_cap().max(mb);
+    let style = bench_style();
+    let run_mono = style != BenchStyle::Dispatch;
+    // dispatch-нагрузки (`load`) гоняются ВСЕГДА (см. комментарий у `load_all`:
+    // по mmap-счётчикам судим только по dispatch-прогону), поэтому отдельный
+    // флаг `run_dispatch` нигде не читается — `_`, чтобы не шуметь warning'ом.
+    let _run_dispatch = style != BenchStyle::Mono;
+    let rounds = std::env::var("R3_TUNE_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(3)
+        .max(1) as usize;
+
+    // `arena_tune_scan` вызывается из главного потока бенча до старта остальных
+    // потоков, поэтому изменение env безопасно (Rust 2024: `set_var` — unsafe).
+    println!(
+        "[tune] нагрузка: R3_BENCH_SCALE={} (итерации делятся на scale), rounds={}",
+        bench_scale(),
+        rounds
+    );
+    let set_chunk = |bytes: usize| {
+        // SAFETY: единственный поток в этот момент; другие потоки читают env
+        // только после того, как скан завершится.
+        unsafe { std::env::set_var("R3_ARENA_CHUNK_MB", (bytes / mb).max(1).to_string()) };
+    };
+
+    // ВАЖНО: при скане сетки ВСЕГДА гоняем dispatch-варианты (`arena_*`),
+    // независимо от R3_BENCH_STYLE. Причина: мономорфный путь (`arena_m_*`)
+    // использует alloc_raw_m и НЕ проходит через grow_fallback, где стоят
+    // счётчики FALLBACK_MMAPS/REGION_TAKEN — при style=mono счётчики всегда
+    // показывали бы 0 mmap'ов даже для чанка в 1 MB (мусорная метрика ->
+    // выбирался минимальный кандидат сетки -> основной прогон уходил в
+    // mmap-шторм). Время прогона при этом зависит от реального пути аллокаций,
+    // поэтому mono-кандидатуры меряются только ВРЕМЕНЕМ (метрика `ms`), а по
+    // mmap/потреблению судим по dispatch-прогону той же нагрузки.
+    let load = |chunk: usize| {
+        arena_full(chunk, smt);
+        arena_light(chunk, smt);
+    };
+    let load_all = |chunk: usize| {
+        if run_mono {
+            arena_m_full_forward(chunk, smt);
+            arena_m_light_forward(chunk, smt);
+        }
+        load(chunk);
+    };
+
+    // Прогрев: JIT/кэш планировщика/первые страницы — первые прогоны всегда
+    // шумные, их не меряем. Гоняем с cap — самый тяжёлый по памяти конфиг.
+    load(cap);
+    load(cap);
+
+    // --- Замер need: сколько байт потребляет одна итерация нагрузки --------
+    // Профильные функции PGO (`profile_arena_chunk_size_*`) для этого НЕ годятся:
+    // они применяют маржу, округление до МБ, `/2` и каппинг через
+    // `pgo_chunk_cap()`, т.е. возвращают вдвое заниженное значение — при таком
+    // `need` выбранный чанк не покрывал реальную нагрузку и основной прогон
+    // уходил в mmap-шторм. Здесь меряется сытое пиковое потребление региона за
+    // одну итерацию (тот же профиль нагрузки, что в бенчах, один поток, чанк
+    // 1 GB — fallback не срабатывает вовсе).
+    // Суммируем full+light: за один `load()` поток (фактически — каждый поток)
+    // выполняет обе нагрузки; запас сверху даёт `grid_lo = need/2` в сетке.
+    // ВАЖНО: override из R3_ARENA_CHUNK_MB на время замера убираем — точечный
+    // замер его не читает, но так безопаснее (никакие побочные пути не увидят
+    // промежуточное значение переменной).
+    let prev_override = std::env::var("R3_ARENA_CHUNK_MB").ok();
+    unsafe { std::env::remove_var("R3_ARENA_CHUNK_MB") };
+    let need_raw = arena_need_bytes(true) + arena_need_bytes(false);
+    match prev_override {
+        Some(v) => unsafe { std::env::set_var("R3_ARENA_CHUNK_MB", v) },
+        None => {}
+    }
+    let need = round_up_mb(need_raw.max(mb));
+
+    // --- Сетка кандидатов: geometric ~2x до cap ----------------------------
+    // Точки ниже need/2 гарантированно дают fallback (потребление итерации
+    // need > чанка), т.е. ничего полезного не измеряют — только mmap-шторм и
+    // потраченное время (на scale=1 это были десятки секунд на ROUND).
+    // Стартуем с need/2 (минимум 1 MB); need в сетке добавляется ниже.
+    let grid_lo = (need / 2).max(mb);
+    let mut candidates: Vec<usize> = Vec::new();
+    let mut c = grid_lo;
+    while c < cap {
+        candidates.push(c);
+        c = c.saturating_mul(2);
+    }
+    candidates.push(cap);
+    // need обязано быть в сетке: именно оно гарантированно убирает fallback.
+    if !candidates.contains(&need) && need <= cap {
+        candidates.push(need);
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+
+    // --- Сканирование -------------------------------------------------------
+    // Бенч-функции берут размер чанка аргументом (env `R3_ARENA_CHUNK_MB` в
+    // бенч-пути не читается — рано и поздно его применяют только
+    // `profile_arena_chunk_size_*`), поэтому кандидат передаётся напрямую.
+    // `set_chunk` остаётся только для финального экспорта выбранного значения.
+    // Счётчики обнуляем непосредственно перед замером каждой кандидатуры.
+    // Метрика выбора — НОВЫЕ mmap-чанки (`FALLBACK_MMAPS`): обращения в
+    // `grow_fallback` (`FALLBACK_CALLS`) есть всегда (первый аллок после reset
+    // региона), они печатаются только как справочная информация.
+    let mut results: Vec<(usize, usize, usize, f64)> = Vec::new(); // (chunk, calls, mmaps, ms)
+    for &cand in &candidates {
+        load_all(cand); // прогрев этой конфигурации (первые страницы/кэш) — не мерим
+        let _ = take_fallback_counters();
+        let t0 = Instant::now();
+        for _ in 0..rounds {
+            load_all(cand);
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / rounds as f64;
+        let (calls, mmaps) = take_fallback_counters();
+        results.push((cand, calls, mmaps, ms));
+        println!(
+            "[tune] chunk={:>5} MB  fallback_calls={:<6} new_mmaps={:<5} {:.1} ms/round",
+            cand / mb,
+            calls,
+            mmaps,
+            ms
+        );
+    }
+
+    // Потолок чанка: cap — это размер НА ПОТОК, т.е. threads×cap ≈ 80% RAM.
+    // Такой прогон уходит в свопинг/перебитие кэшей и выглядит «арена хуже
+    // mimalloc» (у mimalloc тред-локи держат только реально используемые
+    // страницы). Поэтому из zero-mmap кандидатов берём наименьший, но не
+    // больше `need` — ровно столько, сколько нагрузка потребляет за итерацию;
+    // fallback при этом остаётся нулевым (чанк >= need).
+    let chunk_cap = need.min(cap);
+    // Наименьший кандидат без единого нового mmap; если таких нет — кандидат с
+    // минимумом mmap (при равенстве — быстрее по времени).
+    let best = results
+        .iter()
+        .filter(|(cand, _, mmaps, _)| *mmaps == 0 && *cand <= chunk_cap)
+        .min_by_key(|(cand, _, _, _)| *cand)
+        .or_else(|| {
+            results
+                .iter()
+                .filter(|(cand, _, _, _)| *cand <= chunk_cap)
+                .min_by(|a, b| a.2.cmp(&b.2).then(a.3.total_cmp(&b.3)))
+        })
+        .or_else(|| {
+            results
+                .iter()
+                .min_by(|a, b| a.2.cmp(&b.2).then(a.3.total_cmp(&b.3)))
+        })
+        .map(|&(cand, calls, mmaps, ms)| (cand, calls, mmaps, ms))
+        .unwrap_or((need, 0, 0, 0.0));
+
+    set_chunk(best.0);
+    if best.0 > cap / 2 {
+        println!(
+            "[tune] WARNING: выбран чанк {} MB/поток (суммарно ~{} MB на {} потоков) — \
+             близок к лимиту памяти {}, начнётся свопинг и арена гарантированно проиграет \
+             mimalloc. Увеличьте R3_BENCH_SCALE (меньше нагрузка -> меньше need) или \
+             уменьшите число потоков (SMT off).",
+            best.0 / mb,
+            best.0 * num_cpus::get().max(1) / mb,
+            num_cpus::get(),
+            cap / mb,
+        );
+    }
+    println!(
+        "[tune] need={} MB; chosen chunk={} MB (fallback_calls={}, new_mmaps={}, {:.1} ms/round); \\\n         R3_ARENA_CHUNK_MB={}",
+        need / mb,
+        best.0 / mb,
+        best.1,
+        best.2,
+        best.3,
+        best.0 / mb
+    );
+    best.0
+}
+
+/// Отладочные принты арены (`[Arena] ...`) по умолчанию ВЫКЛЮЧЕНЫ, чтобы не
+/// засорять вывод `cargo bench` и обычный прогон бинаря: эти строки печатаются
+/// при каждом создании арены, то есть десятки раз за бенч. Однократная
+/// диагностика (привилегия large pages, `[huge]` errno) включается явным
+/// `R3_VERBOSE=1` (так её включает bench.sh); массовые принты про каждое
+/// выделение — только `R3_VERBOSE=2`. Если процессу пришёл SIGINT (Ctrl+C) —
+/// печать гасится полностью: прерванный прогон не должен генерировать новый
+/// вывод.
+fn verbose_enabled() -> bool {
+    if interrupted().load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    matches!(std::env::var("R3_VERBOSE").as_deref(), Ok("1") | Ok("2"))
+}
+
+/// Флаг «получили SIGINT». Ставится обработчиком сигнала (см.
+/// `install_ctrlc_handler`); читается `verbose_enabled()`, чтобы после
+/// Ctrl+C не печатать ничего нового.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+fn interrupted() -> &'static AtomicBool {
+    &INTERRUPTED
+}
+
+/// Обработчик Ctrl+C. На Unix ставится через `sigaction` с флагом
+/// `SA_RESTART` (прерванные системные вызовы перезапускаются, поведение
+/// потоков не меняется); на Windows и в miri — no-op (на Windows shell
+/// обрабатывает Ctrl+C сама). Вызов идемпотентен.
+#[cfg(all(unix, not(miri)))]
+fn install_ctrlc_handler() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        unsafe extern "C" fn on_sigint(_sig: libc::c_int) {
+            INTERRUPTED.store(true, Ordering::Relaxed);
+        }
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_sigint as usize;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(libc::SIGINT, &sa, ptr::null_mut());
+        }
+    });
+}
+
+#[cfg(any(windows, miri))]
+fn install_ctrlc_handler() {}
 
 /// Какую версию бенчмарка «shared arena» гонять: полностью мономорфную
 /// (`alloc_raw_m`, `arena_m_*`), с runtime-диспетчером (`arena_bench`,
@@ -3973,17 +4821,17 @@ fn run_arena_variant<M: Fn(usize, bool) -> (), D: Fn(usize, bool) -> ()>(
     match style {
         BenchStyle::Mono => {
             let t = bench(&|c, s| mono(c, s));
-            println!("  {:<12} mono     : {} Р’Вµs", label, median(&t));
+            println!("  {:<12} mono     : {} µs", label, median(&t));
         }
         BenchStyle::Dispatch => {
             let t = bench(&|c, s| dispatch(c, s));
-            println!("  {:<12} dispatch : {} Р’Вµs", label, median(&t));
+            println!("  {:<12} dispatch : {} µs", label, median(&t));
         }
         BenchStyle::Both => {
             let t_mono = bench(&|c, s| mono(c, s));
             let t_disp = bench(&|c, s| dispatch(c, s));
             println!(
-                "  {:<12} mono {:>6} Р’Вµs | dispatch {:>6} Р’Вµs",
+                "  {:<12} mono {:>6} µs | dispatch {:>6} µs",
                 label,
                 median(&t_mono),
                 median(&t_disp)
@@ -4026,14 +4874,19 @@ impl PprofGuard {
     fn new() -> Self {
         // Профилирование включается самой фичей `pprof`: если бинарник собран
         // с `--features pprof`, профайлер стартует всегда (без env-переменных).
-        let hz: i32 = std::env::var("R3_PPROF_HZ")
+        // По умолчанию 999 Hz; `R3_PPROF_HALF=1` режет частоту сэмплирования
+        // вдвое (999 -> ~500 Hz): примерно вдвое меньше сэмплов, стеков и
+        // выделяемой памяти профайлером.
+        let base_hz: i32 = std::env::var("R3_PPROF_HZ")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(999)
-            .clamp(1, 10_000);
+            .unwrap_or(999);
+        let half = std::env::var("R3_PPROF_HALF")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        let hz: i32 = if half { (base_hz / 2).max(1) } else { base_hz }.clamp(1, 10_000);
 
-        let out = std::env::var("R3_PPROF_FILE")
-            .unwrap_or_else(|_| "r3-pprof.svg".to_string());
+        let out = std::env::var("R3_PPROF_FILE").unwrap_or_else(|_| "r3-pprof.svg".to_string());
 
         match pprof::ProfilerGuardBuilder::default().frequency(hz).build() {
             Ok(guard) => {
@@ -4045,10 +4898,7 @@ impl PprofGuard {
             }
             Err(e) => {
                 eprintln!("[pprof] failed to start profiler: {e}");
-                Self {
-                    guard: None,
-                    out,
-                }
+                Self { guard: None, out }
             }
         }
     }
@@ -4188,16 +5038,59 @@ pub fn run() {
     println!("Логических ядер: {}", all_cores.len());
     println!("Физических ядер: {}", num_cpus::get_physical());
     println!("Глобальный аллокатор: {}", allocator_label());
+    let huge_on = huge_enabled();
+    // Проба доступности huge pages имеет смысл только при активной фиче
+    // huge (feature `huge` или R3_HUGE=1): без неё huge-аллоки не
+    // запрашиваются, и prefault (трогание памяти) не выполняется.
+    let huge_ok = huge_on && platform::large_pages_available();
     println!(
         "Страницы: {} KB / huge pages {} MB: {}",
         platform::page_size() / 1024,
         platform::huge_page_size() / (1024 * 1024),
-        if platform::large_pages_available() {
+        if huge_ok {
             "доступны"
+        } else if !huge_on {
+            "выключены (--features huge или R3_HUGE=1)"
         } else {
             "нет"
         }
     );
+    #[cfg(windows)]
+    if !huge_ok {
+        // Самая частая причина на Windows — не отсутствующее право, а «устаревший»
+        // токен процесса: привилегии назначаются при логине.
+        println!(
+            "  Подсказка: large pages требует привилегию \"Lock pages in memory\" (secpol.msc ->\n\
+             \u{20}\u{20}Локальные правила -> Назначение прав пользователю) и ПЕРЕЗАПУСКА СЕССИИ:\n\
+             \u{20}\u{20}токен формируется при логине, для WSL нужно `wsl --shutdown` + новый вход.\n\
+             \u{20}\u{20}Проверить: whoami /priv | findstr SeLockMemoryPrivilege\n\
+             \u{20}\u{20}Подробности (статус привилегии, размеры арен): R3_VERBOSE=1"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    if !huge_ok {
+        // На Linux MAP_HUGETLB работает ТОЛЬКО с явным пулом huge pages:
+        // если HugePages_Total = 0, mmap вернёт ENOMEM независимо от THP.
+        let total = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|s| {
+                s.lines().find_map(|line| {
+                    line.strip_prefix("HugePages_Total:")
+                        .and_then(|rest| rest.trim().parse::<usize>().ok())
+                })
+            })
+            .unwrap_or(0);
+        println!(
+            "  Подсказка: MAP_HUGETLB требует зарезервированный пул huge pages\n\
+             \u{20}\u{20}(сейчас HugePages_Total: {total}). Включить (до перезагрузки):\n\
+             \u{20}\u{20}sudo sysctl vm.nr_hugepages=512   # 512 x 2 MB = 1 GB пула\n\
+             \u{20}\u{20}Постоянно: nr_hugepages=512 в /etc/sysctl.d/99-hugepages.conf\n\
+             \u{20}\u{20}Проверить: grep -i huge /proc/meminfo | head\n\
+             \u{20}\u{20}Точная причина отказа (errno): R3_VERBOSE=1\n\
+             \u{20}\u{20}Без явного пула арены всё равно могут попасть на THP (MADV_HUGEPAGE,\n\
+             \u{20}\u{20}best-effort): cat /sys/kernel/mm/transparent_hugepage/enabled"
+        );
+    }
     println!();
 
     // PGO для bumpalo
@@ -4355,6 +5248,9 @@ pub fn pgo_train() {
 
 #[cfg_attr(coverage, coverage(off))]
 fn run_directional_benchmarks(smt: bool, pgo_full_arena: usize, pgo_light_arena: usize) {
+    // Ctrl+C во время длинного прогона: ставим обработчик и гасим весь
+    // дальнейший verbose-вывод (см. `verbose_enabled`). Идемпотентно.
+    install_ctrlc_handler();
     let mode_str = if smt {
         "SMT (all logical cores)"
     } else {
@@ -4645,7 +5541,7 @@ fn run_benchmarks(
 
         match style {
             BenchStyle::Mono => println!(
-                "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena(mono) = {} Р’Вµs",
+                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena(mono) = {} µs",
                 round + 1,
                 median(&mimm_times),
                 median(&bump_times),
@@ -4653,7 +5549,7 @@ fn run_benchmarks(
                 arena_mono_us
             ),
             BenchStyle::Dispatch => println!(
-                "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena(dispatch) = {} Р’Вµs",
+                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena(dispatch) = {} µs",
                 round + 1,
                 median(&mimm_times),
                 median(&bump_times),
@@ -4661,7 +5557,7 @@ fn run_benchmarks(
                 arena_disp_us
             ),
             BenchStyle::Both => println!(
-                "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena mono|dispatch = {}|{} Р’Вµs",
+                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena mono|dispatch = {}|{} µs",
                 round + 1,
                 median(&mimm_times),
                 median(&bump_times),
@@ -4699,7 +5595,7 @@ fn run_benchmarks(
 
         match style {
             BenchStyle::Mono => println!(
-                "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena(mono) = {} Р’Вµs",
+                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena(mono) = {} µs",
                 round + 1,
                 median(&mimm_times),
                 median(&bump_times),
@@ -4707,7 +5603,7 @@ fn run_benchmarks(
                 arena_mono_us
             ),
             BenchStyle::Dispatch => println!(
-                "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena(dispatch) = {} Р’Вµs",
+                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena(dispatch) = {} µs",
                 round + 1,
                 median(&mimm_times),
                 median(&bump_times),
@@ -4715,7 +5611,7 @@ fn run_benchmarks(
                 arena_disp_us
             ),
             BenchStyle::Both => println!(
-                "Round {}: MIMALOC = {} Р’Вµs, Bump = {} Р’Вµs, SharedBump = {} Р’Вµs, Arena mono|dispatch = {}|{} Р’Вµs",
+                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena mono|dispatch = {}|{} µs",
                 round + 1,
                 median(&mimm_times),
                 median(&bump_times),
@@ -4749,6 +5645,32 @@ mod tests {
     }
     fn count_scale(base: usize) -> usize {
         base / MS
+    }
+
+    /// По профилю pprof hotspot — частые `mmap`/`munmap` в `grow_fallback`:
+    /// fallback-чанки были крошечными (`base_chunk.max(need)` при
+    /// `base_chunk == 0`). Регрессия: floor по умолчанию обязан быть не меньше
+    /// 1 МБ, чтобы один mmap покрывал тысячи мелких аллокаций.
+    #[test]
+    fn fallback_chunk_bytes_default_floor_is_1mb() {
+        // Регион >= floor: чанк = min(floor, cap), а не `need` и не 0.
+        assert_eq!(
+            fallback_chunk_bytes(0, 8, 64 * 1024 * 1024),
+            DEFAULT_FALLBACK_CHUNK_BYTES
+        );
+        // need больше floor — берём need (аллокация обязана влезть в чанк).
+        assert_eq!(
+            fallback_chunk_bytes(0, 2 * 1024 * 1024, 64 * 1024 * 1024),
+            2 * 1024 * 1024
+        );
+        // base_chunk больше floor — пол не уменьшает его.
+        assert_eq!(
+            fallback_chunk_bytes(4 * 1024 * 1024, 8, 64 * 1024 * 1024),
+            4 * 1024 * 1024
+        );
+        // Маленький регион (< дефолтного floor): каппинг не применяется,
+        // поведение как историческое (тесты границ/OOM не ломаются).
+        assert_eq!(fallback_chunk_bytes(0, 8, 4096), 8);
     }
 
     /// Один bump заданного направления на `cap` байт.
@@ -6062,7 +6984,7 @@ mod tests {
 
     #[test]
     fn cov_verbose_println_arena_new() {
-        unsafe { std::env::set_var("R3_VERBOSE", "1") };
+        unsafe { std::env::set_var("R3_VERBOSE", "2") };
         let _a = SharedArena::new(4096);
         unsafe { std::env::remove_var("R3_VERBOSE") };
     }

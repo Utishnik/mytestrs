@@ -1,0 +1,87 @@
+Логических ядер: 16
+Физических ядер: 8
+
+PGO bump full: 750 MB
+PGO bump light: 190 MB
+
+PGO arena full: 410 MB
+PGO arena light: 103 MB
+
+
+########## Бенч: SMT (all logical cores) ##########
+
+=== FULL VERSION (SMT (all logical cores)) — style Both ===
+Round 1: MIMALOC = 7321760 Р’Вµs, Bump = 15725446 Р’Вµs, SharedBump = 2958208 Р’Вµs, Arena mono|dispatch = 1287047|1249671 Р’Вµs
+Round 2: MIMALOC = 7097958 Р’Вµs, Bump = 12527798 Р’Вµs, SharedBump = 2868617 Р’Вµs, Arena mono|dispatch = 1273329|1215679 Р’Вµs
+Round 3: MIMALOC = 7263377 Р’Вµs, Bump = 13068890 Р’Вµs, SharedBump = 2928536 Р’Вµs, Arena mono|dispatch = 1267984|1194065 Р’Вµs
+
+=== LIGHT VERSION (SMT (all logical cores)) — style Both ===
+Round 1: MIMALOC = 524984 Р’Вµs, Bump = 345161 Р’Вµs, SharedBump = 748433 Р’Вµs, Arena mono|dispatch = 262339|262850 Р’Вµs
+Round 2: MIMALOC = 523150 Р’Вµs, Bump = 294541 Р’Вµs, SharedBump = 733404 Р’Вµs, Arena mono|dispatch = 263594|261242 Р’Вµs
+Round 3: MIMALOC = 523717 Р’Вµs, Bump = 332015 Р’Вµs, SharedBump = 907907 Р’Вµs, Arena mono|dispatch = 260936|263586 Р’Вµs
+
+########## Бенч: NO SMT (physical cores only) ##########
+
+=== FULL VERSION (NO SMT (physical cores only)) — style Both ===
+Round 1: MIMALOC = 1053765 Р’Вµs, Bump = 720987 Р’Вµs, SharedBump = 1469088 Р’Вµs, Arena mono|dispatch = 499361|494041 Р’Вµs
+Round 2: MIMALOC = 1058163 Р’Вµs, Bump = 708458 Р’Вµs, SharedBump = 1532432 Р’Вµs, Arena mono|dispatch = 555593|584004 Р’Вµs
+Round 3: MIMALOC = 1074890 Р’Вµs, Bump = 737240 Р’Вµs, SharedBump = 1494662 Р’Вµs, Arena mono|dispatch = 502994|502139 Р’Вµs
+
+=== LIGHT VERSION (NO SMT (physical cores only)) — style Both ===
+Round 1: MIMALOC = 232716 Р’Вµs, Bump = 172522 Р’Вµs, SharedBump = 467162 Р’Вµs, Arena mono|dispatch = 135428|129305 Р’Вµs
+Round 2: MIMALOC = 254231 Р’Вµs, Bump = 141480 Р’Вµs, SharedBump = 362637 Р’Вµs, Arena mono|dispatch = 128311|128917 Р’Вµs
+Round 3: MIMALOC = 242934 Р’Вµs, Bump = 165499 Р’Вµs, SharedBump = 372263 Р’Вµs, Arena mono|dispatch = 127203|124676 Р’Вµs
+
+########## Directional Arena: SMT (all logical cores) ##########
+
+=== Directional FULL (SMT (all logical cores)) — style Both ===
+  Forward      mono 1306356 Р’Вµs | dispatch 1280432 Р’Вµs
+  Backward     mono 1169921 Р’Вµs | dispatch 1188343 Р’Вµs
+  MiddleOut    mono 1273863 Р’Вµs | dispatch 1223329 Р’Вµs
+  Neighbors    mono 1193773 Р’Вµs | dispatch 1142869 Р’Вµs
+  Pair         mono 932979 Р’Вµs | dispatch 1237680 Р’Вµs
+  Donors       mono 1205281 Р’Вµs | dispatch 1227696 Р’Вµs
+  DonorsPrio   mono 1204165 Р’Вµs | dispatch 1167022 Р’Вµs
+  DonorsOrx    mono 1205860 Р’Вµs | dispatch 1250903 Р’Вµs
+  DonorsOrxPrio mono 1268737 Р’Вµs | dispatch 1177209 Р’Вµs
+  DonorsBoxcar mono 1224575 Р’Вµs | dispatch 1164898 Р’Вµs
+  DonorsBoxcarPrio mono 1210769 Р’Вµs | dispatch 1201947 Р’Вµs
+=== Directional LIGHT (SMT (all logical cores)) — style Both ===
+  Forward      mono 258327 Р’Вµs | dispatch 264445 Р’Вµs
+  Backward     mono 259797 Р’Вµs | dispatch 257786 Р’Вµs
+  MiddleOut    mono 263252 Р’Вµs | dispatch 265640 Р’Вµs
+  Neighbors    mono 263107 Р’Вµs | dispatch 274392 Р’Вµs
+  Pair         mono 236481 Р’Вµs | dispatch 272105 Р’Вµs
+  Donors       mono 266705 Р’Вµs | dispatch 257375 Р’Вµs
+  DonorsPrio   mono 258966 Р’Вµs | dispatch 262169 Р’Вµs
+  DonorsOrx    mono 268893 Р’Вµs | dispatch 266304 Р’Вµs
+  DonorsOrxPrio mono 263371 Р’Вµs | dispatch 257968 Р’Вµs
+  DonorsBoxcar mono 262822 Р’Вµs | dispatch 260301 Р’Вµs
+  DonorsBoxcarPrio mono 261402 Р’Вµs | dispatch 257089 Р’Вµs
+
+########## Directional Arena: NO SMT (physical cores only) ##########
+
+=== Directional FULL (NO SMT (physical cores only)) — style Both ===
+  Forward      mono 546702 Р’Вµs | dispatch 552573 Р’Вµs
+  Backward     mono 533462 Р’Вµs | dispatch 507281 Р’Вµs
+  MiddleOut    mono 540005 Р’Вµs | dispatch 530574 Р’Вµs
+  Neighbors    mono 486212 Р’Вµs | dispatch 574912 Р’Вµs
+  Pair         mono 507984 Р’Вµs | dispatch 521357 Р’Вµs
+  Donors       mono 572284 Р’Вµs | dispatch 572232 Р’Вµs
+  DonorsPrio   mono 512826 Р’Вµs | dispatch 507705 Р’Вµs
+  DonorsOrx    mono 503663 Р’Вµs | dispatch 505846 Р’Вµs
+  DonorsOrxPrio mono 499038 Р’Вµs | dispatch 550703 Р’Вµs
+  DonorsBoxcar mono 523168 Р’Вµs | dispatch 513162 Р’Вµs
+  DonorsBoxcarPrio mono 506164 Р’Вµs | dispatch 512899 Р’Вµs
+=== Directional LIGHT (NO SMT (physical cores only)) — style Both ===
+  Forward      mono 128168 Р’Вµs | dispatch 128494 Р’Вµs
+  Backward     mono 126716 Р’Вµs | dispatch 125670 Р’Вµs
+  MiddleOut    mono 134638 Р’Вµs | dispatch 129752 Р’Вµs
+  Neighbors    mono 128883 Р’Вµs | dispatch 133180 Р’Вµs
+  Pair         mono 119931 Р’Вµs | dispatch 127457 Р’Вµs
+  Donors       mono 127763 Р’Вµs | dispatch 123846 Р’Вµs
+  DonorsPrio   mono 132298 Р’Вµs | dispatch 124239 Р’Вµs
+  DonorsOrx    mono 127147 Р’Вµs | dispatch 124003 Р’Вµs
+  DonorsOrxPrio mono 145335 Р’Вµs | dispatch 132739 Р’Вµs
+  DonorsBoxcar mono 128163 Р’Вµs | dispatch 124063 Р’Вµs
+  DonorsBoxcarPrio mono 130366 Р’Вµs | dispatch 126564 Р’Вµs

@@ -5,6 +5,18 @@ on:
     branches: [ "master" ]
   pull_request:
     branches: [ "master" ]
+  workflow_dispatch:
+    inputs:
+      target_os:
+        description: 'OS for manual Miri run'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,10 +39,33 @@ jobs:
 
   miri:
     name: miri (${{ matrix.os }})
+    # Пропускаем этот job при ручном запуске (workflow_dispatch): тогда
+    # используется отдельный job miri-manual с выбранным ОС.
+    if: github.event_name != 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install nightly toolchain with Miri
+      run: rustup toolchain install nightly --profile minimal --component miri --component rust-src --no-self-update
+    - name: Use nightly for this checkout
+      run: rustup override set nightly
+    - name: Build Miri sysroot
+      run: cargo miri setup
+    - name: Run Miri tests
+      run: cargo miri test --lib
+
+  miri-manual:
+    name: miri manual (${{ matrix.os }})
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(github.event.inputs.target_os == 'all' && '["ubuntu-latest","windows-latest","macos-latest"]' || github.event.inputs.target_os == 'ubuntu-latest' && '["ubuntu-latest"]' || github.event.inputs.target_os == 'windows-latest' && '["windows-latest"]' || '["macos-latest"]') }}
     runs-on: ${{ matrix.os }}
 
     steps:

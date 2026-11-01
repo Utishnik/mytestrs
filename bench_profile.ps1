@@ -17,6 +17,8 @@
 #   powershell -File bench_profile.ps1 -Out r3.txt              # pprof filename override
 #   powershell -File bench_profile.ps1 -HotpathOut hp.json      # hotpath filename override
 #   powershell -File bench_profile.ps1 -Hz 999                  # pprof sampling frequency
+#   powershell -File bench_profile.ps1 -Half                    # pprof: half sampling freq (~500 Hz)
+#                                                               #   AND half memory footprint (R3_BENCH_SCALE=2)
 #   powershell -File bench_profile.ps1 -Style mono|dispatch|both
 #   powershell -File bench_profile.ps1 -Prefetch                # + win-prefetch-pages
 #   powershell -File bench_profile.ps1 -Cpu                     # + hotpath-cpu (Linux/macOS only)
@@ -29,6 +31,7 @@ param(
     [string]$Out = '',
     [string]$HotpathOut = '',
     [int]$Hz = 0,
+    [switch]$Half,
     [ValidateSet('mono', 'dispatch', 'both')][string]$Style = 'both',
     [switch]$Prefetch,
     [switch]$Cpu,
@@ -53,6 +56,14 @@ function Get-PprofExt([string]$fmt) {
 function Invoke-PprofRun([string]$fmt, [string]$file) {
     $env:R3_PPROF_FILE = $file
     if ($Hz -gt 0) { $env:R3_PPROF_HZ = "$Hz" } else { Remove-Item Env:R3_PPROF_HZ -ErrorAction SilentlyContinue }
+    # -Half: 2x fewer samples (freq /2) and 2x less allocated memory in the bench
+    # (R3_BENCH_SCALE=2 halves all allocation loops).
+    if ($Half) {
+        $env:R3_PPROF_HALF = "1"
+        if (-not $env:R3_BENCH_SCALE) { $env:R3_BENCH_SCALE = "2" }
+    } else {
+        Remove-Item Env:R3_PPROF_HALF -ErrorAction SilentlyContinue
+    }
     Write-Host "===== running pprof bench ($fmt) -> $file =====" -ForegroundColor Cyan
     $bin = ".\target\profiling\r3.exe"
     if (-not (Test-Path $bin)) { $bin = "./target/profiling/r3" }

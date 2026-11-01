@@ -25,6 +25,9 @@ pprof = { version = "0.13", optional = true, features = ["flamegraph", "protobuf
 default = ["alloc-mimalloc"]
 pprof = ["dep:pprof"]
 alloc-mimalloc = ["dep:rustfs-mimalloc"]
+# Счётчик grow_fallback + автоподбор chunk size (arena_tune_scan) для
+# bench_arena_profile.sh --tune. Не входит в default: без него бинарь идентичен.
+tune = []
 hotpath = ["hotpath/hotpath"]
 hotpath-cpu = ["hotpath/hotpath-cpu"]
 # Асинхронный prefetch страниц на Windows через PrefetchVirtualMemory.
@@ -32,6 +35,18 @@ hotpath-cpu = ["hotpath/hotpath-cpu"]
 # в чужом контексте (working-set lock, чужая NUMA-нода) и это даёт
 # регрессию. Включается явно: `cargo build --features win-prefetch-pages`.
 win-prefetch-pages = []
+# Huge pages + prefault (трогание памяти). ВЫКЛЮЧЕН по умолчанию.
+# Включение: `cargo build --features huge` (compile-time) ИЛИ
+# `R3_HUGE=1` (runtime, работает и в бинаре без фичи).
+# При активной фиче:
+#   * арены запрашивают huge pages (MAP_HUGETLB / MEM_LARGE_PAGES),
+#     если ОС их даёт;
+#   * prefault (first-touch трогание страниц региона в своей NUMA-ноде,
+#     MADV_POPULATE_WRITE / touch-loop) выполняется только для регионов,
+#     реально лежащих на huge pages.
+# Без фичи и без R3_HUGE=1: обычные 4KB-страницы, prefault не выполняется
+# вообще (в т.ч. блоки hotpath "prefault" не создаются).
+huge = []
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -53,6 +68,13 @@ harness = false
 
 [[bench]]
 name = "alloc_bench"
+harness = false
+
+# Профильный прогон ТОЛЬКО shared-арены (без spin-мьютекса):
+#   cargo bench --profile profiling --features pprof --bench arena_profile
+# Запускается через скрипт bench_arena_profile.sh (сохраняет .svg + .txt).
+[[bench]]
+name = "arena_profile"
 harness = false
 
 [profile.release]
