@@ -37,6 +37,17 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
 
+  clippy:
+    name: clippy (no warnings)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    # Линтер обязателен: без него в коде копились предупреждения
+    # (в т.ч. deny-by-default `clippy::mut_from_ref`, из-за которого
+    # `cargo clippy` вообще не компилировал крейт).
+    - name: Clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+
   miri:
     name: miri (${{ matrix.os }})
     # Пропускаем этот job при ручном запуске (workflow_dispatch): тогда

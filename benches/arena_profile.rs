@@ -91,6 +91,10 @@ fn main() {
         println!("round {} done", round + 1);
     }
 
+    // Отчёт профайлера пишется в `Drop` гуарда, поэтому роняем его явно
+    // ДО финального сообщения. На Windows (и без фичи `pprof`) `PprofGuard` —
+    // пустая структура без `Drop`, поэтому clippy ругается на `drop`:
+    #[allow(clippy::drop_non_drop)]
     drop(_pprof); // отчёт пишется в Drop профайлера
     println!("=== arena-only profile run finished ===");
 }

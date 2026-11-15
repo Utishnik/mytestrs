@@ -24,7 +24,7 @@
 #                                               #   AND half memory footprint (R3_BENCH_SCALE=2)
 #   ./bench_profile.sh --style mono|dispatch|both        # arena version to run
 #   ./bench_profile.sh --prefetch               # hotpath build: + win-prefetch-pages
-#   ./bench_profile.sh --cpu                    # hotpath: + hotpath-cpu (Linux/macOS only)
+#   ./bench_profile.sh --cpu                    # hotpath: + hotpath-cpu (CPU baseline; фича no-op на Windows)
 #   ./bench_profile.sh --capture                # discard bench stdout (no tee)
 #
 # Notes:

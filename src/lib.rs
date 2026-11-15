@@ -11,7 +11,7 @@ use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::rc::Rc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use triomphe::Arc;
 
 /// Подсказка префетчеру: блок по `addr` будет сразу записан вызывающим.
@@ -30,6 +30,7 @@ fn prefetch_write(_addr: *const u8) {}
 //               ПЛАТФОРМЕННЫЙ СЛОЙ ВЫДЕЛЕНИЯ ПАМЯТИ
 // ============================================================
 
+#[derive(Clone, Copy)]
 pub(crate) struct RawAllocation {
     ptr: *mut u8,
     size: usize,
@@ -68,16 +69,6 @@ impl Default for RawAllocation {
     }
 }
 
-impl Clone for RawAllocation {
-    #[inline]
-    fn clone(&self) -> Self {
-        // Копируем поля, а не конструируем литералом: набор cfg-полей
-        // (`virt_size`/`virt_align`) зависит от платформы и Miri.
-        RawAllocation { ..*self }
-    }
-}
-impl Copy for RawAllocation {}
-
 impl RawAllocation {
     /// Освободить чанк через платформенный слой. В кэшах и контейнерах храним
     /// `Option<RawAllocation>`; при вытеснении/замене элемента старый чанк
@@ -91,13 +82,183 @@ impl RawAllocation {
     }
 }
 
-/// Список дополнительных чанков, выделенных «где-то в памяти» в режиме доноров,
-/// плюс курсор заполнения последнего чанка (чтобы не делать по VirtualAlloc на
-/// каждый блок). Все чанки освобождаются в `Drop` `ThreadBump`.
+/// Fallback-чанки bump'а: дополнительные куски памяти, выделенные «где-то
+/// в памяти», когда собственный регион исчерпан.
+///
+/// Fallback принадлежит РОВНО одному потоку — владельцу bump'а: сосед по
+/// паре и доноры занимают память через счётчики `lo`/`hi` ЧУЖОГО bump'а, но
+/// его fallback-чанки не трогают. Поэтому «горячий» путь (выдача блока из
+/// уже выделенного чанка) работает БЕЗ блокировки: указатель на текущий
+/// чанк и курсор лежат в атомарных ячейках, которые пишет только владелец.
+/// Блокировка нужна лишь на редком пути «чанк закончился → другой/новый».
+///
+/// Чанки ПЕРЕИСПОЛЬЗУЮТСЯ: `reset` обнуляет курсор в каждом чанке, и
+/// следующая итерация бенча берёт ту же память, а не запрашивает её у ОС
+/// заново. Без этого каждая итерация арены забирала у ОС сотни мегабайт
+/// (на Windows это ещё и упиралось в commit charge: 16 потоков × 3 итерации
+/// × ~400 МБ = ~20 ГБ commit'а, из-за чего бенч уходил в pagefile и
+/// замедлялся в разы).
 struct FallbackChunks {
-    chunks: Vec<RawAllocation>,
-    /// Байт занято в последнем чанке (`chunks.last()`).
+    /// Начало текущего чанка (null — чанков ещё нет).
+    cur_ptr: AtomicPtr<u8>,
+    /// Размер текущего чанка в байтах (0 — чанков ещё нет).
+    cur_size: AtomicUsize,
+    /// Занято байт в текущем чанке.
+    cur_used: AtomicUsize,
+    /// Индекс текущего чанка в списке `chunks`.
+    cur_idx: AtomicUsize,
+    /// Все выделенные чанки: переиспользуются по кругу и освобождаются в `Drop`.
+    chunks: SpinMutex<Vec<FbChunk>>,
+}
+
+/// Один fallback-чанк: сырая аллокация и занятое в ней место.
+struct FbChunk {
+    alloc: RawAllocation,
+    /// Занято байт в этом чанке (курсор бампа по нему).
     used: usize,
+}
+
+impl FallbackChunks {
+    fn new() -> Self {
+        FallbackChunks {
+            cur_ptr: AtomicPtr::new(ptr::null_mut()),
+            cur_size: AtomicUsize::new(0),
+            cur_used: AtomicUsize::new(0),
+            cur_idx: AtomicUsize::new(0),
+            chunks: SpinMutex::new(Vec::new()),
+        }
+    }
+
+    /// Выдать блок `size` байт (выровненный под `ALIGN`) из fallback-чанков.
+    ///
+    /// `base_chunk` — базовый размер нового чанка, `cap` — потолок (длина
+    /// региона потока): и то и другое используется только на медленном пути.
+    #[inline(always)]
+    fn alloc_block<const ALIGN: usize>(
+        &self,
+        size: usize,
+        base_chunk: usize,
+        cap: usize,
+    ) -> *mut u8 {
+        let need = (size + ALIGN - 1) & !(ALIGN - 1);
+        // --- Быстрый путь: в текущем чанке есть место (без блокировки) ---
+        let cur_size = self.cur_size.load(Ordering::Relaxed);
+        if cur_size != 0 {
+            let used = self.cur_used.load(Ordering::Relaxed);
+            if used + need <= cur_size {
+                let off = (used + ALIGN - 1) & !(ALIGN - 1);
+                self.cur_used.store(off + size, Ordering::Relaxed);
+                let base = self.cur_ptr.load(Ordering::Relaxed);
+                let p = unsafe { base.add(off) };
+                // Префетчим следующий блок (адрес клампим в границы чанка,
+                // иначе `ptr.add` ушёл бы за выделенный объект = UB).
+                prefetch_write(unsafe { base.add((off + size).min(cur_size)) });
+                return p;
+            }
+        }
+        self.alloc_block_slow::<ALIGN>(size, need, base_chunk, cap)
+    }
+
+    /// Медленный путь: в текущем чанке места нет → берём другой уже
+    /// выделенный чанк (в котором ещё осталось место), а если такого нет —
+    /// выделяем новый.
+    #[cold]
+    fn alloc_block_slow<const ALIGN: usize>(
+        &self,
+        size: usize,
+        need: usize,
+        base_chunk: usize,
+        cap: usize,
+    ) -> *mut u8 {
+        let page = platform::page_size();
+        debug_assert!(
+            ALIGN <= page,
+            "выравнивание больше страницы не поддерживается"
+        );
+        let mut chunks = self.chunks.lock();
+        // Курсор текущего чанка живёт в атомике — синхронизируем его со
+        // списком, чтобы не потерять занятое место.
+        let cur_idx = self.cur_idx.load(Ordering::Relaxed);
+        if cur_idx < chunks.len() {
+            chunks[cur_idx].used = self.cur_used.load(Ordering::Relaxed);
+        }
+        // 1) Переиспользовать уже выделенный чанк, в котором есть место.
+        let mut target = None;
+        for (i, c) in chunks.iter().enumerate() {
+            if c.used + need <= c.alloc.size {
+                target = Some(i);
+                break;
+            }
+        }
+        // 2) Подходящего чанка нет — выделяем новый: сначала пробуем
+        //    thread-local кэш (чанк, освобождённый этим же потоком ранее),
+        //    чтобы вообще не обращаться к ОС.
+        let idx = match target {
+            Some(i) => i,
+            None => {
+                let alloc_size = fallback_chunk_bytes(base_chunk, need, cap).next_multiple_of(page);
+                let alloc = match FREED_CHUNK_CACHE.try_with(|c| c.take(alloc_size)) {
+                    Ok(Some(a)) => a,
+                    _ => {
+                        #[cfg(feature = "tune")]
+                        FALLBACK_MMAPS.fetch_add(1, Ordering::Relaxed);
+                        platform::alloc_normal(alloc_size)
+                    }
+                };
+                chunks.push(FbChunk { alloc, used: 0 });
+                chunks.len() - 1
+            }
+        };
+        let c = &mut chunks[idx];
+        let off = (c.used + ALIGN - 1) & !(ALIGN - 1);
+        c.used = off + size;
+        self.cur_idx.store(idx, Ordering::Relaxed);
+        self.cur_ptr.store(c.alloc.ptr, Ordering::Relaxed);
+        self.cur_size.store(c.alloc.size, Ordering::Relaxed);
+        self.cur_used.store(c.used, Ordering::Relaxed);
+        let p = unsafe { c.alloc.ptr.add(off) };
+        prefetch_write(unsafe { c.alloc.ptr.add((off + size).min(c.alloc.size)) });
+        p
+    }
+
+    /// Вернуть fallback в начальное состояние: курсор в каждом чанке — на ноль.
+    ///
+    /// Память НЕ освобождается: она переиспользуется следующей итерацией
+    /// (см. документ структуры). Это и есть главный выигрыш: арена больше не
+    /// запрашивает у ОС новую память на каждой итерации бенча.
+    fn reset(&self) {
+        let mut chunks = self.chunks.lock();
+        for c in chunks.iter_mut() {
+            c.used = 0;
+        }
+        self.cur_used.store(0, Ordering::Relaxed);
+        self.cur_idx.store(0, Ordering::Relaxed);
+        match chunks.first() {
+            Some(c) => {
+                self.cur_ptr.store(c.alloc.ptr, Ordering::Relaxed);
+                self.cur_size.store(c.alloc.size, Ordering::Relaxed);
+            }
+            None => {
+                self.cur_ptr.store(ptr::null_mut(), Ordering::Relaxed);
+                self.cur_size.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Освободить все чанки; последний возвращается наружу (его можно
+    /// отдать в thread-local кэш).
+    fn take_last_and_free_rest(&self) -> Option<RawAllocation> {
+        let mut chunks = self.chunks.lock();
+        let last = chunks.pop().map(|c| c.alloc);
+        for c in chunks.drain(..) {
+            platform::free(c.alloc);
+        }
+        self.cur_ptr.store(ptr::null_mut(), Ordering::Relaxed);
+        self.cur_size.store(0, Ordering::Relaxed);
+        self.cur_used.store(0, Ordering::Relaxed);
+        self.cur_idx.store(0, Ordering::Relaxed);
+        last
+    }
 }
 
 /// Счётчик обращений в `grow_fallback` (переполнение региона). Включён
@@ -266,62 +427,70 @@ fn fallback_chunk_bytes(base_chunk: usize, need: usize, cap: usize) -> usize {
 // деструктором не может быть `const`-инициализирован, поэтому раньше кэш был
 // `Cell<Option<RawAllocation>>` без Drop и никогда не дренировался при
 // завершении процесса — Miri репортит утечку каждой оставшейся в кэше
-// std-аллокации. Теперь кэш хранит `Cell<Option<Box<ChunkSlot>>>`, где
-// `ChunkSlot` освобождает чанк в своём `Drop`.
+// std-аллокации. Сейчас кэш — `ChunkCache` с собственным `Drop`, который
+// освобождает чанк при завершении потока.
 //
-// Оговорка про «Box уничтожается вместе с потоком/процессом автоматически»:
-// это верно только для типов БЕЗ деструктора. `ChunkSlot` содержит `Drop`,
-// поэтому обычный `thread_local!` гарантированно вызывает деструктор слота
-// при завершении потока (в том числе под Miri) — на этом и построен фикс.
-// Именно поэтому здесь НЕ используется `const`-инициализация тред-локали:
-// `thread_local! { static X: T = const { ... } }` запрещена для типов с
-// деструктором (E0730), а если бы компилировалась, то деструктор вообще не
-// запускался бы и утечка вернулась.
-struct ChunkSlot(RawAllocation);
-
-impl Drop for ChunkSlot {
-    #[inline]
-    fn drop(&mut self) {
-        // Забираем чанк через ptr::read (поля RawAllocation Copy) и отдаём ОС.
-        let a = unsafe { std::ptr::read(&self.0) };
-        platform::free(a);
-    }
+// ВАЖНО (use-after-free!): раньше кэш хранил `Box<ChunkSlot>`, где
+// `ChunkSlot` освобождает чанк в своём `Drop`. Но `drop(Box<ChunkSlot>)`
+// вызывает `Drop` для `ChunkSlot`, то есть ОС возвращала страницы чанка в
+// тот момент, когда `take()` уже отдавал этот указатель вызывающему:
+// `grow_fallback` писал в освобождённую память (UAF / potential crash на
+// Windows: `VirtualFree` снимает отображение, запись → access violation).
+// Поэтому чанк хранится ПРОСТО как значение `RawAllocation` (без
+// деструктора внутри), а освобождение делает `Drop for ChunkCache` —
+// вручную, в нужных местах (`take`/`put`/завершение потока).
+//
+// Деструктор кэша (а не деструктор значения внутри) решает и проблему Miri с
+// утечкой: `thread_local!` с НЕ-const инициализатором регистрирует
+// деструктор, который гарантированно отрабатывает при завершении потока
+// (в том числе под Miri). `const`-инициализация здесь невозможна: тип с
+// деструктором нельзя инициализировать в `const`-контексте (E0730).
+struct ChunkCache {
+    /// Закэшированный чанк (не более одного на поток).
+    slot: Cell<Option<RawAllocation>>,
 }
 
-thread_local! {
-    static FREED_CHUNK_CACHE: RawAllocationCache = const { RawAllocationCache(std::cell::Cell::new(None)) };
-}
-
-struct RawAllocationCache(std::cell::Cell<Option<Box<ChunkSlot>>>);
-
-impl RawAllocationCache {
+impl ChunkCache {
     /// Забрать закэшированный чанк подходящего размера (иначе `None`).
+    ///
+    /// Размер сверяется по фактически выделенному объёму: чанк меньше
+    /// нужного не подходит и освобождается через ОС.
     #[inline]
     fn take(&self, size: usize) -> Option<RawAllocation> {
-        match self.0.take() {
-            Some(slot) if slot.0.size >= size => {
-                // Достаём чанк из Box без запуска Drop слота: `slot` — owned
-                // значение (`Box<ChunkSlot>`), поле читается напрямую,
-                // `ptr::read`/`forget` не нужны.
-                let a = slot.0;
-                drop(slot); // освобождается только сам Box-«ящик»
-                Some(a)
-            }
+        match self.slot.take() {
+            Some(a) if a.size >= size => Some(a),
             other => {
-                // Не подошёл по размеру (или его нет) — при вытеснении `other`
-                // чанк будет освобождён автоматически Drop'ом слота.
-                drop(other);
+                // Не подошёл по размеру (или его нет) — освобождаем через ОС.
+                if let Some(a) = other {
+                    platform::free(a);
+                }
                 None
             }
         }
     }
 
-    /// Положить чанк в кэш; прежний содержимец кэша освобождается через ОС
-    /// (Drop слота при уничтожении вытесненного `Box`).
+    /// Положить чанк в кэш; прежний содержимое кэша освобождается через ОС.
     #[inline]
     fn put(&self, alloc: RawAllocation) {
-        self.0.replace(Some(Box::new(ChunkSlot(alloc))));
+        let old = self.slot.replace(Some(alloc));
+        if let Some(a) = old {
+            platform::free(a);
+        }
     }
+}
+
+impl Drop for ChunkCache {
+    #[inline]
+    fn drop(&mut self) {
+        // Поток завершается — возвращаем чанк ОС (иначе Miri репортит утечку).
+        if let Some(a) = self.slot.take() {
+            platform::free(a);
+        }
+    }
+}
+
+thread_local! {
+    static FREED_CHUNK_CACHE: ChunkCache = const { ChunkCache { slot: Cell::new(None) } };
 }
 
 /// Запись о доноре в реестре: индекс в массиве bumps, его приоритет и флаг
@@ -548,7 +717,10 @@ mod platform {
                     ptr: ptr as *mut u8,
                     size,
                     is_huge: true,
-                    ..Default::default()
+                    #[cfg(all(miri, windows))]
+                    virt_size: 0,
+                    #[cfg(all(miri, windows))]
+                    virt_align: 0,
                 })
             }
         }
@@ -569,7 +741,10 @@ mod platform {
                 ptr: ptr as *mut u8,
                 size,
                 is_huge: false,
-                ..Default::default()
+                #[cfg(all(miri, windows))]
+                virt_size: 0,
+                #[cfg(all(miri, windows))]
+                virt_align: 0,
             }
         }
     }
@@ -752,16 +927,15 @@ mod platform {
         #[cfg(not(feature = "win-prefetch-pages"))]
         let _ = ptr;
         // Под Miri PrefetchVirtualMemory не зашимлен — пропускаем.
-        if cfg!(miri) {
-            return;
-        }
-        #[cfg(feature = "win-prefetch-pages")]
-        unsafe {
-            let range = WIN32_MEMORY_RANGE_ENTRY {
-                VirtualAddress: ptr as *mut _,
-                NumberOfBytes: len,
-            };
-            PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
+        if !cfg!(miri) {
+            #[cfg(feature = "win-prefetch-pages")]
+            unsafe {
+                let range = WIN32_MEMORY_RANGE_ENTRY {
+                    VirtualAddress: ptr as *mut _,
+                    NumberOfBytes: len,
+                };
+                PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
+            }
         }
     }
 
@@ -803,7 +977,10 @@ mod platform {
                     ptr: ptr as *mut u8,
                     size,
                     is_huge: true,
-                    ..Default::default()
+                    #[cfg(all(miri, windows))]
+                    virt_size: 0,
+                    #[cfg(all(miri, windows))]
+                    virt_align: 0,
                 })
             }
         }
@@ -830,7 +1007,10 @@ mod platform {
                 ptr: ptr as *mut u8,
                 size,
                 is_huge: false,
-                ..Default::default()
+                #[cfg(all(miri, windows))]
+                virt_size: 0,
+                #[cfg(all(miri, windows))]
+                virt_align: 0,
             }
         }
     }
@@ -1037,8 +1217,8 @@ fn split_chunk_step(total: usize, n: usize) -> usize {
 }
 
 /// Шаг нарезки при сплите по заданному размеру региона: для регионов
-/// >= страницы округляем ВВЕРХ до кратного странице (старт следующего
-/// региона page-aligned); мелкие — прежнее выравнивание по 16.
+/// не меньше страницы округляем ВВЕРХ до кратного странице, чтобы старт
+/// следующего региона был page-aligned; мелкие — прежнее выравнивание по 16.
 fn split_size_step(sz: usize) -> usize {
     let page = platform::page_size();
     if sz >= page {
@@ -1058,7 +1238,7 @@ fn split_size_step(sz: usize) -> usize {
 /// Сверху ограничиваем 8 MiB, чтобы исчерпание основного чанка не приводило к
 /// ещё одному многогигабайтному резерву.
 fn fallback_chunk_size(chunk_size: usize) -> usize {
-    chunk_size.min(8 * 1024 * 1024).max(64 * 1024)
+    chunk_size.clamp(64 * 1024, 8 * 1024 * 1024)
 }
 
 struct SharedArena {
@@ -1156,9 +1336,6 @@ impl SharedArena {
     pub fn split_safe(&self, num_threads: usize) -> Split<'_> {
         self.split_with_safe(num_threads, BumpDir::Forward)
     }
-    /// Чётные потоки заполняют свой чанк справа налево (`Backward`), нечётные —
-    /// слева направо (`Forward`). Так соседние чанки «доходят» до общей границы
-    /// навстречу друг другу (идея совместного использования памяти соседа).
     // Шаг нарезки page-aligned (см. `split_chunk_step`): старт каждого чанка
     // (base + i*chunk_size) на границе страницы, иначе указатели доноров —
     // UB под Tree Borrows.
@@ -1201,10 +1378,7 @@ impl SharedArena {
                     donor_bump: None,
                     use_priority: false,
                     base_chunk: fallback_chunk_size(chunk_size),
-                    fallback: SpinMutex::new(FallbackChunks {
-                        chunks: Vec::with_capacity(4),
-                        used: 0,
-                    }),
+                    fallback: FallbackChunks::new(),
                 })
             })
             .collect()
@@ -1266,10 +1440,7 @@ impl SharedArena {
                     donor_bump: None,
                     use_priority: false,
                     base_chunk: fallback_chunk_size(chunk_size),
-                    fallback: SpinMutex::new(FallbackChunks {
-                        chunks: Vec::with_capacity(4),
-                        used: 0,
-                    }),
+                    fallback: FallbackChunks::new(),
                 })
             })
             .collect()
@@ -1298,7 +1469,7 @@ impl SharedArena {
 
         let mut bumps: Vec<CachePadded<ThreadBump>> = (0..num_threads)
             .map(|i| {
-                if i % 2 == 0 {
+                if i.is_multiple_of(2) {
                     // Чётный — ведущий чанк пары: общий регион [2k*cs, 2k*cs+2cs).
                     let pair_start = (i / 2) * 2 * chunk_size;
                     // Регион пары не должен выходить за пределы арены:
@@ -1329,10 +1500,7 @@ impl SharedArena {
                         donor_bump: None,
                         use_priority: false,
                         base_chunk: fallback_chunk_size(chunk_size),
-                        fallback: SpinMutex::new(FallbackChunks {
-                            chunks: Vec::with_capacity(4),
-                            used: 0,
-                        }),
+                        fallback: FallbackChunks::new(),
                     })
                 } else {
                     // Нечётный — тот же самый объединённый регион пары, что и у
@@ -1360,10 +1528,7 @@ impl SharedArena {
                         donor_bump: None,
                         use_priority: false,
                         base_chunk: fallback_chunk_size(chunk_size),
-                        fallback: SpinMutex::new(FallbackChunks {
-                            chunks: Vec::with_capacity(4),
-                            used: 0,
-                        }),
+                        fallback: FallbackChunks::new(),
                     })
                 }
             })
@@ -1373,7 +1538,7 @@ impl SharedArena {
         // Адрес буфера Vec стабилен (не переезжает при move/заимствовании),
         // поэтому raw-указатель остаётся валидным, пока живут потоки.
         let array = bumps.as_ptr();
-        for (i, pair) in bumps.chunks_exact_mut(2).enumerate() {
+        for (i, pair) in bumps.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             let k = i * 2;
             let (a, b) = pair.split_at_mut(1);
             a[0].neighbor_idx = Some(k + 1);
@@ -1540,10 +1705,7 @@ impl SharedArena {
                     donor_bump: donor_bump.clone(),
                     use_priority: policy.use_priority,
                     base_chunk: fallback_chunk_size(chunk_size),
-                    fallback: SpinMutex::new(FallbackChunks {
-                        chunks: Vec::with_capacity(4),
-                        used: 0,
-                    }),
+                    fallback: FallbackChunks::new(),
                 })
             })
             .collect();
@@ -1810,7 +1972,7 @@ pub struct ThreadBump {
     base_chunk: usize,
     /// Дополнительные чанки, выделенные «где-то в памяти» при нехватке у
     /// доноров. Освобождаются в `Drop`.
-    fallback: SpinMutex<FallbackChunks>,
+    fallback: FallbackChunks,
 }
 
 // Каждый ThreadBump владеет непересекающимся регионом памяти арены и
@@ -1831,12 +1993,7 @@ impl Drop for ThreadBump {
         // кэш для мгновенного переиспользования этим же потоком (без
         // `munmap` + нового `mmap` на следующей итерации бенча); остальные
         // освобождаем через ОС.
-        let mut fb = self.fallback.lock();
-        let last = fb.chunks.pop();
-        for a in fb.chunks.drain(..) {
-            platform::free(a);
-        }
-        drop(fb);
+        let last = self.fallback.take_last_and_free_rest();
         if let Some(a) = last {
             // `try_with` может НЕ вызвать замыкание: если тред-локаль уже
             // удалена (поток завершается) или инициализация провалилась.
@@ -1924,6 +2081,11 @@ impl ThreadBump {
                     if end <= self.len {
                         self.lo.store(end, Ordering::Relaxed);
                         let p = unsafe { self.ptr.add(off) };
+                        // Forward-заполнение идёт вверх: префетчим следующий блок,
+                        // в который будем писать при следующем выделении.
+                        // Адрес `end` не выходит за границы региона (при
+                        // `end == len` это один-past-the-end — валидный указатель).
+                        prefetch_write(unsafe { self.ptr.add(end) });
                         return p;
                     }
                 }
@@ -1945,6 +2107,7 @@ impl ThreadBump {
                             // Forward-заполнение идёт вверх: префетчим следующий блок,
                             // в который будем писать при следующем выделении.
                             let p = unsafe { self.ptr.add(off) };
+                            prefetch_write(unsafe { self.ptr.add(end) });
                             return p;
                         }
                     } else if let Some(p) = self.try_borrow::<ALIGN>(size) {
@@ -2042,8 +2205,11 @@ impl ThreadBump {
                     }
                     let off = (base - size) & !(ALIGN - 1);
                     let new_lo = mid - off;
-                    // следующая аллокация пойдёт в правую половину
-                    let pf = unsafe { self.ptr.add(mid + hi + size) };
+                    // следующая аллокация пойдёт в правую половину.
+                    // Адрес префетча КЛАМПИМ в границы региона: `mid + hi + size`
+                    // может выйти за конец чанка, а `ptr.add` за пределами
+                    // выделенного объекта — UB (Miri: out-of-bounds pointer).
+                    let pf = unsafe { self.ptr.add((mid + hi + size).min(self.len)) };
                     (off, new_lo, hi, pf)
                 } else {
                     // правая сторона: занята [mid, mid + hi), растёт вверх
@@ -2056,8 +2222,11 @@ impl ThreadBump {
                         return self.grow_fallback::<ALIGN>(size);
                     }
                     let new_hi = off + size - mid;
-                    // следующая аллокация пойдёт в левую половину
-                    let pf = unsafe { self.ptr.add(mid.wrapping_sub(lo + size)) };
+                    // следующая аллокация пойдёт в левую половину.
+                    // `saturating_sub` вместо `wrapping_sub`: при `lo + size > mid`
+                    // вычитание переполнялось и давало ОГРОМНЫЙ оффсет, а
+                    // `ptr.add` с таким оффсетом — UB (Miri: out-of-bounds).
+                    let pf = unsafe { self.ptr.add(mid.saturating_sub(lo + size)) };
                     (off, lo, new_hi, pf)
                 }
             }
@@ -2110,6 +2279,8 @@ impl ThreadBump {
                     if end <= self.len {
                         self.lo.store(end, Ordering::Relaxed);
                         let p = unsafe { self.ptr.add(off) };
+                        // Префетч следующего блока (см. `alloc_raw_dir`).
+                        prefetch_write(unsafe { self.ptr.add(end) });
                         return p;
                     }
                     // Нет места — общий путь: заём у соседа/доноров, затем
@@ -2127,16 +2298,17 @@ impl ThreadBump {
                             .is_ok()
                         {
                             let p = unsafe { self.ptr.add(off) };
+                            prefetch_write(unsafe { self.ptr.add(end) });
                             return p;
                         }
                     } else if pair {
                         if let Some(p) = self.try_borrow::<ALIGN>(size) {
                             return p;
                         }
-                        if donor != 0 {
-                            if let Some(p) = self.try_take_from_donors::<ALIGN>(size) {
-                                return p;
-                            }
+                        if donor != 0
+                            && let Some(p) = self.try_take_from_donors::<ALIGN>(size)
+                        {
+                            return p;
                         }
                         return self.grow_fallback::<ALIGN>(size);
                     } else {
@@ -2189,10 +2361,10 @@ impl ThreadBump {
                     if let Some(p) = self.try_borrow::<ALIGN>(size) {
                         return p;
                     }
-                    if donor != 0 {
-                        if let Some(p) = self.try_take_from_donors::<ALIGN>(size) {
-                            return p;
-                        }
+                    if donor != 0
+                        && let Some(p) = self.try_take_from_donors::<ALIGN>(size)
+                    {
+                        return p;
                     }
                     return self.grow_fallback::<ALIGN>(size);
                 }
@@ -2210,7 +2382,8 @@ impl ThreadBump {
                     }
                     let off = (base - size) & !(ALIGN - 1);
                     let new_lo = mid - off;
-                    let pf = unsafe { self.ptr.add(mid + hi + size) };
+                    // КЛАМПИМ адрес префетча в границы региона (см. `alloc_raw_dir`).
+                    let pf = unsafe { self.ptr.add((mid + hi + size).min(self.len)) };
                     self.lo.store(new_lo, Ordering::Relaxed);
                     self.hi.store(hi, Ordering::Relaxed);
                     let p = unsafe { self.ptr.add(off) };
@@ -2226,7 +2399,8 @@ impl ThreadBump {
                         return self.grow_fallback::<ALIGN>(size);
                     }
                     let new_hi = off + size - mid;
-                    let pf = unsafe { self.ptr.add(mid.wrapping_sub(lo + size)) };
+                    // `saturating_sub` вместо `wrapping_sub` (см. `alloc_raw_dir`).
+                    let pf = unsafe { self.ptr.add(mid.saturating_sub(lo + size)) };
                     self.lo.store(lo, Ordering::Relaxed);
                     self.hi.store(new_hi, Ordering::Relaxed);
                     let p = unsafe { self.ptr.add(off) };
@@ -2372,7 +2546,7 @@ impl ThreadBump {
                 continue;
             }
             if self.donor_has_space::<ALIGN>(d.idx, size)
-                && best.map_or(true, |(bp, _)| d.priority < bp)
+                && best.is_none_or(|(bp, _)| d.priority < bp)
             {
                 best = Some((d.priority, d.idx));
             }
@@ -2527,57 +2701,28 @@ impl ThreadBump {
         }
     }
 
-    /// Выделить совершенно новый чанк «где-то в памяти» (через платформенный
-    /// аллокатор) и вернуть в нём указатель на блок `size`. Чанк сохраняется в
-    /// `fallback` и освобождается в `Drop`. Адрес возвращается вызывающему — его
-    /// собственный регион при этом не трогается.
-    #[hotpath::measure]
+    /// Выделить блок из fallback-чанков («где-то в памяти», вне региона
+    /// потока). Чанки хранятся в `fallback` и освобождаются в `Drop`.
+    ///
+    /// Горячий путь (место в текущем чанке есть) работает без блокировки —
+    /// см. `FallbackChunks::alloc_block`.
+    ///
+    /// ВНИМАНИЕ: здесь НЕТ `#[hotpath::measure]` — этот путь дёргается
+    /// сотни миллионов раз за прогон, и инструментация (замер времени +
+    /// запись сэмпла на каждый вызов) искажала бы ровно те цифры, ради
+    /// которых профилируют. Медленный путь (выделение нового чанка) меряется
+    /// отдельно — там замер стоит копейки, а видно его реальную цену.
     #[inline(always)]
     fn grow_fallback<const ALIGN: usize>(&self, size: usize) -> *mut u8 {
         #[cfg(feature = "tune")]
         {
-            FALLBACK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            FALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
             // Выдача из fallback — это тоже потребление нагрузки потоком
             // (см. `REGION_TAKEN`: по нему автоподбор меряет `need`).
-            REGION_TAKEN.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+            REGION_TAKEN.fetch_add(size, Ordering::Relaxed);
         }
-        let page = platform::page_size();
-        // Размер чанка — хотя бы базовый чанк, выровнен по странице; блок `size`
-        // выровнен внутри.
-        let need = (size + ALIGN - 1) & !(ALIGN - 1);
-        let mut fb = self.fallback.lock();
-        // Если в текущем последнем чанке не хватает места — выделяем новый.
-        let full = match fb.chunks.last() {
-            Some(c) => fb.used + need > c.size,
-            None => true,
-        };
-        if full {
-            // Размер чанка: не меньше base_chunk и не меньше floor
-            // (по умолчанию 1 МБ; переопределяется R3_FALLBACK_CHUNK_MB) —
-            // крупные редкие mmap вместо частых mmap/munmap+SpinMutex.
-            let alloc_size =
-                fallback_chunk_bytes(self.base_chunk, need, self.len).next_multiple_of(page);
-            // Сначала пытаемся переиспользовать чанк, освобождённый этим же
-            // потоком ранее (thread-local кэш): без `mmap` вообще. Счётчик
-            // `FALLBACK_MMAPS` инкрементируется только при реальном мапе.
-            let alloc = match FREED_CHUNK_CACHE.try_with(|c| c.take(alloc_size)) {
-                Ok(Some(a)) => a,
-                _ => {
-                    #[cfg(feature = "tune")]
-                    FALLBACK_MMAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    platform::alloc_normal(alloc_size)
-                }
-            };
-            fb.chunks.push(alloc);
-            fb.used = 0;
-        }
-        let chunk = fb.chunks.last().unwrap();
-        let off = (fb.used + ALIGN - 1) & !(ALIGN - 1);
-        let ptr = unsafe { chunk.ptr.add(off) };
-        // Новый чанк «где-то в памяти»: префетчим следующий блок в нём.
-        prefetch_write(unsafe { chunk.ptr.add(off + size) });
-        fb.used = off + size;
-        ptr
+        self.fallback
+            .alloc_block::<ALIGN>(size, self.base_chunk, self.len)
     }
 
     #[inline(always)]
@@ -2614,7 +2759,16 @@ impl ThreadBump {
 
     /// Обнулить счётчики региона: регион переиспользуется с нуля (уже
     /// выданные блоки становятся валидными только после того, как владелец
-    /// разберётся со своими указателями). Fallback-чанки не трогаются.
+    /// разберётся со своими указателями).
+    ///
+    /// Fallback-чанки ТОЖЕ возвращаются в начальное состояние: курсор
+    /// переводится на первый чанк, и следующая итерация бенча берёт ту же
+    /// память. Без этого каждая итерация забирала у ОС сотни мегабайт заново
+    /// (на Windows — это ещё и commit charge: 16 потоков × 3 итерации ×
+    /// ~400 МБ = ~20 ГБ, из-за чего бенч уходил в pagefile и замедлялся
+    /// в разы). Семантика при этом не меняется: `reset` уже считает все
+    /// ранее выданные указатели недействительными — в том числе и в
+    /// fallback-чанках.
     ///
     /// Сознательно `&mut self`: `ThreadBump: Sync`, а режимы пар и доноров
     /// ходят в счётчики соседа через сырые указатели `array`/`donor_array`,
@@ -2628,6 +2782,8 @@ impl ThreadBump {
         self.lo.store(0, Ordering::Relaxed);
         self.hi.store(0, Ordering::Relaxed);
         self.toggle.set(false);
+        // Fallback-чанки переиспользуются (см. `FallbackChunks::reset`).
+        self.fallback.reset();
     }
 
     /// First-touch: фолтим страницы ИСПОЛЬЗОВАННЫХ областей из текущего
@@ -2753,10 +2909,7 @@ impl ThreadBump {
             donor_bump: None,
             use_priority: false,
             base_chunk,
-            fallback: SpinMutex::new(FallbackChunks {
-                chunks: Vec::with_capacity(4),
-                used: 0,
-            }),
+            fallback: FallbackChunks::new(),
         }
     }
 
@@ -2764,6 +2917,7 @@ impl ThreadBump {
     /// `donor_array` выставляется вызвающим после сборки массива (иначе адрес
     /// нестабилен из-за возможных переаллокаций `Vec`).
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     fn child_bump_donor(
         ptr: *mut u8,
         len: usize,
@@ -2793,10 +2947,7 @@ impl ThreadBump {
             donor_bump: None,
             use_priority,
             base_chunk,
-            fallback: SpinMutex::new(FallbackChunks {
-                chunks: Vec::with_capacity(4),
-                used: 0,
-            }),
+            fallback: FallbackChunks::new(),
         }
     }
 
@@ -2834,7 +2985,7 @@ impl ThreadBump {
     /// размеров превышает регион, лишние дети получают пустой регион.
     #[allow(dead_code)]
     pub fn split_by_sizes(&self, sizes: &[usize], dir: BumpDir) -> Vec<CachePadded<ThreadBump>> {
-        assert!(sizes.len() > 0, "split_by_sizes: пустой список");
+        assert!(!sizes.is_empty(), "split_by_sizes: пустой список");
         let base = self.ptr;
         let total = self.len;
         let mut children = Vec::with_capacity(sizes.len());
@@ -2904,7 +3055,7 @@ impl ThreadBump {
         sizes: &[usize],
         dir: BumpDir,
     ) -> Vec<CachePadded<ThreadBump>> {
-        assert!(sizes.len() > 0, "split_donors_by_sizes: пустой список");
+        assert!(!sizes.is_empty(), "split_donors_by_sizes: пустой список");
         let base = self.ptr;
         let total = self.len;
         let shared: Arc<OrxVec<Donor>> = Arc::new(OrxVec::new());
@@ -2966,7 +3117,7 @@ impl ThreadBump {
     /// Как `split_local`, но по заданным размерам.
     #[allow(dead_code)]
     pub fn split_local_by_sizes(&self, sizes: &[usize], dir: BumpDir) -> Vec<ZoneBump<'static>> {
-        assert!(sizes.len() > 0, "split_local_by_sizes: пустой список");
+        assert!(!sizes.is_empty(), "split_local_by_sizes: пустой список");
         let base = self.ptr;
         let total = self.len;
         let mut zones = Vec::with_capacity(sizes.len());
@@ -3097,16 +3248,13 @@ struct ZoneData {
     dir: BumpDir,
     is_huge: bool,
     base_chunk: usize,
-    fallback: SpinMutex<FallbackChunks>,
+    fallback: FallbackChunks,
 }
 
 impl Drop for ZoneData {
     fn drop(&mut self) {
         // Регион арены освобождает владелец; здесь — только fallback-чанки.
-        let mut fb = self.fallback.lock();
-        for a in fb.chunks.drain(..) {
-            platform::free(a);
-        }
+        let _ = self.fallback.take_last_and_free_rest();
     }
 }
 
@@ -3136,10 +3284,7 @@ impl ZoneBump<'static> {
                 dir,
                 is_huge,
                 base_chunk,
-                fallback: SpinMutex::new(FallbackChunks {
-                    chunks: Vec::with_capacity(4),
-                    used: 0,
-                }),
+                fallback: FallbackChunks::new(),
             }),
             _marker: PhantomData,
         }
@@ -3157,16 +3302,19 @@ impl ZoneBump<'static> {
         self.inner.lo.get() + self.inner.hi.get()
     }
 
-    /// Обнулить счётчики зоны (регион переиспользуется с нуля). Не трогает
-    /// уже выделенные fallback-чанки. `&mut self` — единый контракт со
-    /// `ThreadBump::reset`: сброс даётся только за эксклюзивный доступ
-    /// (наружу — через `BumpGuard`: `reset` требует `&mut guard`), чтобы
-    /// регион не обнулялся «по обычной ссылке», из которой идёт выделение.
+    /// Обнулить счётчики зоны (регион переиспользуется с нуля). Fallback-чанки
+    /// тоже возвращаются в начальное состояние — их память переиспользуется
+    /// следующей итерацией (см. `ThreadBump::reset`).
+    /// `&mut self` — единый контракт со `ThreadBump::reset`: сброс даётся
+    /// только за эксклюзивный доступ (наружу — через `BumpGuard`: `reset`
+    /// требует `&mut guard`), чтобы регион не обнулялся «по обычной ссылке»,
+    /// из которой идёт выделение.
     #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.inner.lo.set(0);
         self.inner.hi.set(0);
         self.inner.toggle.set(false);
+        self.inner.fallback.reset();
     }
 
     /// Одношаговая bump-аллокация из региона зоны. При исчерпании региона
@@ -3189,14 +3337,21 @@ impl ZoneBump<'static> {
             }
             BumpDir::Backward => {
                 let cur = d.hi.get();
-                let off = (d.len - cur - size) & !(ALIGN - 1);
-                if off >= size {
-                    let new_hi = d.len - off;
-                    let pf = unsafe { d.ptr.add(off - size) };
-                    (off, d.lo.get(), new_hi, pf)
-                } else {
+                // Защита от переполнения: `d.len - cur - size` подтекал вниз
+                // (в release — молча), если блок не влезал в регион.
+                if size > d.len - cur {
                     return self.grow_fallback(size);
                 }
+                let off = (d.len - cur - size) & !(ALIGN - 1);
+                let new_hi = d.len - off;
+                // Префетч следующего блока (по меньшему адресу) — с защитой
+                // от вычитания вниз.
+                let pf = if off >= size {
+                    unsafe { d.ptr.add(off - size) }
+                } else {
+                    d.ptr
+                };
+                (off, d.lo.get(), new_hi, pf)
             }
             BumpDir::MiddleOut => {
                 let mid = d.len / 2;
@@ -3204,25 +3359,26 @@ impl ZoneBump<'static> {
                 d.toggle.set(!side);
                 if !side {
                     let base = mid - d.lo.get();
-                    if size <= base {
-                        let off = (base - size) & !(ALIGN - 1);
-                        let new_lo = mid - off;
-                        let pf = unsafe { d.ptr.add(mid + d.hi.get() + size) };
-                        (off, new_lo, d.hi.get(), pf)
-                    } else {
+                    if size > base {
                         return self.grow_fallback(size);
                     }
+                    let off = (base - size) & !(ALIGN - 1);
+                    let new_lo = mid - off;
+                    // Адрес префетча клампим в границы региона (иначе
+                    // `ptr.add` ушёл бы за выделенный объект = UB).
+                    let pf = unsafe { d.ptr.add((mid + d.hi.get() + size).min(d.len)) };
+                    (off, new_lo, d.hi.get(), pf)
                 } else {
                     let base = mid + d.hi.get();
                     let off = (base + ALIGN - 1) & !(ALIGN - 1);
                     let end = off + size;
-                    if end <= d.len {
-                        let new_hi = off + size - mid;
-                        let pf = unsafe { d.ptr.add(mid - d.lo.get() - size) };
-                        (off, d.lo.get(), new_hi, pf)
-                    } else {
+                    if end > d.len {
                         return self.grow_fallback(size);
                     }
+                    let new_hi = off + size - mid;
+                    // `saturating_sub`: `mid - lo - size` мог уйти вниз.
+                    let pf = unsafe { d.ptr.add(mid.saturating_sub(d.lo.get() + size)) };
+                    (off, d.lo.get(), new_hi, pf)
                 }
             }
         };
@@ -3233,29 +3389,13 @@ impl ZoneBump<'static> {
         p
     }
 
-    /// Выделить блок из нового чанка «где-то в памяти» (аналог
-    /// `ThreadBump::grow_fallback`); чанк сохраняется в зоне и освобождается в
-    /// её `Drop`.
+    /// Выделить блок из fallback-чанков «где-то в памяти» (аналог
+    /// `ThreadBump::grow_fallback`); чанки сохраняются в зоне, переиспользуются
+    /// после `reset` и освобождаются в её `Drop`.
     fn grow_fallback(&self, size: usize) -> *mut u8 {
         let d = &self.inner;
-        let page = platform::page_size();
-        let need = (size + 15) & !15;
-        let mut fb = d.fallback.lock();
-        let full = match fb.chunks.last() {
-            Some(c) => fb.used + need > c.size,
-            None => true,
-        };
-        if full {
-            let alloc_size = fallback_chunk_bytes(d.base_chunk, need, d.len).next_multiple_of(page);
-            fb.chunks.push(platform::alloc_normal(alloc_size));
-            fb.used = 0;
-        }
-        let chunk = fb.chunks.last().unwrap();
-        let off = (fb.used + 15) & !15;
-        let ptr = unsafe { chunk.ptr.add(off) };
-        prefetch_write(unsafe { chunk.ptr.add(off + size) });
-        fb.used = off + size;
-        ptr
+        // Выравнивание 16 — как и раньше (зона выравнивает блоки по 16 байт).
+        d.fallback.alloc_block::<16>(size, d.base_chunk, d.len)
     }
 
     /// Разбиение региона зоны на `n` непересекающихся суб-зон (все `!Send`).
@@ -3286,7 +3426,7 @@ impl ZoneBump<'static> {
     /// Разбиение региона зоны по заданным размерам (остаток уходит последней зоне).
     #[allow(dead_code)]
     pub fn split_by_sizes(&self, sizes: &[usize]) -> Vec<ZoneBump<'static>> {
-        assert!(sizes.len() > 0, "split_by_sizes: пустой список");
+        assert!(!sizes.is_empty(), "split_by_sizes: пустой список");
         let d = &self.inner;
         let total = d.len;
         let mut zones = Vec::with_capacity(sizes.len());
@@ -3340,7 +3480,7 @@ impl ZoneBump<'static> {
     #[allow(private_interfaces)]
     pub fn split_into_threads_by_sizes(&self, sizes: &[usize]) -> Vec<CachePadded<ThreadBump>> {
         assert!(
-            sizes.len() > 0,
+            !sizes.is_empty(),
             "split_into_threads_by_sizes: пустой список"
         );
         let d = &self.inner;
@@ -4025,7 +4165,7 @@ const MODE_MO: u32 = ThreadBump::MODE_DIR_MIDDLEOUT;
 /// использовался `MODE_PAIR_FWD`, из-за чего оба писали в [0, mid) — UB.
 #[inline]
 const fn pair_mode_for_index(i: usize) -> u32 {
-    if i % 2 == 0 {
+    if i.is_multiple_of(2) {
         ThreadBump::MODE_PAIR | ThreadBump::MODE_DIR_BACKWARD
     } else {
         ThreadBump::MODE_PAIR | ThreadBump::MODE_DIR_FORWARD
@@ -4056,7 +4196,7 @@ fn arena_bench_neighbors_impl<const FULL: bool>(chunk_size: usize, smt: bool) {
             let core = *core_id;
             s.spawn(move || {
                 core_affinity::set_for_current(core);
-                if i % 2 == 0 {
+                if i.is_multiple_of(2) {
                     arena_run_thread::<MODE_BWD, FULL>(&mut bump);
                 } else {
                     arena_run_thread::<MODE_FWD, FULL>(&mut bump);
@@ -4083,7 +4223,7 @@ fn arena_bench_pair_impl<const FULL: bool>(chunk_size: usize, smt: bool) {
             let core = *core_id;
             s.spawn(move || {
                 core_affinity::set_for_current(core);
-                if i % 2 == 0 {
+                if i.is_multiple_of(2) {
                     arena_run_thread::<{ pair_mode_for_index(0) }, FULL>(&mut bump);
                 } else {
                     arena_run_thread::<{ pair_mode_for_index(1) }, FULL>(&mut bump);
@@ -4278,7 +4418,7 @@ fn pgo_chunk_cap() -> usize {
 
 /// Округление вверх до мегабайта.
 fn round_up_mb(bytes: usize) -> usize {
-    ((bytes + (1024 * 1024 - 1)) / (1024 * 1024)) * (1024 * 1024)
+    bytes.div_ceil(1024 * 1024) * (1024 * 1024)
 }
 
 #[cfg_attr(coverage, coverage(off))]
@@ -4607,9 +4747,8 @@ pub fn arena_tune_scan(smt: bool) -> usize {
     let prev_override = std::env::var("R3_ARENA_CHUNK_MB").ok();
     unsafe { std::env::remove_var("R3_ARENA_CHUNK_MB") };
     let need_raw = arena_need_bytes(true) + arena_need_bytes(false);
-    match prev_override {
-        Some(v) => unsafe { std::env::set_var("R3_ARENA_CHUNK_MB", v) },
-        None => {}
+    if let Some(v) = prev_override {
+        unsafe { std::env::set_var("R3_ARENA_CHUNK_MB", v) }
     }
     let need = round_up_mb(need_raw.max(mb));
 
@@ -4800,7 +4939,7 @@ fn bench_scale() -> usize {
 /// Запустить один бенч-вариант арены с нужным стилем (mono/dispatch/both) и
 /// вернуть медиану времени. `print_name` — как пометить строку.
 #[cfg_attr(coverage, coverage(off))]
-fn run_arena_variant<M: Fn(usize, bool) -> (), D: Fn(usize, bool) -> ()>(
+fn run_arena_variant<M: Fn(usize, bool), D: Fn(usize, bool)>(
     style: BenchStyle,
     label: &str,
     mono: M,
@@ -4808,7 +4947,7 @@ fn run_arena_variant<M: Fn(usize, bool) -> (), D: Fn(usize, bool) -> ()>(
     chunk: usize,
     smt: bool,
 ) {
-    let bench = |f: &dyn Fn(usize, bool) -> ()| {
+    let bench = |f: &dyn Fn(usize, bool)| {
         (0..(10 / bench_scale()).max(1))
             .map(|_| {
                 let start = std::time::Instant::now();
@@ -5771,7 +5910,7 @@ mod tests {
         let _ = bump.alloc_raw::<1>(64); // ровно заполняет
         let p = bump.alloc_raw::<1>(1); // регион полон → fallback-чанк
         assert!(!p.is_null());
-        assert!(!bump.fallback.lock().chunks.is_empty());
+        assert!(!bump.fallback.chunks.lock().is_empty());
     }
 
     #[test]
@@ -5780,7 +5919,7 @@ mod tests {
         let _ = bump.alloc_raw::<1>(64);
         let p = bump.alloc_raw::<1>(1);
         assert!(!p.is_null());
-        assert!(!bump.fallback.lock().chunks.is_empty());
+        assert!(!bump.fallback.chunks.lock().is_empty());
     }
 
     #[test]
@@ -5789,7 +5928,7 @@ mod tests {
         // Середина даёт только половину свободных байт → fallback-чанк.
         let p = bump.alloc_raw::<1>(64);
         assert!(!p.is_null());
-        assert!(!bump.fallback.lock().chunks.is_empty());
+        assert!(!bump.fallback.chunks.lock().is_empty());
     }
 
     #[test]
@@ -6234,17 +6373,17 @@ mod tests {
             let p = bump.alloc_raw::<8>(8);
             assert!(!p.is_null());
         }
-        let fb = bump.fallback.lock();
+        let fb = bump.fallback.chunks.lock();
         assert!(
-            fb.chunks.len() <= 2,
+            fb.len() <= 2,
             "fallback выделил {} чанков вместо 1–2 крупных",
-            fb.chunks.len()
+            fb.len()
         );
-        for c in fb.chunks.iter() {
+        for c in fb.iter() {
             assert!(
-                c.size >= 64 * 1024,
+                c.alloc.size >= 64 * 1024,
                 "fallback-чанк {} B — слишком мелкий",
-                c.size
+                c.alloc.size
             );
         }
     }
@@ -6277,7 +6416,7 @@ mod tests {
             assert_eq!(unsafe { **p }, 0xD000 + j);
         }
         // fallback непуст (Drop позже освободит).
-        assert!(!needy.fallback.lock().chunks.is_empty());
+        assert!(!needy.fallback.chunks.lock().is_empty());
     }
 
     // ---- Статичный список + приоритет: низкоприоритетный берётся первым ----
@@ -6673,7 +6812,7 @@ mod tests {
             .into_iter()
             .map(|tb| {
                 std::thread::spawn(move || {
-                    let p = tb.alloc_uninit_slice::<u64, 8>(1) as *mut u64;
+                    let p = tb.alloc_uninit_slice::<u64, 8>(1);
                     unsafe { *p = 0xABCD };
                     let _ = tb;
                 })
@@ -6789,7 +6928,7 @@ mod tests {
         assert!(s.get(99).is_none());
         // Deref → &[CachePadded<ThreadBump>]
         assert_eq!(s.deref().len(), 3);
-        assert_eq!((&*s).len(), 3);
+        assert_eq!((*s).len(), 3);
         // Кусочки непересекающиеся по адресам.
         let a = s.bumps()[0].ptr as usize;
         let b = s.bumps()[1].ptr as usize;
@@ -7244,7 +7383,7 @@ mod tests {
         let huge = arena_scale(1 << 14) * 2; // больше всего объединённого региона
         let p = v[1].alloc_raw::<1>(huge); // v[1] — Forward bump пары
         assert!(!p.is_null());
-        assert!(!v[1].fallback.lock().chunks.is_empty());
+        assert!(!v[1].fallback.chunks.lock().is_empty());
     }
 
     #[test]
@@ -7255,7 +7394,7 @@ mod tests {
         let huge = arena_scale(1 << 14) * 2;
         let p = v[0].alloc_raw::<1>(huge); // v[0] — Backward bump пары
         assert!(!p.is_null());
-        assert!(!v[0].fallback.lock().chunks.is_empty());
+        assert!(!v[0].fallback.chunks.lock().is_empty());
     }
 
     #[test]
@@ -7267,7 +7406,7 @@ mod tests {
         let huge = arena_scale(1 << 14) * 2;
         let p = bump.alloc_raw::<1>(huge); // правая сторона → fallback
         assert!(!p.is_null());
-        assert!(!bump.fallback.lock().chunks.is_empty());
+        assert!(!bump.fallback.chunks.lock().is_empty());
     }
 
     #[test]
@@ -7282,7 +7421,7 @@ mod tests {
         let p = bump.alloc_raw_m::<1, { ThreadBump::MODE_DIR_MIDDLEOUT }>(huge);
         assert!(!p.is_null(), "гигантский блок уходит в fallback-чанк");
         assert!(
-            !bump.fallback.lock().chunks.is_empty(),
+            !bump.fallback.chunks.lock().is_empty(),
             "fallback-чанк должен быть выделен"
         );
     }
@@ -7294,7 +7433,7 @@ mod tests {
         let _ = bump.alloc_raw_m::<1, { ThreadBump::MODE_DIR_FORWARD }>(big); // регион полон
         let p = bump.alloc_raw_m::<1, { ThreadBump::MODE_DIR_FORWARD }>(64);
         assert!(!p.is_null());
-        assert!(!bump.fallback.lock().chunks.is_empty());
+        assert!(!bump.fallback.chunks.lock().is_empty());
     }
 
     #[test]
@@ -7304,7 +7443,7 @@ mod tests {
         let _ = bump.alloc_raw_m::<1, { ThreadBump::MODE_DIR_BACKWARD }>(big); // регион полон
         let p = bump.alloc_raw_m::<1, { ThreadBump::MODE_DIR_BACKWARD }>(64);
         assert!(!p.is_null());
-        assert!(!bump.fallback.lock().chunks.is_empty());
+        assert!(!bump.fallback.chunks.lock().is_empty());
     }
 
     #[test]
@@ -7342,7 +7481,7 @@ mod tests {
         let _ = v[0].alloc_raw::<1>(cs);
         let p = v[0].alloc_raw::<1>(16); // некуда: своя пол. полна и сосед полон
         assert!(!p.is_null());
-        assert!(!v[0].fallback.lock().chunks.is_empty());
+        assert!(!v[0].fallback.chunks.lock().is_empty());
     }
 
     #[test]
@@ -7356,7 +7495,7 @@ mod tests {
         let _ = v[0].alloc_raw::<1>(cs);
         let p = v[1].alloc_raw::<1>(16);
         assert!(!p.is_null());
-        assert!(!v[1].fallback.lock().chunks.is_empty());
+        assert!(!v[1].fallback.chunks.lock().is_empty());
     }
 
     #[test]
@@ -7371,7 +7510,7 @@ mod tests {
         // Переполнение: сначала донор v[0] отдаёт свою чужую (верхнюю) половину,
         // затем она исчерпывается → try_take_from_donors → None → grow_fallback.
         let size = 64usize;
-        let iters = (cs / size as usize * 4) as usize + 64;
+        let iters = (cs / size * 4) + 64;
         for _ in 0..iters {
             let _ = v[1].alloc_raw::<1>(size);
         }
@@ -7516,5 +7655,80 @@ mod tests {
             let _ = n.alloc_raw::<1>(16); // берёт у донора, пока не исчерпает
         }
         let _ = d;
+    }
+
+    // ===================== Регрессии: баги, исправленные в этой версии =====================
+
+    /// Регрессия (use-after-free): thread-local кэш освобождённых чанков.
+    ///
+    /// Раньше кэш хранил `Box<ChunkSlot>`, а `take()` отдавал наружу чанк,
+    /// предварительно УДАЛЯЯ `Box` — а удаление `Box<ChunkSlot>` вызывает
+    /// `ChunkSlot::drop`, который освобождает чанк через ОС. Вызывающий
+    /// получал указатель на уже освобождённую (на Windows — размапленную)
+    /// память и писал в неё → access violation / порча данных.
+    ///
+    /// Тест: тот же поток создаёт bump, вынуждает fallback-чанк, роняет bump
+    /// (чанк попадает в кэш), затем создаёт новый bump и снова вынуждает
+    /// fallback — кэш обязан отдать ЖИВОЙ чанк.
+    #[test]
+    fn thread_local_chunk_cache_hands_out_live_memory() {
+        // Крошечный регион: любая выдача уходит в fallback-чанк.
+        let cap = arena_scale(4096);
+        let (arena, bump) = make_one(BumpDir::Forward, cap);
+        let p = bump.alloc_raw::<8>(64);
+        assert!(!p.is_null());
+        unsafe { ptr::write(p as *mut u64, 0xA5A5_A5A5_A5A5_A5A5) };
+        drop(bump);
+        drop(arena);
+
+        // Новый bump на том же потоке → кэш отдаёт переиспользованный чанк.
+        let (arena2, bump2) = make_one(BumpDir::Forward, cap);
+        let q = bump2.alloc_raw::<8>(64);
+        assert!(!q.is_null());
+        // Запись в память, полученную из кэша: на старом коде это было
+        // обращение к освобождённой памяти (Windows — access violation).
+        unsafe { ptr::write(q as *mut u64, 0x5A5A_5A5A_5A5A_5A5A) };
+        assert_eq!(unsafe { *(q as *const u64) }, 0x5A5A_5A5A_5A5A_5A5A);
+        drop(bump2);
+        drop(arena2);
+    }
+
+    /// Регрессия (память не переиспользовалась): `reset` обязан возвращать
+    /// fallback-чанки в начальное состояние.
+    ///
+    /// Раньше `reset` обнулял только счётчики региона, а fallback-чанки
+    /// оставались «занятыми» — следующая итерация бенча брала новую память
+    /// у ОС (десятки ГБ commit'а на 16 потоках). Теперь после `reset` те же
+    /// чанки используются повторно: их число НЕ растёт.
+    #[test]
+    fn reset_reuses_fallback_chunks() {
+        let cap = arena_scale(4096);
+        let (arena, mut bump) = make_one(BumpDir::Forward, cap);
+        // Выдаём много блоков — регион исчерпается, уйдём в fallback.
+        for i in 0..count_scale(4096) {
+            let p = bump.alloc_raw::<8>(64);
+            assert!(!p.is_null());
+            unsafe { ptr::write(p as *mut u64, i as u64) };
+        }
+        let chunks_after_first = bump.fallback.chunks.lock().len();
+        assert!(
+            chunks_after_first > 0,
+            "ожидается хотя бы один fallback-чанк"
+        );
+
+        // Сброс и новая порция выдачи: чанки те же, новых не выделяем.
+        bump.reset();
+        for i in 0..count_scale(4096) {
+            let p = bump.alloc_raw::<8>(64);
+            assert!(!p.is_null());
+            unsafe { ptr::write(p as *mut u64, i as u64) };
+        }
+        let chunks_after_second = bump.fallback.chunks.lock().len();
+        assert_eq!(
+            chunks_after_second, chunks_after_first,
+            "после reset fallback-чанки должны переиспользоваться, а не выделяться заново"
+        );
+        drop(bump);
+        drop(arena);
     }
 }

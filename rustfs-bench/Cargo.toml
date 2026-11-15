@@ -8,14 +8,24 @@ autobenches = false
 [dependencies]
 r3 = { path = "..", default-features = false }
 rustfs-mimalloc = "0.5.6"
-divan = "0.1.21"
 hotpath = "0.24.0"
+
+[dev-dependencies]
+# divan нужен только бенчам (`benches/alloc_bench.rs`), не библиотечному коду.
+divan = "0.1.21"
 
 [features]
 default = []
 hotpath = ["r3/hotpath", "hotpath/hotpath"]
-hotpath-cpu = ["r3/hotpath-cpu", "hotpath/hotpath-cpu"]
+# `hotpath-cpu` умеет только macOS/Linux (крейт жёстко падает на Windows
+# через `compile_error!`). Поэтому фича — маркер, а сам `hotpath-cpu`
+# включается target-specific зависимостью ниже: на Windows он не
+# активируется, и `--all-features` собирается на любой ОС.
+hotpath-cpu = ["r3/hotpath-cpu"]
 win-prefetch-pages = ["r3/win-prefetch-pages"]
+
+[target.'cfg(unix)'.dependencies]
+hotpath = { version = "0.24.0", features = ["hotpath-cpu"] }
 
 [[bin]]
 name = "r3-rustfs"

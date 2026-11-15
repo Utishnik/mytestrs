@@ -10,7 +10,7 @@
 #   ./bench_hotpath.sh                                # table report -> hotpath-report.table
 #   ./bench_hotpath.sh --json                         # json report  -> hotpath-report.json
 #   ./bench_hotpath.sh --out custom.json              # custom report filename
-#   ./bench_hotpath.sh --cpu                          # Linux/macOS only: + hotpath-cpu
+#   ./bench_hotpath.sh --cpu                          # + hotpath-cpu (CPU baseline; фича no-op на Windows)
 #   ./bench_hotpath.sh --style mono|dispatch|both     # arena version to run (default: both)
 set -euo pipefail
 
@@ -41,7 +41,7 @@ if [ "$PREFETCH" = "1" ]; then
     FEATURES="hotpath win-prefetch-pages"
 fi
 if [ "$CPU" = "1" ]; then
-    # hotpath-cpu is Linux/macOS-only (the crate hard-errors on Windows).
+    # hotpath-cpu: CPU baseline. Сам крейт hotpath умеет его только на Linux/macOS,
     FEATURES="$FEATURES hotpath-cpu"
 fi
 

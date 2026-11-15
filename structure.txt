@@ -1,0 +1,154 @@
+﻿22: fn prefetch_write(addr: *const u8) {
+27: fn prefetch_write(_addr: *const u8) {}
+57: impl Default for RawAllocation {
+71: impl Clone for RawAllocation {
+79: impl Copy for RawAllocation {}
+81: impl RawAllocation {
+97: struct FallbackChunks {
+108: static FALLBACK_CALLS: AtomicUsize = AtomicUsize::new(0);
+119: static FALLBACK_MMAPS: AtomicUsize = AtomicUsize::new(0);
+124: pub fn take_fallback_counters() -> (usize, usize) {
+133: pub fn take_fallback_calls() -> usize {
+147: static REGION_TAKEN: AtomicUsize = AtomicUsize::new(0);
+151: pub fn take_region_used() -> usize {
+157: pub fn take_region_used() -> usize {
+167: pub fn take_fallback_mmaps() -> usize {
+175: pub fn take_fallback_counters() -> (usize, usize) {
+181: pub fn take_fallback_calls() -> usize {
+187: pub fn take_fallback_mmaps() -> usize {
+198: const DEFAULT_FALLBACK_CHUNK_BYTES: usize = 1024 * 1024;
+212: fn huge_enabled() -> bool {
+222: fn fallback_chunk_floor() -> usize {
+249: fn fallback_chunk_bytes(base_chunk: usize, need: usize, cap: usize) -> usize {
+280: struct ChunkSlot(RawAllocation);
+282: impl Drop for ChunkSlot {
+295: struct RawAllocationCache(std::cell::Cell<Option<Box<ChunkSlot>>>);
+297: impl RawAllocationCache {
+333: struct Donor {
+339: impl Clone for Donor {
+358: enum DonorReg {
+376: pub enum DonorListKind {
+387: pub struct DonorPolicy {
+396: impl DonorPolicy {
+432: mod platform {
+773: mod platform {
+1029: fn split_chunk_step(total: usize, n: usize) -> usize {
+1042: fn split_size_step(sz: usize) -> usize {
+1060: fn fallback_chunk_size(chunk_size: usize) -> usize {
+1064: struct SharedArena {
+1068: unsafe impl Send for SharedArena {}
+1069: unsafe impl Sync for SharedArena {}
+1071: impl SharedArena {
+1571: impl Drop for SharedArena {
+1596: pub struct Split<'a> {
+1602: impl<'a> Split<'a> {
+1651: impl<'a> std::ops::Deref for Split<'a> {
+1662: impl<'a> std::ops::DerefMut for Split<'a> {
+1689: pub struct BumpGuard<'a, T: ?Sized> {
+1693: impl<'a, T: ?Sized> BumpGuard<'a, T> {
+1714: impl<T: ?Sized> Deref for BumpGuard<'_, T> {
+1724: impl<T: ?Sized> DerefMut for BumpGuard<'_, T> {
+1744: pub enum BumpDir {
+1750: pub struct ThreadBump {
+1823: unsafe impl Send for ThreadBump {}
+1824: unsafe impl Sync for ThreadBump {}
+1826: impl Drop for ThreadBump {
+1858: impl ThreadBump {
+3091: struct ZoneData {
+3103: impl Drop for ZoneData {
+3113: pub struct ZoneBump<'a> {
+3119: impl ZoneBump<'static> {
+3385: struct ArenaVec<T> {
+3391: impl<T> ArenaVec<T> {
+3513: impl<T> Drop for ArenaVec<T> {
+3525: struct ArenaString {
+3529: impl ArenaString {
+3546: impl Deref for ArenaString {
+3554: impl fmt::Display for ArenaString {
+3563: mod typed_arena;
+3581: static GLOBAL: MiMalloc = MiMalloc;
+3584: pub fn allocator_info() -> String {
+3595: pub fn allocator_info() -> String {
+3600: pub fn allocator_info() -> String {
+3604: pub fn allocator_label() -> String {
+3610: pub fn mimm(smt: bool) {
+3636: pub fn mimm_light(smt: bool) {
+3663: pub fn bump_scope_m(chunk_size: usize, smt: bool) {
+3693: pub fn bump_scope_m_light(chunk_size: usize, smt: bool) {
+3724: fn do_work_full(bump: &Bump) {
+3741: fn do_work_light(bump: &Bump) {
+3758: pub fn bump_shared_m(chunk_size: usize, smt: bool) {
+3780: pub fn bump_shared_m_light(chunk_size: usize, smt: bool) {
+3803: enum ArenaLayout {
+3829: fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
+3924: fn arena_run_thread<const MODE: u32, const FULL: bool>(bump: &mut BumpGuard<'_, ThreadBump>) {
+3969: fn arena_bench_impl<const MODE: u32, const FULL: bool>(chunk_size: usize, smt: bool) {
+3988: fn make_split<'a, const MODE: u32>(arena: &'a SharedArena, n: usize) -> Split<'a> {
+4017: const MODE_FWD: u32 = ThreadBump::MODE_DIR_FORWARD;
+4018: const MODE_BWD: u32 = ThreadBump::MODE_DIR_BACKWARD;
+4019: const MODE_MO: u32 = ThreadBump::MODE_DIR_MIDDLEOUT;
+4027: const fn pair_mode_for_index(i: usize) -> u32 {
+4035: const MODE_DONORS_STATIC: u32 = ThreadBump::MODE_DONOR_STATIC | ThreadBump::MODE_DIR_FORWARD;
+4036: const MODE_DONORS_STATIC_PRIO: u32 = MODE_DONORS_STATIC | ThreadBump::MODE_PRIO;
+4037: const MODE_DONORS_ORX: u32 = ThreadBump::MODE_DONOR_ORX | ThreadBump::MODE_DIR_FORWARD;
+4038: const MODE_DONORS_ORX_PRIO: u32 = MODE_DONORS_ORX | ThreadBump::MODE_PRIO;
+4039: const MODE_DONORS_BOXCAR: u32 = ThreadBump::MODE_DONOR_BOXCAR | ThreadBump::MODE_DIR_FORWARD;
+4040: const MODE_DONORS_BOXCAR_PRIO: u32 = MODE_DONORS_BOXCAR | ThreadBump::MODE_PRIO;
+4046: fn arena_bench_neighbors_impl<const FULL: bool>(chunk_size: usize, smt: bool) {
+4075: fn arena_bench_pair_impl<const FULL: bool>(chunk_size: usize, smt: bool) {
+4097: macro_rules! mono_bench_wrappers {
+4131: pub fn arena_m_full_pair(chunk_size: usize, smt: bool) {
+4136: pub fn arena_m_light_pair(chunk_size: usize, smt: bool) {
+4141: pub fn arena_m_full_neighbors(chunk_size: usize, smt: bool) {
+4145: pub fn arena_m_light_neighbors(chunk_size: usize, smt: bool) {
+4150: pub fn arena_full(chunk_size: usize, smt: bool) {
+4160: pub fn arena_light(chunk_size: usize, smt: bool) {
+4171: pub fn arena_full_dir(chunk_size: usize, smt: bool, dir: BumpDir) {
+4177: pub fn arena_light_dir(chunk_size: usize, smt: bool, dir: BumpDir) {
+4183: pub fn arena_full_neighbors(chunk_size: usize, smt: bool) {
+4189: pub fn arena_light_neighbors(chunk_size: usize, smt: bool) {
+4195: pub fn arena_full_pair(chunk_size: usize, smt: bool) {
+4201: pub fn arena_light_pair(chunk_size: usize, smt: bool) {
+4207: pub fn arena_full_donors(chunk_size: usize, smt: bool) {
+4211: pub fn arena_light_donors(chunk_size: usize, smt: bool) {
+4217: pub fn arena_full_donors_prio(chunk_size: usize, smt: bool) {
+4221: pub fn arena_light_donors_prio(chunk_size: usize, smt: bool) {
+4227: pub fn arena_full_donors_orx(chunk_size: usize, smt: bool) {
+4231: pub fn arena_light_donors_orx(chunk_size: usize, smt: bool) {
+4237: pub fn arena_full_donors_orx_prio(chunk_size: usize, smt: bool) {
+4241: pub fn arena_light_donors_orx_prio(chunk_size: usize, smt: bool) {
+4247: pub fn arena_full_donors_boxcar(chunk_size: usize, smt: bool) {
+4251: pub fn arena_light_donors_boxcar(chunk_size: usize, smt: bool) {
+4257: pub fn arena_full_donors_boxcar_prio(chunk_size: usize, smt: bool) {
+4261: pub fn arena_light_donors_boxcar_prio(chunk_size: usize, smt: bool) {
+4273: fn pgo_chunk_cap() -> usize {
+4280: fn round_up_mb(bytes: usize) -> usize {
+4285: pub fn profile_bump_chunk_size_full() -> usize {
+4314: pub fn profile_bump_chunk_size_light() -> usize {
+4346: fn arena_chunk_override() -> Option<usize> {
+4355: pub fn profile_arena_chunk_size_full() -> usize {
+4405: pub fn profile_arena_chunk_size_light() -> usize {
+4459: fn arena_need_bytes(full: bool) -> usize {
+4538: pub fn arena_tune_scan(smt: bool) -> usize {
+4725: fn verbose_enabled() -> bool {
+4735: static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+4737: fn interrupted() -> &'static AtomicBool {
+4746: fn install_ctrlc_handler() {
+4764: fn install_ctrlc_handler() {}
+4771: enum BenchStyle {
+4778: fn bench_style() -> BenchStyle {
+4792: fn bench_scale() -> usize {
+4803: fn run_arena_variant<M: Fn(usize, bool) -> (), D: Fn(usize, bool) -> ()>(
+4843: fn get_cores(smt: bool) -> Vec<core_affinity::CoreId> {
+4854: fn median(times: &[u128]) -> u128 {
+4865: pub struct PprofGuard {
+4871: impl PprofGuard {
+4907: impl Drop for PprofGuard {
+5013: pub struct PprofGuard;
+5017: pub fn start_pprof() -> PprofGuard {
+5023: pub fn start_pprof() -> PprofGuard {
+5033: pub fn run() {
+5144: pub fn pgo_train() {
+5249: fn run_directional_benchmarks(smt: bool, pgo_full_arena: usize, pgo_light_arena: usize) {
+5451: fn run_benchmarks(
+5630: mod tests {

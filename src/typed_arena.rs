@@ -29,6 +29,15 @@ struct ArenaRegion {
     len: usize,
     /// Байт, занято начиная с `ptr` (атомарный bump текущего потока).
     used: AtomicUsize,
+    /// Число ЭЛЕМЕНТОВ `T`, размещённых в этом регионе.
+    ///
+    /// Считается отдельно, а НЕ выводится из `used / size_of::<T>()`: при
+    /// выравнивании больше 16 байт первая выдача в регионе съедает
+    /// padding-байты, и деление давало бы завышенное число элементов
+    /// (а `into_vec`/`clear` по такому числу читали бы ЗА пределами
+    /// выделенной памяти). Для ZST (`size_of::<T>() == 0`) байт не
+    /// расходуется вовсе — без отдельного счётчика `len()` всегда был бы 0.
+    count: AtomicUsize,
     /// Чанк ownership: Some — spill-регион, выделенный `platform::alloc_normal`
     /// (освобождается в `Drop for Arena` строго тем же `RawAllocation`, из
     /// которого брались `ptr`/`len`); None — первичный регион, живущий в общем
@@ -37,10 +46,15 @@ struct ArenaRegion {
 }
 
 // Thread-local: индекс первичного региона для текущего потока. Кэш
-// валиден только для той же арены (сверяем по адресу первого региона).
+// валиден только для той же арены: ключ — уникальный id арены (не адрес
+// буфера: адрес может переиспользоваться после освобождения арены, и без id
+// кэш перепутал бы две разные арены и отдал бы потоку чужой регион).
 thread_local! {
     static SLOT: Cell<(usize, usize)> = const { Cell::new((usize::MAX, usize::MAX)) };
 }
+
+/// Глобальный счётчик id'ов арен (см. `SLOT`).
+static ARENA_IDS: AtomicUsize = AtomicUsize::new(0);
 
 pub struct Arena<T> {
     /// Общий буфер (владеет памятью primary-регионов). Поле живёт только для
@@ -53,6 +67,8 @@ pub struct Arena<T> {
     spill: SpinMutex<Vec<ArenaRegion>>,
     /// Круговой счётчик раздачи первичных регионов потокам.
     next_slot: AtomicUsize,
+    /// Уникальный id арены — часть ключа thread-local кэша (см. `SLOT`).
+    id: usize,
     /// Суммарный размер общего буфера (для capacity()).
     total_bytes: usize,
     _pd: PhantomData<T>,
@@ -110,6 +126,7 @@ impl<T> Arena<T> {
                 ptr: b.ptr,
                 len: b.len,
                 used: AtomicUsize::new(0),
+                count: AtomicUsize::new(0),
                 alloc: None,
             })
             .collect::<Vec<_>>();
@@ -118,6 +135,7 @@ impl<T> Arena<T> {
             primary,
             spill: SpinMutex::new(Vec::new()),
             next_slot: AtomicUsize::new(0),
+            id: ARENA_IDS.fetch_add(1, Ordering::Relaxed),
             total_bytes: actual_total,
             _pd: PhantomData,
         }
@@ -128,27 +146,26 @@ impl<T> Arena<T> {
         self.primary.len()
     }
 
-    /// Первый регион как идентификатор арены (для thread-local кэша) —
-    /// по адресу первичного буфера.
-    #[inline]
-    fn arena_key(&self) -> usize {
-        self.primary.first().map(|r| r.ptr as usize).unwrap_or(0)
-    }
-
     /// Индекс первичного региона текущего потока (кэш в thread-local).
+    ///
+    /// Ключ кэша — уникальный id арены (`self.id`), а не адрес буфера:
+    /// адрес освобождённой арены может переиспользоваться под новую, и без id
+    /// поток получил бы регион чужой арены (или, наоборот, отобрал бы
+    /// регион у другой арены).
     #[inline]
     fn thread_slot(&self) -> usize {
         let n = self.primary.len().max(1);
-        let key = self.arena_key();
-        let slot = SLOT.with(|c| c.get());
-        let idx = if slot.0 == key && slot.1 < n {
-            slot.1
-        } else {
-            let idx = self.next_slot.fetch_add(1, Ordering::Relaxed) % n;
-            SLOT.with(|c| c.set((key, idx)));
-            idx
-        };
-        idx
+        let key = self.id;
+        SLOT.with(|c| {
+            let slot = c.get();
+            if slot.0 == key && slot.1 < n {
+                slot.1
+            } else {
+                let idx = self.next_slot.fetch_add(1, Ordering::Relaxed) % n;
+                c.set((key, idx));
+                idx
+            }
+        })
     }
 
     /// Forward-bump в регионе: вернуть выровненный указатель на `size` байт,
@@ -198,6 +215,7 @@ impl<T> Arena<T> {
             ptr: alloc.ptr,
             len: alloc.size,
             used: AtomicUsize::new(0),
+            count: AtomicUsize::new(0),
             alloc: Some(alloc),
         }
     }
@@ -205,27 +223,42 @@ impl<T> Arena<T> {
     /// Зарезервировать `size` выровненных байт в регионе текущего потока.
     /// Сначала пробуем первичный регион, затем существующие spill-регионы,
     /// и только при нехватке везде — выделяем новый spill. Возвращает указатель.
-    fn alloc_bytes(&self, size: usize) -> *mut u8 {
+    ///
+    /// `elements` — сколько элементов `T` размещается в этом блоке: счётчик
+    /// региона обновляется здесь же, чтобы `len()`/`into_vec()`/`clear()`
+    /// знали точное число элементов (см. `ArenaRegion::count`).
+    fn alloc_bytes(&self, size: usize, elements: usize) -> *mut u8 {
         let align = core::mem::align_of::<T>();
         let slot = self.thread_slot();
         if let Some(p) = Self::region_alloc(&self.primary[slot], size, align) {
+            self.primary[slot]
+                .count
+                .fetch_add(elements, Ordering::Relaxed);
             return p;
         }
         let mut spill = self.spill.lock();
         for r in spill.iter() {
             if let Some(p) = Self::region_alloc(r, size, align) {
+                r.count.fetch_add(elements, Ordering::Relaxed);
                 return p;
             }
         }
         let region = self.take_spill_region();
         let p = Self::region_alloc(&region, size, align).expect("spill region large enough");
+        region.count.fetch_add(elements, Ordering::Relaxed);
         spill.push(region);
         p
     }
 
     /// Аллоцировать объект `T` в регионе текущего потока и вернуть `&mut T`.
+    ///
+    /// API повторяет `typed-arena` v2 (`alloc(&self) -> &mut T`), поэтому
+    /// `&mut` выдаётся из `&self` — clippy::mut_from_ref здесь намеренно
+    /// подавлен: адреса выдаются непересекающиеся (каждый `alloc` занимает
+    /// свой блок в регионе), а сам `&mut` живёт не дольше арены.
+    #[allow(clippy::mut_from_ref)]
     pub fn alloc(&self, value: T) -> &mut T {
-        let p = self.alloc_bytes(core::mem::size_of::<T>()) as *mut T;
+        let p = self.alloc_bytes(core::mem::size_of::<T>(), 1) as *mut T;
         unsafe {
             ptr::write(p, value);
             &mut *p
@@ -235,6 +268,10 @@ impl<T> Arena<T> {
     /// Аллоцировать элементы из итератора и вернуть непрерывный мутабельный
     /// срез. Собирает во временный `Vec`, чтобы знать точное число и выделить
     /// одним блоком (гарантия непрерывности, как у typed-arena).
+    ///
+    /// Как и `alloc`, метод намеренно отдаёт `&mut [T]` из `&self`
+    /// (совместимость с API typed-arena) — см. `alloc`.
+    #[allow(clippy::mut_from_ref)]
     pub fn alloc_extend<I: IntoIterator<Item = T>>(&self, iterable: I) -> &mut [T] {
         let items: Vec<T> = iterable.into_iter().collect();
         let count = items.len();
@@ -242,7 +279,7 @@ impl<T> Arena<T> {
             return &mut [];
         }
         let size = count * core::mem::size_of::<T>();
-        let p = self.alloc_bytes(size) as *mut T;
+        let p = self.alloc_bytes(size, count) as *mut T;
         for (i, v) in items.into_iter().enumerate() {
             unsafe {
                 ptr::write(p.add(i), v);
@@ -255,10 +292,10 @@ impl<T> Arena<T> {
     pub fn len(&self) -> usize {
         let mut n = 0usize;
         for r in &self.primary {
-            n += r.used.load(Ordering::Relaxed) / core::mem::size_of::<T>().max(1);
+            n += r.count.load(Ordering::Relaxed);
         }
         for r in self.spill.lock().iter() {
-            n += r.used.load(Ordering::Relaxed) / core::mem::size_of::<T>().max(1);
+            n += r.count.load(Ordering::Relaxed);
         }
         n
     }
@@ -276,12 +313,21 @@ impl<T> Arena<T> {
     /// Непрерывный неинициализированный срез в регионе текущего потока.
     /// Вызывает `alloc_bytes(num * size_of::<T>())`, т.е. выделяет ровно под
     /// `num` элементов одним блоком.
+    ///
+    /// # Safety
+    /// Выделенная память НЕ инициализирована: вызывающий обязан записать
+    /// значения во все `num` элементов до чтения и не читать
+    /// `MaybeUninit` как будто они инициализированы. Элементы, которые
+    /// вызывающий решил не инициализировать, нужно забыть через
+    /// `MaybeUninit::assume_init_drop` (или оставить неинициализированными,
+    /// если `T` не требует `Drop`).
+    #[allow(clippy::mut_from_ref)]
     pub unsafe fn alloc_uninitialized(&self, num: usize) -> &mut [core::mem::MaybeUninit<T>] {
         if num == 0 {
             return &mut [];
         }
         let size = num * core::mem::size_of::<T>();
-        let p = self.alloc_bytes(size) as *mut core::mem::MaybeUninit<T>;
+        let p = self.alloc_bytes(size, num) as *mut core::mem::MaybeUninit<T>;
         unsafe { &mut *ptr::slice_from_raw_parts_mut(p, num) }
     }
 
@@ -315,15 +361,15 @@ impl<T> Arena<T> {
     /// Превратить арену в `Vec<T>` (порядок выделения). Эксклюзивный доступ.
     ///
     /// `ptr::read` делает побитовую копию каждого элемента (Arc refcount не
-    /// увеличивается!). Поэтому после чтения我们必须 обнулить `used` всех
+    /// увеличивается!). Поэтому после чтения НУЖНО обнулить счётчики всех
     /// регионов — иначе `Drop::drop → clear()` вызовет `drop_in_place` на уже
     /// прочитанных объектах (use-after-free). После обнуления `Drop` находит
-    /// `used == 0` и пропускает; spill-регионы освобождаются через `platform::free`.
+    /// `count == 0` и пропускает; spill-регионы освобождаются через `platform::free`.
     pub fn into_vec(self) -> Vec<T> {
         let len = self.len();
         let mut out = Vec::with_capacity(len);
         for r in &self.primary {
-            let count = r.used.load(Ordering::Relaxed) / core::mem::size_of::<T>().max(1);
+            let count = r.count.load(Ordering::Relaxed);
             let base = r.ptr as *const T;
             for i in 0..count {
                 unsafe {
@@ -331,9 +377,10 @@ impl<T> Arena<T> {
                 }
             }
             r.used.store(0, Ordering::Relaxed);
+            r.count.store(0, Ordering::Relaxed);
         }
         for r in self.spill.lock().iter() {
-            let count = r.used.load(Ordering::Relaxed) / core::mem::size_of::<T>().max(1);
+            let count = r.count.load(Ordering::Relaxed);
             let base = r.ptr as *const T;
             for i in 0..count {
                 unsafe {
@@ -341,6 +388,7 @@ impl<T> Arena<T> {
                 }
             }
             r.used.store(0, Ordering::Relaxed);
+            r.count.store(0, Ordering::Relaxed);
         }
         out
     }
@@ -349,23 +397,25 @@ impl<T> Arena<T> {
     /// чтобы их можно было переиспользовать.
     pub fn clear(&mut self) {
         for r in &self.primary {
-            let count = r.used.load(Ordering::Relaxed) / core::mem::size_of::<T>().max(1);
+            let count = r.count.load(Ordering::Relaxed);
             for i in 0..count {
                 unsafe {
                     ptr::drop_in_place((r.ptr as *mut T).add(i));
                 }
             }
             r.used.store(0, Ordering::Relaxed);
+            r.count.store(0, Ordering::Relaxed);
         }
         let spill = self.spill.lock();
         for r in spill.iter() {
-            let count = r.used.load(Ordering::Relaxed) / core::mem::size_of::<T>().max(1);
+            let count = r.count.load(Ordering::Relaxed);
             for i in 0..count {
                 unsafe {
                     ptr::drop_in_place((r.ptr as *mut T).add(i));
                 }
             }
             r.used.store(0, Ordering::Relaxed);
+            r.count.store(0, Ordering::Relaxed);
         }
     }
 }
@@ -409,7 +459,7 @@ impl<'a, T> Iterator for Iter<'a, T> {
         loop {
             if self.region < self.arena.primary.len() {
                 let r = &self.arena.primary[self.region];
-                let count = r.used.load(Ordering::Relaxed) / core::mem::size_of::<T>().max(1);
+                let count = r.count.load(Ordering::Relaxed);
                 if self.idx < count {
                     let item = unsafe { &*(r.ptr as *const T).add(self.idx) };
                     self.idx += 1;
@@ -423,7 +473,7 @@ impl<'a, T> Iterator for Iter<'a, T> {
             let spill = self.arena.spill.lock();
             if self.spill_head < spill.len() {
                 let r = &spill[self.spill_head];
-                let count = r.used.load(Ordering::Relaxed) / core::mem::size_of::<T>().max(1);
+                let count = r.count.load(Ordering::Relaxed);
                 if self.idx < count {
                     let item = unsafe { &*(r.ptr as *const T).add(self.idx) };
                     self.idx += 1;
@@ -456,7 +506,7 @@ impl<'a, T> Iterator for IterMut<'a, T> {
         loop {
             if self.region < n_primary {
                 let r = &arena.primary[self.region];
-                let count = r.used.load(Ordering::Relaxed) / core::mem::size_of::<T>().max(1);
+                let count = r.count.load(Ordering::Relaxed);
                 if self.idx < count {
                     let p = unsafe { (r.ptr as *mut T).add(self.idx) };
                     self.idx += 1;
@@ -469,7 +519,7 @@ impl<'a, T> Iterator for IterMut<'a, T> {
             let spill = arena.spill.get_mut();
             let sidx = self.region - n_primary;
             let r = spill.get(sidx)?;
-            let count = r.used.load(Ordering::Relaxed) / core::mem::size_of::<T>().max(1);
+            let count = r.count.load(Ordering::Relaxed);
             if self.idx < count {
                 let p = unsafe { (r.ptr as *mut T).add(self.idx) };
                 self.idx += 1;
@@ -937,5 +987,43 @@ mod tests {
             assert_ne!(w[0], w[1]);
         }
         assert_eq!(arena.len(), count_scale(300));
+    }
+
+    // ===================== Регрессии: счётчик элементов typed-арены =====================
+
+    /// Регрессия (счётчик элементов): число элементов нельзя выводить из
+    /// `used / size_of::<T>()` — при выравнивании больше 16 байт первая
+    /// выдача съедает padding-байты, и деление давало завышенное число
+    /// элементов (а `into_vec`/`clear` по нему читали ЗА пределами
+    /// выделенной памяти).
+    #[test]
+    fn counts_elements_with_big_alignment() {
+        #[repr(align(64))]
+        struct Big(u64);
+        let a = Arena::<Big>::with_regions(1, 8);
+        assert_eq!(a.len(), 0);
+        for i in 0..10u64 {
+            let p = a.alloc(Big(i));
+            assert_eq!(p.0, i);
+        }
+        assert_eq!(a.len(), 10, "len() обязан считать элементы, а не байты");
+        let v = a.into_vec();
+        assert_eq!(v.len(), 10);
+        for (i, item) in v.iter().enumerate() {
+            assert_eq!(item.0, i as u64);
+        }
+    }
+
+    /// Регрессия (ZST): для типа нулевого размера байты не расходуются, но
+    /// элементы считаться должны — иначе `len()` всегда был бы 0.
+    #[test]
+    fn counts_zst_elements() {
+        let a = Arena::<()>::new();
+        assert_eq!(a.len(), 0);
+        for _ in 0..5 {
+            a.alloc(());
+        }
+        assert_eq!(a.len(), 5, "ZST-элементы тоже должны считаться");
+        assert_eq!(a.iter().count(), 5);
     }
 }

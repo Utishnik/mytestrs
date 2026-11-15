@@ -18,18 +18,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "allocation_hints"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1822e8bbb2c4d6662020c9c95049f9ad39b08aceaba3b9b5a538e9b2674a2a2"
-
-[[package]]
-name = "allocator-api2"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c880a97d28a3681c0267bd29cff89621202715b065127cd445fa0f0fe0aa2880"
-
-[[package]]
 name = "anstyle"
 version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -638,10 +626,8 @@ dependencies = [
 
 [[package]]
 name = "r3"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "allocation_hints",
- "allocator-api2",
  "boxcar",
  "branches",
  "bumpalo",

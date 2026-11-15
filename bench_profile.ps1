@@ -21,7 +21,7 @@
 #                                                               #   AND half memory footprint (R3_BENCH_SCALE=2)
 #   powershell -File bench_profile.ps1 -Style mono|dispatch|both
 #   powershell -File bench_profile.ps1 -Prefetch                # + win-prefetch-pages
-#   powershell -File bench_profile.ps1 -Cpu                     # + hotpath-cpu (Linux/macOS only)
+#   powershell -File bench_profile.ps1 -Cpu                     # + hotpath-cpu (CPU baseline; на Windows фича no-op)
 #   powershell -File bench_profile.ps1 -Capture                 # discard bench stdout
 param(
     [switch]$PprofOnly,

@@ -19,7 +19,6 @@ orx-concurrent-vec = "4"
 boxcar = "0.2"
 triomphe = "0.1"
 branches = { version = "0.5.0", features = ["prefetch"] }
-pprof = { version = "0.13", optional = true, features = ["flamegraph", "protobuf-codec"] }
 
 [features]
 default = ["alloc-mimalloc"]
@@ -29,7 +28,11 @@ alloc-mimalloc = ["dep:rustfs-mimalloc"]
 # bench_arena_profile.sh --tune. Не входит в default: без него бинарь идентичен.
 tune = []
 hotpath = ["hotpath/hotpath"]
-hotpath-cpu = ["hotpath/hotpath-cpu"]
+# `hotpath-cpu` умеет только macOS/Linux (крейт жёстко падает на Windows
+# через `compile_error!`). Фича включается через target-specific зависимость
+# `hotpath` (см. [target.'cfg(unix)'.dependencies]): на Windows она не
+# активируется, поэтому `--all-features` собирается на любой ОС.
+hotpath-cpu = []
 # Асинхронный prefetch страниц на Windows через PrefetchVirtualMemory.
 # ВЫКЛЮЧЕН по умолчанию: на практике worker-потоки ядра фолтят страницы
 # в чужом контексте (working-set lock, чужая NUMA-нода) и это даёт
@@ -58,6 +61,17 @@ windows-sys = { version = "0.59", features = [
 ] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# Тот же `hotpath`, но с `hotpath-cpu`: фича работает только на macOS/Linux
+# (на Windows крейт жёстко падает через `compile_error!`). Объявление
+# target-specific позволяет включать CPU-семплирование только на unix и
+# держать `--all-features` собираемым на Windows.
+hotpath = { version = "0.24.0", features = ["hotpath-cpu"] }
+# pprof — ТОЛЬКО на unix: крейт использует POSIX-сигналы (`nix::sys::signal`,
+# `libc::pthread_t`, `libc::ucontext_t`) и на Windows не собирается вообще.
+# Раньше зависимость была в общем `[dependencies]`, и `cargo build --all-features`
+# на Windows падал с ошибками компиляции самого `pprof`. Код профайлера в
+# `src/lib.rs` и так защищён `#[cfg(all(feature = "pprof", not(miri), unix))]`.
+pprof = { version = "0.13", optional = true, features = ["flamegraph", "protobuf-codec"] }
 
 [dev-dependencies]
 divan = "0.1.21"
