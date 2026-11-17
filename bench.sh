@@ -47,9 +47,9 @@
 #            прогон бинаря.
 set -euo pipefail
 
-MODE="${1:-1}"
-STYLE="${2:-}"
-ALLOCATOR="${3:-mimalloc}"
+MODE=""
+STYLE=""
+ALLOCATOR=""
 QUICK=""
 TUNE=0
 TUNE_ONLY=0
@@ -94,6 +94,11 @@ if [ -n "$SCALE" ] && ! [[ "$SCALE" =~ ^[1-9][0-9]*$ ]]; then
     echo "bad --scale: '$SCALE' (expected: целое число >= 1)" >&2
     exit 2
 fi
+# Дефолты позиционных аргументов — ПОСЛЕ разбора флагов: раньше
+# ALLOCATOR="${3:-mimalloc}" при `./bench.sh 1 --scale 2` хватал "2" как
+# третий позиционный ещё до парсера, и значение аллокатора терялось.
+MODE="${MODE:-1}"
+ALLOCATOR="${ALLOCATOR:-mimalloc}"
 TRIPLE="$(rustc --print host-tuple)"
 
 if [ -n "$STYLE" ]; then
