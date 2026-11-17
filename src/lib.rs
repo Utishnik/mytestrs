@@ -205,8 +205,7 @@ impl FallbackChunks {
         let idx = match target {
             Some(i) => i,
             None => {
-                let alloc_size =
-                    fallback_chunk_bytes(base_chunk, need, cap).next_multiple_of(page);
+                let alloc_size = fallback_chunk_bytes(base_chunk, need, cap).next_multiple_of(page);
                 let alloc = take_fallback_chunk(alloc_size);
                 chunks.push(FbChunk { alloc, used: 0 });
                 chunks.len() - 1
@@ -573,7 +572,8 @@ fn chunk_pool_put(a: RawAllocation) {
 /// на реальном обращении к ОС.
 #[inline]
 fn take_fallback_chunk(alloc_size: usize) -> RawAllocation {
-    if let Some(a) = FREED_CHUNK_CACHE.try_with(|c| c.take(alloc_size))
+    if let Some(a) = FREED_CHUNK_CACHE
+        .try_with(|c| c.take(alloc_size))
         .ok()
         .flatten()
     {
@@ -4121,9 +4121,7 @@ thread_local! {
 fn with_bench_arena<R>(total_capacity: usize, f: impl FnOnce(&SharedArena) -> R) -> R {
     BENCH_ARENA.with(|cell| {
         let mut slot = cell.borrow_mut();
-        let reuse = slot
-            .as_ref()
-            .is_some_and(|(cap, _)| *cap == total_capacity);
+        let reuse = slot.as_ref().is_some_and(|(cap, _)| *cap == total_capacity);
         if !reuse {
             *slot = Some((total_capacity, SharedArena::new(total_capacity)));
         }
@@ -4148,78 +4146,80 @@ fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
 
     with_bench_arena(total_capacity, |arena| {
         let mut bumps: Split<'_> = match layout {
-        ArenaLayout::Uniform(dir) => arena.split_with_safe(core_ids.len(), dir),
-        ArenaLayout::Neighbors => arena.split_alternating_safe(core_ids.len()),
-        ArenaLayout::Pair => arena.split_paired_safe(core_ids.len()),
-        ArenaLayout::Donors => {
-            arena.split_donors_with_safe(core_ids.len(), DonorPolicy::static_(4))
-        }
-        ArenaLayout::DonorsPrio => {
-            arena.split_donors_with_safe(core_ids.len(), DonorPolicy::static_(4).with_priority())
-        }
-        ArenaLayout::DonorsOrx => arena.split_donors_with_safe(core_ids.len(), DonorPolicy::orx(4)),
-        ArenaLayout::DonorsOrxPrio => {
-            arena.split_donors_with_safe(core_ids.len(), DonorPolicy::orx(4).with_priority())
-        }
-        ArenaLayout::DonorsBoxcar => {
-            arena.split_donors_with_safe(core_ids.len(), DonorPolicy::boxcar(4))
-        }
-        ArenaLayout::DonorsBoxcarPrio => {
-            arena.split_donors_with_safe(core_ids.len(), DonorPolicy::boxcar(4).with_priority())
-        }
-    };
+            ArenaLayout::Uniform(dir) => arena.split_with_safe(core_ids.len(), dir),
+            ArenaLayout::Neighbors => arena.split_alternating_safe(core_ids.len()),
+            ArenaLayout::Pair => arena.split_paired_safe(core_ids.len()),
+            ArenaLayout::Donors => {
+                arena.split_donors_with_safe(core_ids.len(), DonorPolicy::static_(4))
+            }
+            ArenaLayout::DonorsPrio => arena
+                .split_donors_with_safe(core_ids.len(), DonorPolicy::static_(4).with_priority()),
+            ArenaLayout::DonorsOrx => {
+                arena.split_donors_with_safe(core_ids.len(), DonorPolicy::orx(4))
+            }
+            ArenaLayout::DonorsOrxPrio => {
+                arena.split_donors_with_safe(core_ids.len(), DonorPolicy::orx(4).with_priority())
+            }
+            ArenaLayout::DonorsBoxcar => {
+                arena.split_donors_with_safe(core_ids.len(), DonorPolicy::boxcar(4))
+            }
+            ArenaLayout::DonorsBoxcarPrio => {
+                arena.split_donors_with_safe(core_ids.len(), DonorPolicy::boxcar(4).with_priority())
+            }
+        };
 
-    // Гуарды-владельцы: каждый поток получает эксклюзивный доступ к своему
-    // чанку. `guards()` занимает `&mut bumps` целиком и раздаёт
-    // непересекающиеся `&mut` (bumps при этом остаются на месте в `Split` —
-    // на них ссылаются сырые указатели `array`/`donor_array`).
-    let guards = bumps.guards();
-    std::thread::scope(|sc| {
-        for (core_id, mut bump) in core_ids.iter().zip(guards) {
-            // Гуард `Send` (содержит `&mut ThreadBump`), его можно отдать
-            // потоку. Каждый чанк использует ровно один поток; заём у соседа
-            // идёт только через atomic-счётчики (см. `try_borrow`).
-            let core = *core_id;
-            sc.spawn(move || {
-                core_affinity::set_for_current(core);
-                hotpath::measure_block!("prefault", {
-                    bump.prefault_own_region(); // first-touch в локальную NUMA-ноду
-                });
-                for _ in 0..(3 / scale).max(1) {
-                    hotpath::measure_block!("alloc", {
-                        // Выделение — по заимствованию гуарда (`&bump`).
-                        let mut vectr: ArenaVec<ArenaVec<ArenaString>> =
-                            ArenaVec::with_capacity_in::<
-                                { core::mem::align_of::<ArenaVec<ArenaString>>() },
-                            >(vcap / scale, &bump);
-                        for _ in 0..(outer / scale).max(1) {
-                            for _ in 0..(inner / scale).max(1) {
-                                let mut vec: ArenaVec<ArenaString> =
-                                    ArenaVec::with_capacity_in::<
-                                        { core::mem::align_of::<ArenaString>() },
-                                    >(400, &bump);
-                                for _ in 0..(100 / scale).max(1) {
-                                    vec.push::<{ core::mem::align_of::<ArenaString>() }>(
-                                        ArenaString::from_str_in("stroka", &bump),
-                                        &bump,
-                                    );
+        // Гуарды-владельцы: каждый поток получает эксклюзивный доступ к своему
+        // чанку. `guards()` занимает `&mut bumps` целиком и раздаёт
+        // непересекающиеся `&mut` (bumps при этом остаются на месте в `Split` —
+        // на них ссылаются сырые указатели `array`/`donor_array`).
+        let guards = bumps.guards();
+        std::thread::scope(|sc| {
+            for (core_id, mut bump) in core_ids.iter().zip(guards) {
+                // Гуард `Send` (содержит `&mut ThreadBump`), его можно отдать
+                // потоку. Каждый чанк использует ровно один поток; заём у соседа
+                // идёт только через atomic-счётчики (см. `try_borrow`).
+                let core = *core_id;
+                sc.spawn(move || {
+                    core_affinity::set_for_current(core);
+                    hotpath::measure_block!("prefault", {
+                        bump.prefault_own_region(); // first-touch в локальную NUMA-ноду
+                    });
+                    for _ in 0..(3 / scale).max(1) {
+                        hotpath::measure_block!("alloc", {
+                            // Выделение — по заимствованию гуарда (`&bump`).
+                            let mut vectr: ArenaVec<ArenaVec<ArenaString>> =
+                                ArenaVec::with_capacity_in::<
+                                    { core::mem::align_of::<ArenaVec<ArenaString>>() },
+                                >(vcap / scale, &bump);
+                            for _ in 0..(outer / scale).max(1) {
+                                for _ in 0..(inner / scale).max(1) {
+                                    let mut vec: ArenaVec<ArenaString> =
+                                        ArenaVec::with_capacity_in::<
+                                            { core::mem::align_of::<ArenaString>() },
+                                        >(400, &bump);
+                                    for _ in 0..(100 / scale).max(1) {
+                                        vec.push::<{ core::mem::align_of::<ArenaString>() }>(
+                                            ArenaString::from_str_in("stroka", &bump),
+                                            &bump,
+                                        );
+                                    }
+                                    vectr
+                                        .push::<{ core::mem::align_of::<ArenaVec<ArenaString>>() }>(
+                                            vec, &bump,
+                                        );
                                 }
-                                vectr.push::<{ core::mem::align_of::<ArenaVec<ArenaString>>() }>(
-                                    vec, &bump,
-                                );
                             }
-                        }
-                        core::hint::black_box(&vectr);
-                        drop(vectr);
-                    });
-                    // `reset` — только по `&mut bump` (DerefMut -> `&mut ThreadBump`).
-                    hotpath::measure_block!("reset", {
-                        bump.reset();
-                    });
-                }
-            });
-        }
-    });
+                            core::hint::black_box(&vectr);
+                            drop(vectr);
+                        });
+                        // `reset` — только по `&mut bump` (DerefMut -> `&mut ThreadBump`).
+                        hotpath::measure_block!("reset", {
+                            bump.reset();
+                        });
+                    }
+                });
+            }
+        });
     })
 }
 
