@@ -1,4 +1,21 @@
-[В РАБОТЕ] прогнать полный bench.sh (scale=1) после пула чанков и обновить логи
+[ОГРАНИЧЕНО] полный bench.sh scale=1 на этой машине невозможен — OOM.
+
+Хост 13.3 ГБ RAM; full-бенчи scale=1 требуют пиково ~11-13 ГБ (PGO-чанки
+70-282 МБ x 16 потоков + удержание страниц mimalloc между бенчами). В WSL
+даже с лимитом 10 ГБ (.wslconfig) бинарь убивается OOM-киллером на первом
+FULL SMT. Старые bench_mode*_log со scale=1 (PGO bump full 750 MB) писались
+не в WSL (UTF-16) — там было больше памяти.
+
+Сделан полный прогон (не quick, все бенчи, run()) на scale=2:
+- SMT FULL:   mimalloc 108.9 мс | bumpalo 143.6 | SharedBump 247.0 | АРЕНА 38.8|33.7
+- SMT LIGHT:  mimalloc 53.9      | bumpalo 33.9  | SharedBump 64.8  | АРЕНА 9.7|8.0
+- NOSMT FULL: mimalloc 107.8     | bumpalo 31.4  | SharedBump 132.9 | АРЕНА 16.9|15.6
+- NOSMT LIGHT:mimalloc 19.8      | bumpalo 30.0  | SharedBump 32.4  | АРЕНА 5.6|4.8
+Арена выигрывает у всех во всех 4 конфигурациях (в 2-7 раз).
+Directional (SMT FULL, mono): Donors 74.0 | DonorsOrx 117.3 | DonorsBoxcar
+118.6 — orx теперь наравне с boxcar, отрыв от static ~1.6x (был 20-40x).
+Scale=1 станет доступен, когда будет машина с >= 24 ГБ RAM (или запуск
+не в WSL).
 
 [РЕШЕНО] donors_orx / donors_orx_prio в 20-40 раз медленнее static-доноров.
 
@@ -17,7 +34,7 @@ CAS-цикл (Acquire RMW) по state-байту элемента + restore-CAS.
   инвалидации.
 - Регрессионный тест donors_orx_remove_invalidates_snapshot_cache.
 
-Результат (scale=2, медианы): donors_orx FULL/no-smt 619.6 -> 50.7 мс,
+Результат (scale=2, divan, медианы): donors_orx FULL/no-smt 619.6 -> 50.7 мс,
 FULL/smt 2082 -> 122 мс, LIGHT 136.2 -> 13.9 / 489.8 -> 30.5 мс (x10-18).
 orx == boxcar; остаточный зазор к static-донорам (29/69 мс FULL) — цена
 снапшот-слоя динамического реестра как класса (у boxcar тот же зазор).
@@ -43,5 +60,3 @@ orx == boxcar; остаточный зазор к static-донорам (29/69 �
    mimalloc на scale=1); проигрыш bump'ов бывал только в LIGHT на
    урезанных scale — фиксированная накладка на сэмпл, размазанная по
    малой нагрузке. Не баг аллокатора.
-
-[ ] прогнать полный bench.sh (scale=1) после пула чанков и обновить логи
