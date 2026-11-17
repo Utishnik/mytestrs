@@ -145,8 +145,13 @@ impl FallbackChunks {
         let cur_size = self.cur_size.load(Ordering::Relaxed);
         if cur_size != 0 {
             let used = self.cur_used.load(Ordering::Relaxed);
-            if used + need <= cur_size {
-                let off = (used + ALIGN - 1) & !(ALIGN - 1);
+            // Проверять место нужно по ВЫРОВНЕННОМУ смещению `off`, а не по
+            // сырому `used`: при size, не кратном ALIGN, `off = align_up(used)`
+            // может быть на ALIGN-1 байт больше `used`, и проверка
+            // `used + need <= cur_size` пропускала блок, который вылезал за
+            // конец чанка (запись за границей выделенной памяти).
+            let off = (used + ALIGN - 1) & !(ALIGN - 1);
+            if off + size <= cur_size {
                 self.cur_used.store(off + size, Ordering::Relaxed);
                 let base = self.cur_ptr.load(Ordering::Relaxed);
                 let p = unsafe { base.add(off) };
@@ -183,9 +188,13 @@ impl FallbackChunks {
             chunks[cur_idx].used = self.cur_used.load(Ordering::Relaxed);
         }
         // 1) Переиспользовать уже выделенный чанк, в котором есть место.
+        //    Как и в быстром пути, место считаем от ВЫРОВНЕННОГО смещения:
+        //    `c.used + need <= c.alloc.size` пропускало чанк, где блок
+        //    вылезал за его конец на до ALIGN-1 байт.
         let mut target = None;
         for (i, c) in chunks.iter().enumerate() {
-            if c.used + need <= c.alloc.size {
+            let off = (c.used + ALIGN - 1) & !(ALIGN - 1);
+            if off + size <= c.alloc.size {
                 target = Some(i);
                 break;
             }
@@ -1043,14 +1052,14 @@ mod platform {
             }
             #[cfg(target_os = "linux")]
             {
-                if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
-                    if let Some(kb) = meminfo.lines().find_map(|line| {
+                if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo")
+                    && let Some(kb) = meminfo.lines().find_map(|line| {
                         line.strip_prefix("Hugepagesize:")
                             .and_then(|rest| rest.trim().strip_suffix("kB"))
                             .and_then(|num| num.trim().parse::<usize>().ok())
-                    }) {
-                        return kb * 1024;
-                    }
+                    })
+                {
+                    return kb * 1024;
                 }
             }
             2 * 1024 * 1024
@@ -4861,6 +4870,10 @@ pub fn arena_tune_scan(smt: bool) -> usize {
 /// выделение — только `R3_VERBOSE=2`. Если процессу пришёл SIGINT (Ctrl+C) —
 /// печать гасится полностью: прерванный прогон не должен генерировать новый
 /// вывод.
+///
+/// На Linux platform-слой пока ничего не печатает (диагностика R3_VERBOSE
+/// используется Windows-веткой), поэтому вне Windows — dead_code.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn verbose_enabled() -> bool {
     if interrupted().load(std::sync::atomic::Ordering::Relaxed) {
         return false;
@@ -4873,6 +4886,7 @@ fn verbose_enabled() -> bool {
 /// Ctrl+C не печатать ничего нового.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn interrupted() -> &'static AtomicBool {
     &INTERRUPTED
 }
@@ -4891,7 +4905,7 @@ fn install_ctrlc_handler() {
         }
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = on_sigint as usize;
+            sa.sa_sigaction = on_sigint as *const () as usize;
             sa.sa_flags = libc::SA_RESTART;
             libc::sigemptyset(&mut sa.sa_mask);
             libc::sigaction(libc::SIGINT, &sa, ptr::null_mut());
@@ -7705,7 +7719,15 @@ mod tests {
         let cap = arena_scale(4096);
         let (arena, mut bump) = make_one(BumpDir::Forward, cap);
         // Выдаём много блоков — регион исчерпается, уйдём в fallback.
-        for i in 0..count_scale(4096) {
+        //
+        // Число аллокаций обязано ГАРАНТИРОВАННО исчерпать регион и в обычном
+        // прогоне, и под Miri: под Miri `count_scale` сжимает счётчик в 100
+        // раз (4096/100 = 40), и 40 аллокаций по 64 байта (2560 байт) целиком
+        // помещаются в регион 4096 байт — до fallback дело не доходило, и
+        // тест паниковал на ассерте ниже. `(cap / 64) * 2` даёт двукратный
+        // перелив региона независимо от режима.
+        let n = (cap / 64 * 2).max(count_scale(4096));
+        for i in 0..n {
             let p = bump.alloc_raw::<8>(64);
             assert!(!p.is_null());
             unsafe { ptr::write(p as *mut u64, i as u64) };
@@ -7718,7 +7740,7 @@ mod tests {
 
         // Сброс и новая порция выдачи: чанки те же, новых не выделяем.
         bump.reset();
-        for i in 0..count_scale(4096) {
+        for i in 0..n {
             let p = bump.alloc_raw::<8>(64);
             assert!(!p.is_null());
             unsafe { ptr::write(p as *mut u64, i as u64) };
