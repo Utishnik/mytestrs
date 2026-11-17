@@ -2843,6 +2843,15 @@ impl ThreadBump {
     /// работой потока.
     #[cfg_attr(coverage, coverage(off))]
     fn prefault_own_region(&self) {
+        // Контракт (см. Cargo.toml, фича `huge`): prefault делается ТОЛЬКО для
+        // регионов на huge pages. Для обычных 4KB-страниц страницы и так
+        // фолтятся demand-fault'ом внутри раунда, а прогон populate_write по
+        // всему чанку на каждом сэмпле бенча — чистая накладка (миллисекунды
+        // на сэмпл), из-за которой арена «проигрывала» mimalloc при мелкой
+        // нагрузке. Тот же гейт стоит в `prefault_local`.
+        if !huge_enabled() || !self.is_huge {
+            return;
+        }
         if self.is_huge && platform::large_pages_precommitted() {
             return;
         }
@@ -3974,6 +3983,42 @@ enum ArenaLayout {
 
 /// Единое тело бенчмарка shared-арены. `full` управляет объёмом работы
 /// (FULL: 200×200×100, LIGHT: 100×100×100), `layout` — направлением заполнения.
+/// Кэш арены бенчмарка между вызовами (см. `with_bench_arena`).
+thread_local! {
+    static BENCH_ARENA: std::cell::RefCell<Option<(usize, SharedArena)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Выполнить `f` на арене `total_capacity` байт, ПЕРЕИСПОЛЬЗУЯ арену между
+/// вызовами (сэмплами divan).
+///
+/// Зачем: каждый сэмпл `arena_light`/`arena_full` раньше делал свежий
+/// `mmap` + prefault всего чанка (LIGHT ≈ 14 МБ × потоки) — ~6–8 мс
+/// фиксированной накладки на сэмпл. При `R3_BENCH_SCALE >= 10` она
+/// доминировала над самой нагрузкой, и арена «проигрывала» mimalloc,
+/// который между сэмплами работает на тёплых страницах. Кэш делает
+/// сравнение честным: один `mmap`+prefault на поток бенча, дальше —
+/// `reset` между раундами, как у mimalloc (тёплые сегменты).
+///
+/// Безопасность продления `&SharedArena` на всё тело `f`: ссылка живёт в
+/// thread-local до конца потока; замена кэша возможна только в начале
+/// следующего вызова `with_bench_arena` на этом же потоке, то есть после
+/// выхода `f` (внутри `f` рекурсивного обращения к кэшу нет).
+#[cfg_attr(coverage, coverage(off))]
+fn with_bench_arena<R>(total_capacity: usize, f: impl FnOnce(&SharedArena) -> R) -> R {
+    BENCH_ARENA.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let reuse = slot
+            .as_ref()
+            .is_some_and(|(cap, _)| *cap == total_capacity);
+        if !reuse {
+            *slot = Some((total_capacity, SharedArena::new(total_capacity)));
+        }
+        let arena: &SharedArena = &slot.as_ref().unwrap().1;
+        f(arena)
+    })
+}
+
 #[cfg_attr(coverage, coverage(off))]
 fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
     install_ctrlc_handler();
@@ -3981,8 +4026,15 @@ fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
     let total_capacity = chunk_size * core_ids.len();
     // Принт [TOTAL CAPACITY] убран: он дублировал информацию про каждое
     // создание арены и засорял вывод бенча (см. R3_VERBOSE=2 выше).
-    let arena = SharedArena::new(total_capacity);
-    let mut bumps: Split<'_> = match layout {
+    let (vcap, outer, inner) = if full {
+        (40000, 200, 200)
+    } else {
+        (10000, 100, 100)
+    };
+    let scale = bench_scale();
+
+    with_bench_arena(total_capacity, |arena| {
+        let mut bumps: Split<'_> = match layout {
         ArenaLayout::Uniform(dir) => arena.split_with_safe(core_ids.len(), dir),
         ArenaLayout::Neighbors => arena.split_alternating_safe(core_ids.len()),
         ArenaLayout::Pair => arena.split_paired_safe(core_ids.len()),
@@ -4003,13 +4055,6 @@ fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
             arena.split_donors_with_safe(core_ids.len(), DonorPolicy::boxcar(4).with_priority())
         }
     };
-
-    let (vcap, outer, inner) = if full {
-        (40000, 200, 200)
-    } else {
-        (10000, 100, 100)
-    };
-    let scale = bench_scale();
 
     // Гуарды-владельцы: каждый поток получает эксклюзивный доступ к своему
     // чанку. `guards()` занимает `&mut bumps` целиком и раздаёт
@@ -4062,6 +4107,7 @@ fn arena_bench(chunk_size: usize, smt: bool, full: bool, layout: ArenaLayout) {
             });
         }
     });
+    })
 }
 
 /// Полностью мономорфная версия `arena_bench`: конфигурация (направление,
@@ -4118,19 +4164,20 @@ fn arena_run_thread<const MODE: u32, const FULL: bool>(bump: &mut BumpGuard<'_, 
 fn arena_bench_impl<const MODE: u32, const FULL: bool>(chunk_size: usize, smt: bool) {
     let core_ids = get_cores(smt);
     let total_capacity = chunk_size * core_ids.len();
-    let arena = SharedArena::new(total_capacity);
-    let mut bumps = make_split::<MODE>(&arena, core_ids.len());
-    // Гуарды-владельцы: по одному на поток, отдаются в `move`-замыкания.
-    let guards = bumps.guards();
-    std::thread::scope(|s| {
-        for (core_id, mut bump) in core_ids.iter().zip(guards) {
-            let core = *core_id;
-            s.spawn(move || {
-                core_affinity::set_for_current(core);
-                arena_run_thread::<MODE, FULL>(&mut bump);
-            });
-        }
-    });
+    with_bench_arena(total_capacity, |arena| {
+        let mut bumps = make_split::<MODE>(arena, core_ids.len());
+        // Гуарды-владельцы: по одному на поток, отдаются в `move`-замыкания.
+        let guards = bumps.guards();
+        std::thread::scope(|s| {
+            for (core_id, mut bump) in core_ids.iter().zip(guards) {
+                let core = *core_id;
+                s.spawn(move || {
+                    core_affinity::set_for_current(core);
+                    arena_run_thread::<MODE, FULL>(&mut bump);
+                });
+            }
+        });
+    })
 }
 
 #[cfg_attr(coverage, coverage(off))]
