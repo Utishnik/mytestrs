@@ -199,21 +199,15 @@ impl FallbackChunks {
                 break;
             }
         }
-        // 2) Подходящего чанка нет — выделяем новый: сначала пробуем
-        //    thread-local кэш (чанк, освобождённый этим же потоком ранее),
-        //    чтобы вообще не обращаться к ОС.
+        // 2) Подходящего чанка нет — берём чанк: сначала thread-local кэш
+        //    (чанк, освобождённый этим же потоком ранее), затем глобальный
+        //    пул тёплых чанков, и только потом ОС.
         let idx = match target {
             Some(i) => i,
             None => {
-                let alloc_size = fallback_chunk_bytes(base_chunk, need, cap).next_multiple_of(page);
-                let alloc = match FREED_CHUNK_CACHE.try_with(|c| c.take(alloc_size)) {
-                    Ok(Some(a)) => a,
-                    _ => {
-                        #[cfg(feature = "tune")]
-                        FALLBACK_MMAPS.fetch_add(1, Ordering::Relaxed);
-                        platform::alloc_normal(alloc_size)
-                    }
-                };
+                let alloc_size =
+                    fallback_chunk_bytes(base_chunk, need, cap).next_multiple_of(page);
+                let alloc = take_fallback_chunk(alloc_size);
                 chunks.push(FbChunk { alloc, used: 0 });
                 chunks.len() - 1
             }
@@ -254,19 +248,19 @@ impl FallbackChunks {
         }
     }
 
-    /// Освободить все чанки; последний возвращается наружу (его можно
-    /// отдать в thread-local кэш).
-    fn take_last_and_free_rest(&self) -> Option<RawAllocation> {
+    /// Разобрать чанки при смерти bump'а: вернуть `(последний, остальные)`.
+    /// Память НЕ освобождается — вызывающий отдаёт последний в thread-local
+    /// кэш, остальные в глобальный пул тёплых чанков (см. `Drop for
+    /// ThreadBump`); под Mirи — освобождает через ОС.
+    fn take_chunks_for_reuse(&self) -> (Option<RawAllocation>, Vec<RawAllocation>) {
         let mut chunks = self.chunks.lock();
         let last = chunks.pop().map(|c| c.alloc);
-        for c in chunks.drain(..) {
-            platform::free(c.alloc);
-        }
+        let rest: Vec<RawAllocation> = chunks.drain(..).map(|c| c.alloc).collect();
         self.cur_ptr.store(ptr::null_mut(), Ordering::Relaxed);
         self.cur_size.store(0, Ordering::Relaxed);
         self.cur_used.store(0, Ordering::Relaxed);
         self.cur_idx.store(0, Ordering::Relaxed);
-        last
+        (last, rest)
     }
 }
 
@@ -469,21 +463,28 @@ impl ChunkCache {
         match self.slot.take() {
             Some(a) if a.size >= size => Some(a),
             other => {
-                // Не подошёл по размеру (или его нет) — освобождаем через ОС.
+                // Не подошёл по размеру (или его нет) — не теряем: в пул
+                // (страницы остаются тёплыми), под Miri — через ОС.
                 if let Some(a) = other {
-                    platform::free(a);
+                    #[cfg(not(miri))]
+                    chunk_pool_put(a);
+                    #[cfg(miri)]
+                    a.release();
                 }
                 None
             }
         }
     }
 
-    /// Положить чанк в кэш; прежний содержимое кэша освобождается через ОС.
+    /// Положить чанк в кэш; прежний чанк кэша — в пул (под Miri — через ОС).
     #[inline]
     fn put(&self, alloc: RawAllocation) {
         let old = self.slot.replace(Some(alloc));
         if let Some(a) = old {
-            platform::free(a);
+            #[cfg(not(miri))]
+            chunk_pool_put(a);
+            #[cfg(miri)]
+            a.release();
         }
     }
 }
@@ -491,15 +492,100 @@ impl ChunkCache {
 impl Drop for ChunkCache {
     #[inline]
     fn drop(&mut self) {
-        // Поток завершается — возвращаем чанк ОС (иначе Miri репортит утечку).
+        // Поток завершается — чанк в пул (переиспользуется следующим
+        // потоком; под Mirи пул выключен — освобождаем через ОС, иначе
+        // Miri репортит утечку).
         if let Some(a) = self.slot.take() {
-            platform::free(a);
+            #[cfg(not(miri))]
+            chunk_pool_put(a);
+            #[cfg(miri)]
+            a.release();
         }
     }
 }
 
 thread_local! {
     static FREED_CHUNK_CACHE: ChunkCache = const { ChunkCache { slot: Cell::new(None) } };
+}
+
+// ============================================================
+//       ГЛОБАЛЬНЫЙ ПУЛ ОСВОБОЖДЁННЫХ FALLBACK-ЧАНКОВ
+// ============================================================
+//
+// FREED_CHUNK_CACHE (thread-local) не спасает бенчмарк-цикл: `Drop for
+// ThreadBump` исполняется на том потоке, где жил `Split` (бенч-поток),
+// а `grow_fallback` зовётся из worker-потоков — чанк кладётся в TLS одного
+// потока, а берётся (никогда) из TLS другого. В итоге каждый сэмпл divan'а
+// делал munmap всех fallback-чанков + десятки тысяч холодных page fault'ов
+// на следующем сэмпле. Замер (scale=3): arena_full/no-smt 24.4 мс против
+// 5.8 мс при чанке без fallback — fallback-путь съедал ~4x.
+//
+// Пул — процессный: чанки живут между bump'ами, сэмплами и потоками,
+// страницы остаются тёплыми. Ограничен по суммарному объёму (доля
+// физической RAM), лишнее — через `platform::free`. Под Miri пул выключен:
+// static, владеющий памятью на момент завершения процесса, попал бы в
+// проверку утечек; под Miri работает прежняя схема (TLS + free).
+#[cfg(not(miri))]
+static CHUNK_POOL: SpinMutex<ChunkPool> = SpinMutex::new(ChunkPool(Vec::new()));
+
+/// Обёртка над списком чанков пула. `RawAllocation` содержит `*mut u8` и
+/// поэтому `!Send`, но пул передаёт ВЛАДЕНИЕ чанком между потоками (под
+/// мьютексом, без параллельного доступа): забравший чанк становится
+/// единственным владельцем памяти. Разыменований из чужого потока нет —
+/// только возврат ОС (`platform::free`).
+#[cfg(not(miri))]
+struct ChunkPool(Vec<RawAllocation>);
+#[cfg(not(miri))]
+unsafe impl Send for ChunkPool {}
+
+/// Потолок суммарного объёма пула: 1/8 физической RAM, 128 МБ..1 ГБ.
+#[cfg(not(miri))]
+fn chunk_pool_cap() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        (platform::physical_memory_bytes() / 8).clamp(128 * 1024 * 1024, 1024 * 1024 * 1024)
+    })
+}
+
+/// Забрать из пула чанк размером не меньше `need` (первый подходящий).
+#[cfg(not(miri))]
+fn chunk_pool_take(need: usize) -> Option<RawAllocation> {
+    let mut pool = CHUNK_POOL.lock();
+    let idx = pool.0.iter().position(|a| a.size >= need)?;
+    Some(pool.0.remove(idx))
+}
+
+/// Вернуть чанк в пул; при переполнении пула — освободить через ОС.
+#[cfg(not(miri))]
+fn chunk_pool_put(a: RawAllocation) {
+    let mut pool = CHUNK_POOL.lock();
+    let used: usize = pool.0.iter().map(|c| c.size).sum();
+    if used + a.size <= chunk_pool_cap() {
+        pool.0.push(a);
+    } else {
+        drop(pool);
+        a.release();
+    }
+}
+
+/// Взять чанк для fallback-выдачи: thread-local кэш → глобальный пул → ОС.
+/// Счётчик реальных mmap'ов (`FALLBACK_MMAPS`, фича `tune`) растёт только
+/// на реальном обращении к ОС.
+#[inline]
+fn take_fallback_chunk(alloc_size: usize) -> RawAllocation {
+    if let Some(a) = FREED_CHUNK_CACHE.try_with(|c| c.take(alloc_size))
+        .ok()
+        .flatten()
+    {
+        return a;
+    }
+    #[cfg(not(miri))]
+    if let Some(a) = chunk_pool_take(alloc_size) {
+        return a;
+    }
+    #[cfg(feature = "tune")]
+    FALLBACK_MMAPS.fetch_add(1, Ordering::Relaxed);
+    platform::alloc_normal(alloc_size)
 }
 
 /// Запись о доноре в реестре: индекс в массиве bumps, его приоритет и флаг
@@ -1998,20 +2084,34 @@ impl Drop for ThreadBump {
     fn drop(&mut self) {
         // Первичный регион арены освобождает `SharedArena`; здесь — только
         // дополнительные fallback-чанки, выделенные «где-то в памяти».
-        // Самый последний (самый большой/свежий) чанк отдаём в thread-local
-        // кэш для мгновенного переиспользования этим же потоком (без
-        // `munmap` + нового `mmap` на следующей итерации бенча); остальные
-        // освобождаем через ОС.
-        let last = self.fallback.take_last_and_free_rest();
+        //
+        // Остальные чанки — в глобальный пул тёплых чанков (страницы
+        // остаются замапленными и переиспользуются следующим bump'ом без
+        // mmap и без холодных page fault'ов; под Mirи пул выключен —
+        // освобождаем через ОС). Самый последний (самый большой/свежий)
+        // чанк отдаём в thread-local кэш для мгновенного переиспользования
+        // этим же потоком.
+        let (last, rest) = self.fallback.take_chunks_for_reuse();
+        for a in rest {
+            #[cfg(not(miri))]
+            chunk_pool_put(a);
+            #[cfg(miri)]
+            a.release();
+        }
         if let Some(a) = last {
             // `try_with` может НЕ вызвать замыкание: если тред-локаль уже
             // удалена (поток завершается) или инициализация провалилась.
             // Раньше результат просто выбрасывался (`let _ = ...`) — чанк
             // терялся, и Miri репортил «memory leaked». Теперь при отказе
-            // освобождаем чанк напрямую через платформенный слой.
+            // отправляем чанк в пул (под Mirи — освобождаем напрямую).
             match FREED_CHUNK_CACHE.try_with(|c| c.put(a)) {
                 Ok(()) => {}
-                Err(_) => a.release(),
+                Err(_) => {
+                    #[cfg(not(miri))]
+                    chunk_pool_put(a);
+                    #[cfg(miri)]
+                    a.release();
+                }
             }
         }
     }
@@ -3271,8 +3371,21 @@ struct ZoneData {
 
 impl Drop for ZoneData {
     fn drop(&mut self) {
-        // Регион арены освобождает владелец; здесь — только fallback-чанки.
-        let _ = self.fallback.take_last_and_free_rest();
+        // Регион арены освобождает владелец; здесь — только fallback-чанки:
+        // в глобальный пул тёплых чанков (под Miri — через ОС).
+        let (last, rest) = self.fallback.take_chunks_for_reuse();
+        for a in rest {
+            #[cfg(not(miri))]
+            chunk_pool_put(a);
+            #[cfg(miri)]
+            a.release();
+        }
+        if let Some(a) = last {
+            #[cfg(not(miri))]
+            chunk_pool_put(a);
+            #[cfg(miri)]
+            a.release();
+        }
     }
 }
 
@@ -7799,5 +7912,27 @@ mod tests {
         );
         drop(bump);
         drop(arena);
+    }
+
+    /// Регрессия (холодные fallback-чанки, пул): чанки умершего bump'а
+    /// обязаны попадать в глобальный пул и возвращаться из него по запросу.
+    /// Раньше чанки munmap'ились при смерти bump'а, а thread-local кэш не
+    /// работал (кладёт — бенч-поток, берёт — worker) — каждый сэмпл бенча
+    /// платил десятки тысяч холодных page fault'ов (arena_full/no-smt был
+    /// в ~4 раза медленнее: 24.4 мс против 5.8 мс на scale=3).
+    #[test]
+    #[cfg(not(miri))]
+    fn chunk_pool_roundtrip() {
+        // Размер 64 MiB уникален: fallback-чанки не больше 8 MiB
+        // (потолок `fallback_chunk_size`), поэтому параллельные тесты
+        // не могут подложить чанк такого размера — take вернёт ровно наш.
+        let sz = 64 * 1024 * 1024;
+        let a = platform::alloc_normal(sz);
+        chunk_pool_put(a);
+        let b = chunk_pool_take(sz).expect("чанк обязан вернуться из пула");
+        assert!(b.size >= sz);
+        b.release();
+        // Чанков >= 16 MiB в пуле быть не должно (см. выше про потолок 8 MiB).
+        assert!(chunk_pool_take(16 * 1024 * 1024).is_none());
     }
 }
