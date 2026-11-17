@@ -641,7 +641,7 @@ enum DonorReg {
     Orx(Arc<OrxRegistry>),
     /// Динамический список на boxcar::Vec — альтернативная реализация того же
     /// контракта (добавление/удаление в рантайме).
-    Boxcar(Arc<BoxcarVec<Donor>>),
+    Boxcar(Arc<BoxcarRegistry>),
 }
 
 /// orx-реестр доноров со счётчиком эпохи изменений (см. `DonorReg::Orx`).
@@ -650,6 +650,14 @@ struct OrxRegistry {
     /// Инкрементируется (Release) после каждого изменения реестра
     /// (`add_donor`/`remove_donor`); читатели (Acquire) по несовпадению
     /// перезаполняют свой снапшот-кэш.
+    epoch: AtomicUsize,
+}
+
+/// boxcar-реестр доноров со счётчиком эпохи изменений (аналог `OrxRegistry`:
+/// единый снапшот-кэш в `ThreadBump` для обоих динамических реестров).
+struct BoxcarRegistry {
+    vec: BoxcarVec<Donor>,
+    /// См. `OrxRegistry::epoch`.
     epoch: AtomicUsize,
 }
 
@@ -1807,7 +1815,10 @@ impl SharedArena {
                 for d in entries.iter() {
                     v.push(d.clone());
                 }
-                DonorReg::Boxcar(Arc::new(v))
+                DonorReg::Boxcar(Arc::new(BoxcarRegistry {
+                    vec: v,
+                    epoch: AtomicUsize::new(0),
+                }))
             }
         };
 
@@ -2651,58 +2662,86 @@ impl ThreadBump {
                     .donor_static_ptr
                     .expect("donor_static_ptr задаётся для DonorReg::Static");
                 let slice = unsafe { std::slice::from_raw_parts(ptr, self.donor_static_len) };
-                for d in slice {
-                    if d.idx == self.self_index {
-                        continue;
-                    }
-                    if let Some(p) = self.take_from_donor::<ALIGN>(d.idx, size) {
-                        return Some(p);
-                    }
-                }
-                None
+                self.scan_donors_slice::<ALIGN>(slice, size)
             }
             DonorReg::Orx(v) => {
                 // Снапшот-кэш реестра: сканируем orx (CAS на каждый элемент —
                 // см. `OrxRegistry`) только при смене реестра/эпохи; горячий
-                // путь клонирует дешёвые `Donor`-записи из своего снапшота.
-                // `take`/`set` — чтобы не держать заем на время скана; кэш
-                // возвращает на место после обхода (реентерности нет: скан
-                // не вызывает `try_take_from_donors` рекурсивно).
-                let reg = Arc::as_ptr(v) as usize;
-                let epoch = v.epoch.load(Ordering::Acquire);
-                let mut cache = self.donor_orx_cache.take();
-                if cache.reg != reg || cache.epoch != epoch {
-                    cache.reg = reg;
-                    cache.epoch = epoch;
-                    cache.donors.clear();
-                    cache.donors.extend(
+                // путь обходит снапшот ПО ССЫЛКЕ, без клонов.
+                self.take_from_registry_cached::<ALIGN, _>(
+                    Arc::as_ptr(v) as usize,
+                    v.epoch.load(Ordering::Acquire),
+                    size,
+                    |out| {
+                        out.extend(
+                            v.vec
+                                .iter()
+                                .map(|e| e.cloned())
+                                .filter(|d| !d.removed.load(Ordering::Relaxed)),
+                        );
+                    },
+                )
+            }
+            DonorReg::Boxcar(v) => self.take_from_registry_cached::<ALIGN, _>(
+                Arc::as_ptr(v) as usize,
+                v.epoch.load(Ordering::Acquire),
+                size,
+                |out| {
+                    out.extend(
                         v.vec
                             .iter()
-                            .map(|e| e.cloned())
-                            .filter(|d| !d.removed.load(Ordering::Relaxed)),
+                            .filter(|(_, d)| !d.removed.load(Ordering::Relaxed))
+                            .map(|(_, d)| d.clone()),
                     );
-                }
-                let res = self.take_from_registry::<ALIGN, _>(cache.donors.iter().cloned(), size);
-                self.donor_orx_cache.set(cache);
-                res
-            }
-            DonorReg::Boxcar(v) => {
-                self.take_from_registry::<ALIGN, _>(v.iter().map(|(_, d)| d.clone()), size)
-            }
+                },
+            ),
         }
     }
 
-    /// Обход динамического реестра (orx/boxcar). Без приоритета — первый
-    /// подходящий; с приоритетом — из доступных выбирается донор с минимальным
-    /// приоритетом (== высокоприоритетные берутся в последнюю очередь).
-    /// Логически удалённые (`removed`) доноры пропускаются.
+    /// Обход динамического реестра (orx/boxcar) со снапшот-кэшем
+    /// (`donor_orx_cache`): при несовпадении адреса реестра (Arc
+    /// переехал — новый бенч-сэмпл) или эпохи (изменение реестра) снапшот
+    /// перезаполняется через `refill`; сам обход — по ссылке на снапшот,
+    /// без клонов. `take`/`set` — чтобы не держать заем на время скана;
+    /// кэш возвращается на место после обхода (реентерности нет: скан
+    /// не вызывает `try_take_from_donors` рекурсивно).
     #[inline(always)]
-    fn take_from_registry<const ALIGN: usize, I>(&self, iter: I, size: usize) -> Option<*mut u8>
+    fn take_from_registry_cached<const ALIGN: usize, F>(
+        &self,
+        reg: usize,
+        epoch: usize,
+        size: usize,
+        refill: F,
+    ) -> Option<*mut u8>
     where
-        I: Iterator<Item = Donor>,
+        F: FnOnce(&mut Vec<Donor>),
     {
+        let mut cache = self.donor_orx_cache.take();
+        if cache.reg != reg || cache.epoch != epoch {
+            cache.reg = reg;
+            cache.epoch = epoch;
+            cache.donors.clear();
+            refill(&mut cache.donors);
+        }
+        let res = self.scan_donors_slice::<ALIGN>(&cache.donors, size);
+        self.donor_orx_cache.set(cache);
+        res
+    }
+
+    /// Обход списка доноров (`&[Donor]`). Без приоритета — первый подходящий;
+    /// с приоритетом — из доступных выбирается донор с минимальным
+    /// приоритетом (== высокоприоритетные берутся в последнюю очередь).
+    /// Логически удалённые (`removed`) доноры пропускаются (для снапшотов
+    /// динамических реестров удалённые отфильтрованы при наполнении — их
+    /// флаг всегда false).
+    #[inline(always)]
+    fn scan_donors_slice<const ALIGN: usize>(
+        &self,
+        donors: &[Donor],
+        size: usize,
+    ) -> Option<*mut u8> {
         if !self.use_priority {
-            for d in iter {
+            for d in donors {
                 if d.removed.load(Ordering::Relaxed) || d.idx == self.self_index {
                     continue;
                 }
@@ -2713,7 +2752,7 @@ impl ThreadBump {
             return None;
         }
         let mut best: Option<(u32, usize)> = None;
-        for d in iter {
+        for d in donors {
             if d.removed.load(Ordering::Relaxed) || d.idx == self.self_index {
                 continue;
             }
@@ -2831,16 +2870,19 @@ impl ThreadBump {
                 true
             }
             DonorReg::Boxcar(v) => {
-                if v.iter()
+                if v.vec
+                    .iter()
                     .any(|(_, d)| d.idx == idx && !d.removed.load(Ordering::Relaxed))
                 {
                     return false;
                 }
-                v.push(Donor {
+                v.vec.push(Donor {
                     idx,
                     priority,
                     removed: AtomicBool::new(false),
                 });
+                // Инвалидация снапшот-кэшей (см. `DonorReg::Orx`).
+                v.epoch.fetch_add(1, Ordering::Release);
                 true
             }
         }
@@ -2866,9 +2908,11 @@ impl ThreadBump {
                 false
             }
             DonorReg::Boxcar(v) => {
-                for (_, d) in v.iter() {
+                for (_, d) in v.vec.iter() {
                     if d.idx == idx && !d.removed.load(Ordering::Relaxed) {
                         d.removed.store(true, Ordering::Relaxed);
+                        // Инвалидация снапшот-кэшей (см. `DonorReg::Orx`).
+                        v.epoch.fetch_add(1, Ordering::Release);
                         return true;
                     }
                 }
