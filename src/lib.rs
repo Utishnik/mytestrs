@@ -629,10 +629,39 @@ enum DonorReg {
     Static,
     /// Динамический список на orx-concurrent-vec: доноры могут добавляться и
     /// удаляться в рантайме (lock-free push / логическое удаление).
-    Orx(Arc<OrxVec<Donor>>),
+    ///
+    /// Обёрнут в `OrxRegistry` со счётчиком эпохи: CAS-чтение элемента orx
+    /// (`cloned()` -> `spin_get_handle` — Acquire-RMW по state-байту элемента
+    /// и restore-CAS при освобождении) при обходе реестра на КАЖДОЙ аллокации
+    /// после исчерпания региона (сотни тысяч раз за раунд бенча) делало
+    /// donors_orx в 20-40 раз медленнее static-доноров: 16 потоков бьются
+    /// за кэш-линии state-байтов. Снапшот-кэш в `ThreadBump` (`OrxCache`)
+    /// перезаполняется только когда изменился реестр — `add_donor`/
+    /// `remove_donor` инкрементируют `epoch`.
+    Orx(Arc<OrxRegistry>),
     /// Динамический список на boxcar::Vec — альтернативная реализация того же
     /// контракта (добавление/удаление в рантайме).
     Boxcar(Arc<BoxcarVec<Donor>>),
+}
+
+/// orx-реестр доноров со счётчиком эпохи изменений (см. `DonorReg::Orx`).
+struct OrxRegistry {
+    vec: OrxVec<Donor>,
+    /// Инкрементируется (Release) после каждого изменения реестра
+    /// (`add_donor`/`remove_donor`); читатели (Acquire) по несовпадению
+    /// перезаполняют свой снапшот-кэш.
+    epoch: AtomicUsize,
+}
+
+/// Снапшот orx-реестра в `ThreadBump` (см. `DonorReg::Orx`). `reg` — адрес
+/// `Arc`-аллокации реестра (bump живёт в пределах одного реестра, но кэш
+/// переживает бенч-сэмплы с разными аренами — сверяемся по адресу); `donors`
+/// — снимок живых доноров на момент эпохи (`removed` отфильтрованы).
+#[derive(Default)]
+struct OrxCache {
+    reg: usize,
+    epoch: usize,
+    donors: Vec<Donor>,
 }
 
 /// Какое хранилище списка доноров использовать.
@@ -1473,6 +1502,7 @@ impl SharedArena {
                     donor_bump: None,
                     use_priority: false,
                     base_chunk: fallback_chunk_size(chunk_size),
+                    donor_orx_cache: Cell::new(OrxCache::default()),
                     fallback: FallbackChunks::new(),
                 })
             })
@@ -1535,6 +1565,7 @@ impl SharedArena {
                     donor_bump: None,
                     use_priority: false,
                     base_chunk: fallback_chunk_size(chunk_size),
+                    donor_orx_cache: Cell::new(OrxCache::default()),
                     fallback: FallbackChunks::new(),
                 })
             })
@@ -1595,6 +1626,7 @@ impl SharedArena {
                         donor_bump: None,
                         use_priority: false,
                         base_chunk: fallback_chunk_size(chunk_size),
+                        donor_orx_cache: Cell::new(OrxCache::default()),
                         fallback: FallbackChunks::new(),
                     })
                 } else {
@@ -1623,6 +1655,7 @@ impl SharedArena {
                         donor_bump: None,
                         use_priority: false,
                         base_chunk: fallback_chunk_size(chunk_size),
+                        donor_orx_cache: Cell::new(OrxCache::default()),
                         fallback: FallbackChunks::new(),
                     })
                 }
@@ -1764,7 +1797,10 @@ impl SharedArena {
                 for d in entries.iter() {
                     v.push(d.clone());
                 }
-                DonorReg::Orx(Arc::new(v))
+                DonorReg::Orx(Arc::new(OrxRegistry {
+                    vec: v,
+                    epoch: AtomicUsize::new(0),
+                }))
             }
             DonorListKind::Boxcar => {
                 let v: BoxcarVec<Donor> = BoxcarVec::with_capacity(num_donors);
@@ -1800,6 +1836,7 @@ impl SharedArena {
                     donor_bump: donor_bump.clone(),
                     use_priority: policy.use_priority,
                     base_chunk: fallback_chunk_size(chunk_size),
+                    donor_orx_cache: Cell::new(OrxCache::default()),
                     fallback: FallbackChunks::new(),
                 })
             })
@@ -2047,6 +2084,10 @@ pub struct ThreadBump {
     /// только доноров (статичный или динамический), чтобы при переполнении не
     /// перебирать ВСЕ bumps и не проверять каждый на `can_give`.
     donor_reg: DonorReg,
+    /// Снапшот-кэш orx-реестра (см. `OrxCache`): CAS-чтение orx на каждой
+    /// аллокации — узкое место, поэтому реестр сканируется в снапшот только
+    /// при изменении эпохи, горячий путь ходит по кэшу.
+    donor_orx_cache: Cell<OrxCache>,
     /// Указатель на плоский срез доноров (для `DonorReg::Static`). Память
     /// выделена в `bumpalo::Bump` (`donor_bump`), поэтому это НЕ глобальный
     /// аллокатор и НЕ `Arc`. Валиден, пока жив `donor_bump`.
@@ -2621,7 +2662,29 @@ impl ThreadBump {
                 None
             }
             DonorReg::Orx(v) => {
-                self.take_from_registry::<ALIGN, _>(v.iter().map(|e| e.cloned()), size)
+                // Снапшот-кэш реестра: сканируем orx (CAS на каждый элемент —
+                // см. `OrxRegistry`) только при смене реестра/эпохи; горячий
+                // путь клонирует дешёвые `Donor`-записи из своего снапшота.
+                // `take`/`set` — чтобы не держать заем на время скана; кэш
+                // возвращает на место после обхода (реентерности нет: скан
+                // не вызывает `try_take_from_donors` рекурсивно).
+                let reg = Arc::as_ptr(v) as usize;
+                let epoch = v.epoch.load(Ordering::Acquire);
+                let mut cache = self.donor_orx_cache.take();
+                if cache.reg != reg || cache.epoch != epoch {
+                    cache.reg = reg;
+                    cache.epoch = epoch;
+                    cache.donors.clear();
+                    cache.donors.extend(
+                        v.vec
+                            .iter()
+                            .map(|e| e.cloned())
+                            .filter(|d| !d.removed.load(Ordering::Relaxed)),
+                    );
+                }
+                let res = self.take_from_registry::<ALIGN, _>(cache.donors.iter().cloned(), size);
+                self.donor_orx_cache.set(cache);
+                res
             }
             DonorReg::Boxcar(v) => {
                 self.take_from_registry::<ALIGN, _>(v.iter().map(|(_, d)| d.clone()), size)
@@ -2752,17 +2815,19 @@ impl ThreadBump {
         match &self.donor_reg {
             DonorReg::None | DonorReg::Static => false,
             DonorReg::Orx(v) => {
-                if v.iter().any(|e| {
+                if v.vec.iter().any(|e| {
                     let d = e.cloned();
                     d.idx == idx && !d.removed.load(Ordering::Relaxed)
                 }) {
                     return false;
                 }
-                v.push(Donor {
+                v.vec.push(Donor {
                     idx,
                     priority,
                     removed: AtomicBool::new(false),
                 });
+                // Инвалидация снапшот-кэшей (см. `DonorReg::Orx`).
+                v.epoch.fetch_add(1, Ordering::Release);
                 true
             }
             DonorReg::Boxcar(v) => {
@@ -2788,11 +2853,13 @@ impl ThreadBump {
         match &self.donor_reg {
             DonorReg::None | DonorReg::Static => false,
             DonorReg::Orx(v) => {
-                for e in v.iter() {
+                for e in v.vec.iter() {
                     let d = e.cloned();
                     if d.idx == idx && !d.removed.load(Ordering::Relaxed) {
                         // Помечаем живой элемент удалённым.
                         e.map(|x| x.removed.store(true, Ordering::Relaxed));
+                        // Инвалидация снапшот-кэшей (см. `DonorReg::Orx`).
+                        v.epoch.fetch_add(1, Ordering::Release);
                         return true;
                     }
                 }
@@ -3027,6 +3094,7 @@ impl ThreadBump {
             donor_bump: None,
             use_priority: false,
             base_chunk,
+            donor_orx_cache: Cell::new(OrxCache::default()),
             fallback: FallbackChunks::new(),
         }
     }
@@ -3065,6 +3133,7 @@ impl ThreadBump {
             donor_bump: None,
             use_priority,
             base_chunk,
+            donor_orx_cache: Cell::new(OrxCache::default()),
             fallback: FallbackChunks::new(),
         }
     }
@@ -3136,7 +3205,10 @@ impl ThreadBump {
         let base = self.ptr;
         let total = self.len;
         let chunk_size = split_chunk_step(total, n);
-        let shared: Arc<OrxVec<Donor>> = Arc::new(OrxVec::new());
+        let shared: Arc<OrxRegistry> = Arc::new(OrxRegistry {
+            vec: OrxVec::new(),
+            epoch: AtomicUsize::new(0),
+        });
         let mut children: Vec<CachePadded<ThreadBump>> = Vec::with_capacity(n);
         for i in 0..n {
             let start = i * chunk_size;
@@ -3176,7 +3248,10 @@ impl ThreadBump {
         assert!(!sizes.is_empty(), "split_donors_by_sizes: пустой список");
         let base = self.ptr;
         let total = self.len;
-        let shared: Arc<OrxVec<Donor>> = Arc::new(OrxVec::new());
+        let shared: Arc<OrxRegistry> = Arc::new(OrxRegistry {
+            vec: OrxVec::new(),
+            epoch: AtomicUsize::new(0),
+        });
         let mut children: Vec<CachePadded<ThreadBump>> = Vec::with_capacity(sizes.len());
         let mut start = 0usize;
         let last = sizes.len() - 1;
@@ -3342,6 +3417,7 @@ impl ThreadBump {
             donor_bump: None,
             use_priority: false,
             base_chunk: z.base_chunk,
+            donor_orx_cache: Cell::new(OrxCache::default()),
             fallback,
         }
     }
@@ -4094,9 +4170,9 @@ enum ArenaLayout {
     DonorsBoxcarPrio,
 }
 
-/// Единое тело бенчмарка shared-арены. `full` управляет объёмом работы
-/// (FULL: 200×200×100, LIGHT: 100×100×100), `layout` — направлением заполнения.
-/// Кэш арены бенчмарка между вызовами (см. `with_bench_arena`).
+// Единое тело бенчмарка shared-арены. `full` управляет объёмом работы
+// (FULL: 200×200×100, LIGHT: 100×100×100), `layout` — направлением заполнения.
+// Кэш арены бенчмарка между вызовами (см. `with_bench_arena`).
 thread_local! {
     static BENCH_ARENA: std::cell::RefCell<Option<(usize, SharedArena)>> =
         const { std::cell::RefCell::new(None) };
@@ -6953,6 +7029,61 @@ mod tests {
             }
             assert!(borrowed_any, "needy должен занять память у донора-соседа");
         }
+    }
+
+    /// Регрессия (orx-снапшот-кэш): `remove_donor`/`add_donor` инкрементируют
+    /// эпоху реестра, и снапшот в `ThreadBump` обязан перезаполняться. Раньше
+    /// (без кэша) корректность давала проверка `removed` на каждом элементе;
+    /// с кэшем без инвалидации по эпохе «залипший» снапшот продолжал бы
+    /// занимать у удалённого донора.
+    #[test]
+    #[cfg(not(miri))]
+    fn donors_orx_remove_invalidates_snapshot_cache() {
+        let (_arena, bump) = make_one(BumpDir::Forward, arena_scale(4096));
+        // [1024, 1024] — второй чанк берёт остаток региона; один — донор.
+        let children = bump.split_donors_by_sizes(&[1024usize, 1024], BumpDir::Forward);
+        let (d0, needy) = (&children[0], &children[1]);
+        let d0_range = d0.ptr as usize..d0.ptr as usize + d0.len;
+
+        // 1) Прогреваем снапшот-кэш needy: донор 0 отдаёт хотя бы один блок.
+        let mut warmed = false;
+        for _ in 0..2000usize {
+            let a = needy.alloc_raw::<8>(8) as usize;
+            if d0_range.contains(&a) {
+                warmed = true;
+                break;
+            }
+        }
+        assert!(warmed, "до remove_donor needy должен занимать у донора 0");
+
+        // 2) remove_donor инкрементирует эпоху — снапшот перезаполняется уже
+        //    без донора 0.
+        assert!(needy.remove_donor(0));
+
+        // 3) Ни один блок больше не приходит из донора 0: всё — свой регион
+        //    или fallback-чанки (вне региона донора).
+        for _ in 0..2000usize {
+            let a = needy.alloc_raw::<8>(8) as usize;
+            assert!(
+                !d0_range.contains(&a),
+                "после remove_donor блок не должен приходить от донора 0"
+            );
+        }
+
+        // 4) add_donor возвращает донора (новая эпоха) — заём возобновляется.
+        assert!(needy.add_donor(0, 0));
+        let mut borrowed_again = false;
+        for _ in 0..2000usize {
+            let a = needy.alloc_raw::<8>(8) as usize;
+            if d0_range.contains(&a) {
+                borrowed_again = true;
+                break;
+            }
+        }
+        assert!(
+            borrowed_again,
+            "после add_donor заём у донора 0 возобновляется"
+        );
     }
 
     #[test]
