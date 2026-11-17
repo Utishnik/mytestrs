@@ -1,3 +1,27 @@
+[В РАБОТЕ] прогнать полный bench.sh (scale=1) после пула чанков и обновить логи
+
+[РЕШЕНО] donors_orx / donors_orx_prio в 20-40 раз медленнее static-доноров.
+
+Причина: orx-concurrent-vec читает элемент через cloned() -> spin_get_handle —
+CAS-цикл (Acquire RMW) по state-байту элемента + restore-CAS. Скан реестра
+шёл на КАЖДОЙ аллокации после исчерпания региона (сотни тысяч раз за раунд),
+16 потоков бились за кэш-линии state-байтов (hot: atomic_compare_exchange::<u8>
+в pprof). boxcar не делает CAS на элемент — потому был в 20 раз быстрее.
+
+Фикс (коммиты b0106d3 + скан по ссылке):
+- OrxRegistry/BoxcarRegistry { vec, epoch: AtomicUsize } — add_donor/
+  remove_donor инкрементируют эпоху (Release), читатели — Acquire.
+- Снапшот-кэш реестра в ThreadBump (donor_orx_cache: Cell<OrxCache>:
+  адрес Arc + эпоха + снимок живых доноров). Горячий путь обходит снапшот
+  по ссылке (scan_donors_slice), CAS-чтение orx осталось только на пути
+  инвалидации.
+- Регрессионный тест donors_orx_remove_invalidates_snapshot_cache.
+
+Результат (scale=2, медианы): donors_orx FULL/no-smt 619.6 -> 50.7 мс,
+FULL/smt 2082 -> 122 мс, LIGHT 136.2 -> 13.9 / 489.8 -> 30.5 мс (x10-18).
+orx == boxcar; остаточный зазор к static-донорам (29/69 мс FULL) — цена
+снапшот-слоя динамического реестра как класса (у boxcar тот же зазор).
+
 [РЕШЕНО] почему mimalloc последний v3 обгоняет бамп алокаторы?
 
 Обгонял не аллокатор, а накладка каркаса бенча — в трёх местах:
