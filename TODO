@@ -1,3 +1,23 @@
+[РЕШЕНО] CPU-время: bumpalo vs mimalloc vs arena.
+
+`/usr/bin/time -v cargo bench` (scale=2, quick), 2 серии; берём сумму user+sys.
+
+FULL/smt (16 логических на 8 физических):
+  mimalloc: CPU 28.6 с при wall 2.34 с — 12.2 ядра заняты, ~1220% CPU;
+  bumpalo:  CPU 23.2 с при wall 2.03 с — 11.4 ядра, ~1130%;
+  arena:    CPU 12.2 с при wall 1.65 с —  7.4 ядра,  ~730%.
+Т.е. арена тратит вдвое меньше CPU и при этом приходит первой; bumpalo чуть
+экономнее mimalloc по CPU (~19%), но wall тот же. Sys-время (page faults,
+сегменты): mimalloc 9.5 с, bumpalo 7.1 с, arena 3.8 с.
+
+FULL/no-smt: mimalloc CPU 8.1 с / wall 1.55; bumpalo 6.0 / 1.15; arena 3.3 / 0.92.
+LIGHT/smt:   mimalloc 6.0 / 0.96; bumpalo 3.9 / 0.76; arena 2.0 / 0.75.
+LIGHT/no-smt:mimalloc 1.8 / 0.79; bumpalo 1.7 / 0.75; arena 0.85 / 0.56.
+
+Shared FULL/smt (сериализовано локом, один Bump): spin CPU 33.6 с при wall 4.3
+(7.8 ядра вхолостую), parking_lot 3.6 с при том же wall (0.84 ядра) — 9.4x
+меньше CPU при том же времени. LIGHT/smt: spin 5.0 с против parking 0.6 с.
+
 [РЕШЕНО] потребление памяти: bumpalo vs mimalloc vs arena.
 
 Мерили пиковый RSS через `/usr/bin/time -v cargo bench` (scale=2, quick), каждая
