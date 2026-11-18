@@ -13,8 +13,11 @@ Bump::with_capacity(70 МБ) на каждый сэмпл (16 потоков; sh
 shared-варианта; R3_BUMP_POOL=0 выключает пул для A/B.
 Замер (divan, scale=2, медианы): bump_scope_m/smt 105 -> 54-62 мс (mimalloc
 65.6), fastest 48-52 против 53-56 выкл.; bump_shared_m/smt 242 -> 168 мс
-(1.44x). Вывод: с тёплыми чанками bumpalo в FULL SMT больше не проигрывает
-mimalloc — проигрывал каркас, а не bump-аллокация.
+(1.44x). Подтверждено на run()-харнессе (bench.sh 1 --scale 2, FULL SMT):
+Bump 143.6 -> 54.1 мс, SharedBump 247.0 -> 169.2 мс, при MIMALOC 79.7 мс —
+bumpalo теперь быстрее mimalloc на 1.47x (арена dispatch 28.3 мс — быстрее
+всех в 1.9x). Вывод: с тёплыми чанками bumpalo в FULL SMT больше не
+проигрывает mimalloc — проигрывал каркас, а не bump-аллокация.
 
 [ОГРАНИЧЕНО] полный bench.sh scale=1 на этой машине невозможен — OOM.
 
