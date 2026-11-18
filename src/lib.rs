@@ -4050,6 +4050,58 @@ pub fn mimm_light(smt: bool) {
 }
 
 // --- Per-thread bumpalo ---
+
+/// Пул тёплых `Bump` для bumpalo-бенчмарка.
+///
+/// Без него каждый сэмпл создаёт по свежему `Bump::with_capacity(70 МБ)` на
+/// поток и роняет его: чанки уходят в глобальный аллокатор (mimalloc), а
+/// крупные блоки mimalloc отдаёт/декоммитит, так что следующий сэмпл снова
+/// платит first-touch по ~1.1 ГБ (замер на scale=2: 314 624 minor page fault
+/// и RSS 4.07 ГБ у bumpalo-бенча против 31 135/1.74 ГБ у mimalloc-бенча;
+/// FULL/smt 104.5 мс против 55.9 мс). Переиспользование `Bump` через
+/// `reset()` — штатный паттерн bumpalo, и оно выравнивает условия сравнения:
+/// mimalloc-бенч тоже переиспользует освобождённые блоки.
+///
+/// Храним пары (запрошенная ёмкость первого чанка, bump): full/light идут с
+/// разными PGO-размерами, смешивать их нельзя — иначе поедет начальная
+/// ёмкость и чистота замера.
+static BUMP_BENCH_POOL: SpinMutex<Vec<(usize, Bump)>> = SpinMutex::new(Vec::new());
+
+/// Пул включён по умолчанию; `R3_BUMP_POOL=0` его выключает (для A/B-замеров
+/// вклада first-touch по чанкам).
+fn bump_pool_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("R3_BUMP_POOL")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Взять тёплый `Bump` c первым чанком ровно `chunk_size` (иначе — новый).
+fn take_bench_bump(chunk_size: usize) -> Bump {
+    if !bump_pool_enabled() {
+        return Bump::with_capacity(chunk_size);
+    }
+    let mut pool = BUMP_BENCH_POOL.lock();
+    if let Some(pos) = pool.iter().position(|(cap, _)| *cap == chunk_size) {
+        return pool.swap_remove(pos).1;
+    }
+    drop(pool);
+    Bump::with_capacity(chunk_size)
+}
+
+/// Вернуть `Bump` в пул (после `reset()`; чанки остаются аллоцированными).
+fn put_bench_bump(chunk_size: usize, bump: Bump) {
+    if !bump_pool_enabled() {
+        return;
+    }
+    let mut pool = BUMP_BENCH_POOL.lock();
+    if pool.len() < 64 {
+        pool.push((chunk_size, bump));
+    }
+}
+
 #[cfg_attr(coverage, coverage(off))]
 pub fn bump_scope_m(chunk_size: usize, smt: bool) {
     let core_ids = get_cores(smt);
@@ -4058,7 +4110,7 @@ pub fn bump_scope_m(chunk_size: usize, smt: bool) {
         for core_id in core_ids.iter() {
             s2.spawn(move || {
                 core_affinity::set_for_current(*core_id);
-                let mut bump = Bump::with_capacity(chunk_size);
+                let mut bump = take_bench_bump(chunk_size);
                 for _ in 0..(3 / s).max(1) {
                     let capacity = 4 * 100 * (100 / s).max(1);
                     let mut vectr = BumpVec::with_capacity_in(capacity, &bump);
@@ -4075,6 +4127,7 @@ pub fn bump_scope_m(chunk_size: usize, smt: bool) {
                     drop(vectr); // <-- сброс vectr
                     bump.reset(); // теперь можно сбросить
                 }
+                put_bench_bump(chunk_size, bump);
             });
         }
     });
@@ -4088,7 +4141,7 @@ pub fn bump_scope_m_light(chunk_size: usize, smt: bool) {
         for core_id in core_ids.iter() {
             s2.spawn(move || {
                 core_affinity::set_for_current(*core_id);
-                let mut bump = Bump::with_capacity(chunk_size);
+                let mut bump = take_bench_bump(chunk_size);
                 for _ in 0..(3 / s).max(1) {
                     let capacity = 100 * (100 / s).max(1);
                     let mut vectr = BumpVec::with_capacity_in(capacity, &bump);
@@ -4105,12 +4158,41 @@ pub fn bump_scope_m_light(chunk_size: usize, smt: bool) {
                     drop(vectr);
                     bump.reset();
                 }
+                put_bench_bump(chunk_size, bump);
             });
         }
     });
 }
 
 // --- Shared bump + spinmutex ---
+
+/// Слот тёплого `Bump` для shared-бенчмарка (`Bump::with_capacity(2.24 ГБ)`
+/// на каждый сэмпл — та же проблема, что и у per-thread: если буфер отдаётся
+/// ОС, следующий сэмпл снова платит first-touch по гигабайтам). Один слот:
+/// shared-бенч держит ровно один bump, и размеры full/light чередуются.
+static SHARED_BUMP_POOL: SpinMutex<Option<(usize, Arc<SpinMutex<Bump>>)>> = SpinMutex::new(None);
+
+fn take_shared_bump(total: usize) -> Arc<SpinMutex<Bump>> {
+    if !bump_pool_enabled() {
+        return Arc::new(SpinMutex::new(Bump::with_capacity(total)));
+    }
+    match SHARED_BUMP_POOL.lock().take() {
+        Some((cap, b)) if cap == total => b,
+        Some((_, b)) => {
+            drop(b);
+            Arc::new(SpinMutex::new(Bump::with_capacity(total)))
+        }
+        None => Arc::new(SpinMutex::new(Bump::with_capacity(total))),
+    }
+}
+
+fn put_shared_bump(total: usize, bump: Arc<SpinMutex<Bump>>) {
+    if !bump_pool_enabled() {
+        return;
+    }
+    *SHARED_BUMP_POOL.lock() = Some((total, bump));
+}
+
 #[cfg_attr(coverage, coverage(off))]
 fn do_work_full(bump: &Bump) {
     let s = bench_scale();
@@ -4150,7 +4232,7 @@ pub fn bump_shared_m(chunk_size: usize, smt: bool) {
     let core_ids = get_cores(smt);
     let s = bench_scale();
     let total = chunk_size * core_ids.len() * 2;
-    let shared = Arc::new(SpinMutex::new(Bump::with_capacity(total)));
+    let shared = take_shared_bump(total);
 
     std::thread::scope(|sc| {
         for core_id in core_ids.iter() {
@@ -4165,6 +4247,7 @@ pub fn bump_shared_m(chunk_size: usize, smt: bool) {
             });
         }
     });
+    put_shared_bump(total, shared);
 }
 
 #[cfg_attr(coverage, coverage(off))]
@@ -4172,7 +4255,7 @@ pub fn bump_shared_m_light(chunk_size: usize, smt: bool) {
     let core_ids = get_cores(smt);
     let s = bench_scale();
     let total = chunk_size * core_ids.len() * 2;
-    let shared = Arc::new(SpinMutex::new(Bump::with_capacity(total)));
+    let shared = take_shared_bump(total);
 
     std::thread::scope(|sc| {
         for core_id in core_ids.iter() {
@@ -4187,6 +4270,7 @@ pub fn bump_shared_m_light(chunk_size: usize, smt: bool) {
             });
         }
     });
+    put_shared_bump(total, shared);
 }
 
 // --- Shared arena (single big buffer) ---
