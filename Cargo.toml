@@ -19,6 +19,7 @@ orx-concurrent-vec = "4"
 boxcar = "0.2"
 triomphe = "0.1"
 branches = { version = "0.5.0", features = ["prefetch"] }
+parking_lot = "0.13.0"
 
 [features]
 default = ["alloc-mimalloc"]

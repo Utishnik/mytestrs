@@ -95,6 +95,31 @@ fn bump_shared_m_light_no_smt() {
     bump_shared_m_light(lb, false);
 }
 
+// ---------------- Shared bump + parking_lot::Mutex ----------------
+#[divan::bench(name = "bump_shared_parking_m/smt", sample_count = RUNS)]
+fn bump_shared_parking_m_smt() {
+    let (fb, _, _, _) = pgo();
+    bump_shared_parking_m(fb, true);
+}
+
+#[divan::bench(name = "bump_shared_parking_m/no-smt", sample_count = RUNS)]
+fn bump_shared_parking_m_no_smt() {
+    let (fb, _, _, _) = pgo();
+    bump_shared_parking_m(fb, false);
+}
+
+#[divan::bench(name = "bump_shared_parking_m_light/smt", sample_count = RUNS)]
+fn bump_shared_parking_m_light_smt() {
+    let (_, lb, _, _) = pgo();
+    bump_shared_parking_m_light(lb, true);
+}
+
+#[divan::bench(name = "bump_shared_parking_m_light/no-smt", sample_count = RUNS)]
+fn bump_shared_parking_m_light_no_smt() {
+    let (_, lb, _, _) = pgo();
+    bump_shared_parking_m_light(lb, false);
+}
+
 // ---------------- Shared arena (single big buffer) ----------------
 #[divan::bench(name = "arena_full/smt", sample_count = RUNS)]
 fn arena_full_smt() {

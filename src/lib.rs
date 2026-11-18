@@ -3961,6 +3961,7 @@ pub use typed_arena::Arena;
 use bumpalo::Bump;
 use bumpalo::collections::String as BumpString;
 use bumpalo::collections::Vec as BumpVec;
+use parking_lot::Mutex as ParkingMutex;
 use spin::Mutex as SpinMutex;
 
 #[cfg(all(not(miri), feature = "alloc-mimalloc"))]
@@ -4271,6 +4272,85 @@ pub fn bump_shared_m_light(chunk_size: usize, smt: bool) {
         }
     });
     put_shared_bump(total, shared);
+}
+
+// --- Shared bump + parking_lot::Mutex ---
+
+/// Слот тёплого `Bump` для parking_lot-варианта (та же проблема first-touch,
+/// что у `SHARED_BUMP_POOL`; слот отдельный из-за другого типа мьютекса).
+static SHARED_PARKING_BUMP_POOL: SpinMutex<Option<(usize, Arc<ParkingMutex<Bump>>)>> =
+    SpinMutex::new(None);
+
+fn take_shared_parking_bump(total: usize) -> Arc<ParkingMutex<Bump>> {
+    if !bump_pool_enabled() {
+        return Arc::new(ParkingMutex::new(Bump::with_capacity(total)));
+    }
+    match SHARED_PARKING_BUMP_POOL.lock().take() {
+        Some((cap, b)) if cap == total => b,
+        Some((_, b)) => {
+            drop(b);
+            Arc::new(ParkingMutex::new(Bump::with_capacity(total)))
+        }
+        None => Arc::new(ParkingMutex::new(Bump::with_capacity(total))),
+    }
+}
+
+fn put_shared_parking_bump(total: usize, bump: Arc<ParkingMutex<Bump>>) {
+    if !bump_pool_enabled() {
+        return;
+    }
+    *SHARED_PARKING_BUMP_POOL.lock() = Some((total, bump));
+}
+
+/// Тот же shared-бенч, что `bump_shared_m`, но под `parking_lot::Mutex`:
+/// адаптивный спин с парковкой/разбудом потоков ОС. При длинной критической
+/// секции (весь раунд нагрузки) ожидающий поток засыпает, а не жжёт ядро —
+/// сравнение с чистым `spin::Mutex`, который при 16 потоках на 8 физических
+/// ядрах крутится вхолостую.
+#[cfg_attr(coverage, coverage(off))]
+pub fn bump_shared_parking_m(chunk_size: usize, smt: bool) {
+    let core_ids = get_cores(smt);
+    let s = bench_scale();
+    let total = chunk_size * core_ids.len() * 2;
+    let shared = take_shared_parking_bump(total);
+
+    std::thread::scope(|sc| {
+        for core_id in core_ids.iter() {
+            let shared = Arc::clone(&shared);
+            sc.spawn(move || {
+                core_affinity::set_for_current(*core_id);
+                for _ in 0..(3 / s).max(1) {
+                    let mut guard = shared.lock();
+                    do_work_full(&guard);
+                    guard.reset();
+                }
+            });
+        }
+    });
+    put_shared_parking_bump(total, shared);
+}
+
+#[cfg_attr(coverage, coverage(off))]
+pub fn bump_shared_parking_m_light(chunk_size: usize, smt: bool) {
+    let core_ids = get_cores(smt);
+    let s = bench_scale();
+    let total = chunk_size * core_ids.len() * 2;
+    let shared = take_shared_parking_bump(total);
+
+    std::thread::scope(|sc| {
+        for core_id in core_ids.iter() {
+            let shared = Arc::clone(&shared);
+            sc.spawn(move || {
+                core_affinity::set_for_current(*core_id);
+                for _ in 0..(3 / s).max(1) {
+                    let mut guard = shared.lock();
+                    do_work_light(&guard);
+                    guard.reset();
+                }
+            });
+        }
+    });
+    put_shared_parking_bump(total, shared);
 }
 
 // --- Shared arena (single big buffer) ---
@@ -6026,6 +6106,8 @@ fn run_benchmarks(
         bump_scope_m_light(pgo_light_bump, smt);
         bump_shared_m(pgo_full_bump, smt);
         bump_shared_m_light(pgo_light_bump, smt);
+        bump_shared_parking_m(pgo_full_bump, smt);
+        bump_shared_parking_m_light(pgo_light_bump, smt);
         arena_full(pgo_full_arena, smt);
         arena_light(pgo_light_arena, smt);
     }
@@ -6053,31 +6135,41 @@ fn run_benchmarks(
                 start.elapsed().as_micros()
             })
             .collect();
+        let shared_parking_times: Vec<u128> = (0..(10 / sc).max(1))
+            .map(|_| {
+                let start = std::time::Instant::now();
+                bump_shared_parking_m(pgo_full_bump, smt);
+                start.elapsed().as_micros()
+            })
+            .collect();
         let (arena_mono_us, arena_disp_us) = arena_full_res(pgo_full_arena);
 
         match style {
             BenchStyle::Mono => println!(
-                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena(mono) = {} µs",
+                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, SharedParking = {} µs, Arena(mono) = {} µs",
                 round + 1,
                 median(&mimm_times),
                 median(&bump_times),
                 median(&shared_times),
+                median(&shared_parking_times),
                 arena_mono_us
             ),
             BenchStyle::Dispatch => println!(
-                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena(dispatch) = {} µs",
+                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, SharedParking = {} µs, Arena(dispatch) = {} µs",
                 round + 1,
                 median(&mimm_times),
                 median(&bump_times),
                 median(&shared_times),
+                median(&shared_parking_times),
                 arena_disp_us
             ),
             BenchStyle::Both => println!(
-                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena mono|dispatch = {}|{} µs",
+                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, SharedParking = {} µs, Arena mono|dispatch = {}|{} µs",
                 round + 1,
                 median(&mimm_times),
                 median(&bump_times),
                 median(&shared_times),
+                median(&shared_parking_times),
                 arena_mono_us,
                 arena_disp_us
             ),
@@ -6107,31 +6199,41 @@ fn run_benchmarks(
                 start.elapsed().as_micros()
             })
             .collect();
+        let shared_parking_times: Vec<u128> = (0..(10 / sc).max(1))
+            .map(|_| {
+                let start = std::time::Instant::now();
+                bump_shared_parking_m_light(pgo_light_bump, smt);
+                start.elapsed().as_micros()
+            })
+            .collect();
         let (arena_mono_us, arena_disp_us) = arena_light_res(pgo_light_arena);
 
         match style {
             BenchStyle::Mono => println!(
-                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena(mono) = {} µs",
+                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, SharedParking = {} µs, Arena(mono) = {} µs",
                 round + 1,
                 median(&mimm_times),
                 median(&bump_times),
                 median(&shared_times),
+                median(&shared_parking_times),
                 arena_mono_us
             ),
             BenchStyle::Dispatch => println!(
-                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena(dispatch) = {} µs",
+                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, SharedParking = {} µs, Arena(dispatch) = {} µs",
                 round + 1,
                 median(&mimm_times),
                 median(&bump_times),
                 median(&shared_times),
+                median(&shared_parking_times),
                 arena_disp_us
             ),
             BenchStyle::Both => println!(
-                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, Arena mono|dispatch = {}|{} µs",
+                "Round {}: MIMALOC = {} µs, Bump = {} µs, SharedBump = {} µs, SharedParking = {} µs, Arena mono|dispatch = {}|{} µs",
                 round + 1,
                 median(&mimm_times),
                 median(&bump_times),
                 median(&shared_times),
+                median(&shared_parking_times),
                 arena_mono_us,
                 arena_disp_us
             ),

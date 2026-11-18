@@ -21,69 +21,69 @@ PGO arena light: 14 MB
 ########## Бенч: SMT (all logical cores) ##########
 
 === FULL VERSION (SMT (all logical cores)) — style Both ===
-Round 1: MIMALOC = 79681 µs, Bump = 54089 µs, SharedBump = 169241 µs, Arena mono|dispatch = 48165|28261 µs
+Round 1: MIMALOC = 303149 µs, Bump = 53589 µs, SharedBump = 164482 µs, SharedParking = 140524 µs, Arena mono|dispatch = 58536|39930 µs
 
 === LIGHT VERSION (SMT (all logical cores)) — style Both ===
-Round 1: MIMALOC = 26101 µs, Bump = 15141 µs, SharedBump = 33077 µs, Arena mono|dispatch = 9825|8652 µs
+Round 1: MIMALOC = 18762 µs, Bump = 15348 µs, SharedBump = 41279 µs, SharedParking = 35736 µs, Arena mono|dispatch = 13818|9032 µs
 
 ########## Бенч: NO SMT (physical cores only) ##########
 
 === FULL VERSION (NO SMT (physical cores only)) — style Both ===
-Round 1: MIMALOC = 60920 µs, Bump = 26785 µs, SharedBump = 72743 µs, Arena mono|dispatch = 19987|15106 µs
+Round 1: MIMALOC = 105933 µs, Bump = 30739 µs, SharedBump = 94077 µs, SharedParking = 72639 µs, Arena mono|dispatch = 20138|17260 µs
 
 === LIGHT VERSION (NO SMT (physical cores only)) — style Both ===
-Round 1: MIMALOC = 10599 µs, Bump = 7905 µs, SharedBump = 17976 µs, Arena mono|dispatch = 5263|5373 µs
+Round 1: MIMALOC = 18025 µs, Bump = 8138 µs, SharedBump = 14522 µs, SharedParking = 15124 µs, Arena mono|dispatch = 5664|4845 µs
 
 ########## Directional Arena: SMT (all logical cores) ##########
 
 === Directional FULL (SMT (all logical cores)) — style Both ===
-  Forward      mono  28752 µs | dispatch  27078 µs
-  Backward     mono  29998 µs | dispatch  26543 µs
-  MiddleOut    mono  25710 µs | dispatch  26024 µs
-  Neighbors    mono 144847 µs | dispatch  26652 µs
-  Pair         mono 172878 µs | dispatch  29233 µs
-  Donors       mono  78540 µs | dispatch  64755 µs
-  DonorsPrio   mono  75350 µs | dispatch  77360 µs
-  DonorsOrx    mono 122937 µs | dispatch 133256 µs
-  DonorsOrxPrio mono 133805 µs | dispatch 127820 µs
-  DonorsBoxcar mono 120203 µs | dispatch 117480 µs
-  DonorsBoxcarPrio mono 133931 µs | dispatch 122257 µs
+  Forward      mono  29762 µs | dispatch  29786 µs
+  Backward     mono  27505 µs | dispatch  29658 µs
+  MiddleOut    mono  29369 µs | dispatch  27402 µs
+  Neighbors    mono 183482 µs | dispatch  33021 µs
+  Pair         mono 205765 µs | dispatch  49982 µs
+  Donors       mono  77187 µs | dispatch  71432 µs
+  DonorsPrio   mono  82452 µs | dispatch  75650 µs
+  DonorsOrx    mono 120158 µs | dispatch 122996 µs
+  DonorsOrxPrio mono 139475 µs | dispatch 135555 µs
+  DonorsBoxcar mono 119855 µs | dispatch 122780 µs
+  DonorsBoxcarPrio mono 144273 µs | dispatch 128481 µs
 === Directional LIGHT (SMT (all logical cores)) — style Both ===
-  Forward      mono   8650 µs | dispatch   7583 µs
-  Backward     mono   9086 µs | dispatch   8539 µs
-  MiddleOut    mono   9200 µs | dispatch   7957 µs
-  Neighbors    mono  38120 µs | dispatch   8275 µs
-  Pair         mono  34686 µs | dispatch  11418 µs
-  Donors       mono  19602 µs | dispatch  21071 µs
-  DonorsPrio   mono  26781 µs | dispatch  27313 µs
-  DonorsOrx    mono  32296 µs | dispatch  32097 µs
-  DonorsOrxPrio mono  40596 µs | dispatch  38632 µs
-  DonorsBoxcar mono  31617 µs | dispatch  29929 µs
-  DonorsBoxcarPrio mono  36854 µs | dispatch  37180 µs
+  Forward      mono  10613 µs | dispatch   7962 µs
+  Backward     mono  10610 µs | dispatch  10789 µs
+  MiddleOut    mono  11805 µs | dispatch   8881 µs
+  Neighbors    mono  37967 µs | dispatch  10625 µs
+  Pair         mono  39981 µs | dispatch  11951 µs
+  Donors       mono  28504 µs | dispatch  26274 µs
+  DonorsPrio   mono  30041 µs | dispatch  30461 µs
+  DonorsOrx    mono  35154 µs | dispatch  34216 µs
+  DonorsOrxPrio mono  40006 µs | dispatch  36771 µs
+  DonorsBoxcar mono  30296 µs | dispatch  32318 µs
+  DonorsBoxcarPrio mono  34319 µs | dispatch  41314 µs
 
 ########## Directional Arena: NO SMT (physical cores only) ##########
 
 === Directional FULL (NO SMT (physical cores only)) — style Both ===
-  Forward      mono  18529 µs | dispatch  15352 µs
-  Backward     mono  16179 µs | dispatch  16204 µs
-  MiddleOut    mono  15549 µs | dispatch  16511 µs
-  Neighbors    mono  84655 µs | dispatch  15725 µs
-  Pair         mono  80196 µs | dispatch  21375 µs
-  Donors       mono  32119 µs | dispatch  26745 µs
-  DonorsPrio   mono  34164 µs | dispatch  35173 µs
-  DonorsOrx    mono  54926 µs | dispatch  50387 µs
-  DonorsOrxPrio mono  56966 µs | dispatch  53816 µs
-  DonorsBoxcar mono  57629 µs | dispatch  50094 µs
-  DonorsBoxcarPrio mono  56222 µs | dispatch  53050 µs
+  Forward      mono  16197 µs | dispatch  14788 µs
+  Backward     mono  16721 µs | dispatch  18091 µs
+  MiddleOut    mono  19666 µs | dispatch  17761 µs
+  Neighbors    mono  85060 µs | dispatch  15762 µs
+  Pair         mono  85732 µs | dispatch  21629 µs
+  Donors       mono  32325 µs | dispatch  27106 µs
+  DonorsPrio   mono  33359 µs | dispatch  33364 µs
+  DonorsOrx    mono  55352 µs | dispatch  50684 µs
+  DonorsOrxPrio mono  54307 µs | dispatch  52743 µs
+  DonorsBoxcar mono  54541 µs | dispatch  49725 µs
+  DonorsBoxcarPrio mono  55775 µs | dispatch  54202 µs
 === Directional LIGHT (NO SMT (physical cores only)) — style Both ===
-  Forward      mono   5309 µs | dispatch   4895 µs
-  Backward     mono   5315 µs | dispatch   5101 µs
-  MiddleOut    mono   5208 µs | dispatch   5557 µs
-  Neighbors    mono  19529 µs | dispatch   4780 µs
-  Pair         mono  20327 µs | dispatch   6316 µs
-  Donors       mono   9481 µs | dispatch  10310 µs
-  DonorsPrio   mono  10776 µs | dispatch  10568 µs
-  DonorsOrx    mono  13866 µs | dispatch  13677 µs
-  DonorsOrxPrio mono  15055 µs | dispatch  14289 µs
-  DonorsBoxcar mono  14457 µs | dispatch  13557 µs
-  DonorsBoxcarPrio mono  14671 µs | dispatch  13705 µs
+  Forward      mono   7007 µs | dispatch   5108 µs
+  Backward     mono   5604 µs | dispatch   6638 µs
+  MiddleOut    mono   6497 µs | dispatch   6356 µs
+  Neighbors    mono  21122 µs | dispatch   4948 µs
+  Pair         mono  21690 µs | dispatch   6214 µs
+  Donors       mono  12128 µs | dispatch  12939 µs
+  DonorsPrio   mono  12926 µs | dispatch  14952 µs
+  DonorsOrx    mono  15362 µs | dispatch  15346 µs
+  DonorsOrxPrio mono  15486 µs | dispatch  15643 µs
+  DonorsBoxcar mono  14605 µs | dispatch  13960 µs
+  DonorsBoxcarPrio mono  14685 µs | dispatch  13927 µs
