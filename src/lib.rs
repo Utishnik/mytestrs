@@ -4280,10 +4280,37 @@ pub fn arena_light_donors_boxcar_prio(chunk_size: usize, smt: bool) {
 /// они занимают до 80% физической памяти (остальное — системе и остальным
 /// процессам): `phys * 0.8 / threads`. На 16-поточной машине с 13 GB RAM без
 /// ограничения PGO выдавал чанки по 750 MB и commit charge доходил до 12 GB.
+///
+/// Бюджет поднимается со старых 4/5 (80%) до 4/4 (100%): при половинных чанках
+/// 80% хватало с запасом, но теперь bumpalo и арена просят чанк ПОД НАГРУЗКУ
+/// (см. `profile_bump_chunk_size_*`), и на машинах, где `need` близок к лимиту,
+/// старый кап резал бы покрытие пополам ровно в тот момент, когда это снова
+/// начинало стоить второго чанка роста (т.е. воспроизводило бы проблему).
+/// Реальная защита от свопинга — не этот кап, а `R3_BENCH_SCALE` (меньше
+/// нагрузка -> меньше need) и выбор минимального подходящего кандидата в
+/// автотюне.
 fn pgo_chunk_cap() -> usize {
     let threads = num_cpus::get().max(1);
-    let phys = platform::physical_memory_bytes();
-    phys.saturating_mul(4) / (threads * 5)
+    phys_mem_budget_bytes().saturating_mul(4) / (threads * 4)
+}
+
+/// Бюджет физической памяти машины в байтах: `platform::physical_memory_bytes()`,
+/// но с возможностью понизить его через `R3_MEM_LIMIT_MB=N` — нужно для
+/// корректного автотюна в контейнерах/под cgroup, где sysconf отдаёт память
+/// хоста и сетка кандидатов уходит за реальный лимит (OOM вместо замера).
+fn phys_mem_budget_bytes() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    let mb = 1024 * 1024;
+    *LIMIT.get_or_init(|| {
+        let phys = platform::physical_memory_bytes();
+        std::env::var("R3_MEM_LIMIT_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .map(|m| m * mb)
+            .unwrap_or(phys)
+            .min(phys)
+    })
 }
 
 /// Округление вверх до мегабайта.
@@ -4291,8 +4318,27 @@ fn round_up_mb(bytes: usize) -> usize {
     ((bytes + (1024 * 1024 - 1)) / (1024 * 1024)) * (1024 * 1024)
 }
 
+/// Override per-thread чанка bumpalo из `R3_BUMP_CHUNK_MB=N` (МБ). Симметрично
+/// `arena_chunk_override`: нужен для прогонов «чанк под нагрузку» — вручную
+/// заданный крупный чанк убирает рост bumpalo посреди бенча (второй чанк на
+/// поток = лишние ~100 МБ закоммиченной памяти на ядро, см. отчёт по RSS).
+/// Значение читается при каждом вызове (не кешируется в `OnceLock`), потому
+/// что автоподбор (`bump_tune_scan`) меняет переменную между кандидатурами.
+/// Чтение env — редкий путь (только инициализация арены/профильного замера).
+fn bump_chunk_override() -> Option<usize> {
+    std::env::var("R3_BUMP_CHUNK_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .map(|mb| mb * 1024 * 1024)
+}
+
 #[cfg_attr(coverage, coverage(off))]
 pub fn profile_bump_chunk_size_full() -> usize {
+    // Чанк под нагрузку: явный override бьёт PGO-эвристику (см. bump_chunk_override).
+    if let Some(mb) = bump_chunk_override() {
+        return mb;
+    }
     let bump = Bump::new();
     let s = bench_scale();
     let capacity = 4 * 100 * (100 / s).max(1);
@@ -4314,14 +4360,21 @@ pub fn profile_bump_chunk_size_full() -> usize {
     let used = bump.allocated_bytes().saturating_sub(bump.chunk_capacity());
     core::hint::black_box(&vectr);
     drop(vectr);
-    // /2: выделяем вдвое меньше памяти под PGO-чанки bump full (см. git-историю;
-    // при нехватке bump просто доаллоцирует следующий чанк).
-    let recommended = (used * 110 / 100 / 2).min(pgo_chunk_cap());
+    // /2 убрано: геометрия чанка — как у арены (покрытие пика итерации + 15%
+    // запаса). Половинный чанк заставлял каждый поток просить ВТОРОЙ чанк роста
+    // bumpalo, из-за чего RSS lean'а был вдвое выше арены при той же скорости
+    // (см. подробный комментарий в profile_bump_chunk_size_light). Каппинг по
+    // памяти (`pgo_chunk_cap`) остаётся.
+    let recommended = (used * 115 / 100).min(pgo_chunk_cap());
     round_up_mb(recommended)
 }
 
 #[cfg_attr(coverage, coverage(off))]
 pub fn profile_bump_chunk_size_light() -> usize {
+    // Чанк под нагрузку: явный override бьёт PGO-эвристику (см. bump_chunk_override).
+    if let Some(mb) = bump_chunk_override() {
+        return mb;
+    }
     let bump = Bump::new();
     let s = bench_scale();
     let capacity = 100 * (100 / s).max(1);
@@ -4339,8 +4392,16 @@ pub fn profile_bump_chunk_size_light() -> usize {
     let used = bump.allocated_bytes().saturating_sub(bump.chunk_capacity());
     core::hint::black_box(&vectr);
     drop(vectr);
-    // /2: вдвое меньше памяти под PGO-чанки bump light (см. profile_bump_chunk_size_full).
-    let recommended = (used * 110 / 100 / 2).min(pgo_chunk_cap());
+    // Геометрия чанка — как у арены: ровно покрытие пика одной итерации + 15%
+    // запаса, без `/2`. Прежняя `/2` выдавала bumpalo чанк ВДВОЕ меньше нужного
+    // (70 МБ при потребности ~100 МБ на поток), из-за чего каждый поток просил
+    // второй чанк роста и RSS lean'а выходил вдвое выше арены при той же
+    // скорости. Арена такого штрафа не платит: её `grow_fallback` аллоцирует
+    // чанк по запросу (`fallback_chunk_bytes` >= need), поэтому там `/2` была
+    // безвредна. Теперь профилировочный замер (`used`) сам считает пики
+    // итерации bumpalo, поэтому запас в 15% симметричен марже
+    // `profile_arena_chunk_size_*`. Каппинг по памяти (`pgo_chunk_cap`) остаётся.
+    let recommended = (used * 115 / 100).min(pgo_chunk_cap());
     round_up_mb(recommended)
 }
 
