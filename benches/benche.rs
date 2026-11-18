@@ -70,6 +70,31 @@ fn bump_scope_m_light_no_smt() {
     bump_scope_m_light(lb, false);
 }
 
+// ---------------- Per-thread bumpalo, lean-контейнеры (24 байта) ----------------
+#[divan::bench(name = "bump_lean_m/smt", sample_count = RUNS)]
+fn bump_lean_m_smt() {
+    let (fb, _, _, _) = pgo();
+    bump_scope_lean_m(fb, true);
+}
+
+#[divan::bench(name = "bump_lean_m/no-smt", sample_count = RUNS)]
+fn bump_lean_m_no_smt() {
+    let (fb, _, _, _) = pgo();
+    bump_scope_lean_m(fb, false);
+}
+
+#[divan::bench(name = "bump_lean_m_light/smt", sample_count = RUNS)]
+fn bump_lean_m_light_smt() {
+    let (_, lb, _, _) = pgo();
+    bump_scope_lean_m_light(lb, true);
+}
+
+#[divan::bench(name = "bump_lean_m_light/no-smt", sample_count = RUNS)]
+fn bump_lean_m_light_no_smt() {
+    let (_, lb, _, _) = pgo();
+    bump_scope_lean_m_light(lb, false);
+}
+
 // ---------------- Shared bump + spin::Mutex ----------------
 #[divan::bench(name = "bump_shared_m/smt", sample_count = RUNS)]
 fn bump_shared_m_smt() {

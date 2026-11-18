@@ -4103,6 +4103,139 @@ fn put_bench_bump(chunk_size: usize, bump: Bump) {
     }
 }
 
+// --- Lean-контейнеры поверх bumpalo ---
+//
+// Зачем: `bumpalo::collections::{Vec, String}` весят 32 байта, потому что в
+// `RawVec` лежит ссылка на `Bump` (`ptr, cap, a: &Bump, len`) — она нужна для
+// роста вектора. Наш бенч вектор не растит (ёмкость задана заранее), поэтому
+// ссылка на аллокатор — чистые накладные расходы: 32 байта вместо 24 у
+// `ArenaVec`/`std::vec::Vec`. На нагрузке FULL это +33% байт на элемент и,
+// как показали perf-счётчики, +2.4x cache-miss относительно арены.
+//
+// Здесь те же 24-байтные заголовки, но аллокация идёт через
+// `Bump::alloc_layout` (inline(always), тот же быстрый путь bump'а). Это
+// честная проверка гипотезы: «bumpalo медленнее из-за самого аллокатора или
+// из-за толщины его generic-контейнеров?»
+struct LeanVec<T> {
+    ptr: *mut T,
+    len: usize,
+    cap: usize,
+}
+
+impl<T> LeanVec<T> {
+    #[inline(always)]
+    fn with_capacity_in(cap: usize, bump: &Bump) -> Self {
+        if cap == 0 {
+            return Self {
+                ptr: core::ptr::NonNull::<T>::dangling().as_ptr(),
+                len: 0,
+                cap: 0,
+            };
+        }
+        let layout = std::alloc::Layout::array::<T>(cap).expect("LeanVec: layout overflow");
+        let ptr = bump.alloc_layout(layout).as_ptr() as *mut T;
+        Self { ptr, len: 0, cap }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, value: T) {
+        assert!(self.len < self.cap, "LeanVec: capacity overflow");
+        // SAFETY: len < cap, слот принадлежит этой же аллокации и ещё не занят.
+        unsafe { self.ptr.add(self.len).write(value) };
+        self.len += 1;
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[T] {
+        // SAFETY: [0, len) инициализированы push'ами.
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+/// Поля намеренно не читаются в бенче: важно, что заголовок ровно 24 байта
+/// (ptr + len + cap), как у ArenaVec/std::vec::Vec, а данные лежат в bump'е.
+#[allow(dead_code)]
+struct LeanStr {
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
+}
+
+impl LeanStr {
+    #[inline(always)]
+    fn from_str_in(s: &str, bump: &Bump) -> Self {
+        let len = s.len();
+        let layout = std::alloc::Layout::array::<u8>(len).expect("LeanStr: layout overflow");
+        let ptr = bump.alloc_layout(layout).as_ptr();
+        // SAFETY: выделено ровно len байт под запись, источник не пересекается.
+        unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), ptr, len) };
+        Self { ptr, len, cap: len }
+    }
+}
+
+/// `bump_scope_m`, но на 24-байтных контейнерах (см. `LeanVec`/`LeanStr`).
+#[cfg_attr(coverage, coverage(off))]
+pub fn bump_scope_lean_m(chunk_size: usize, smt: bool) {
+    let core_ids = get_cores(smt);
+    let s = bench_scale();
+    std::thread::scope(|s2| {
+        for core_id in core_ids.iter() {
+            s2.spawn(move || {
+                core_affinity::set_for_current(*core_id);
+                let mut bump = take_bench_bump(chunk_size);
+                for _ in 0..(3 / s).max(1) {
+                    let capacity = 4 * 100 * (100 / s).max(1);
+                    let mut vectr: LeanVec<LeanVec<LeanStr>> =
+                        LeanVec::with_capacity_in(capacity, &bump);
+                    for _ in 0..(200 / s).max(1) {
+                        for _ in 0..(200 / s).max(1) {
+                            let mut vec: LeanVec<LeanStr> = LeanVec::with_capacity_in(400, &bump);
+                            for _ in 0..(100 / s).max(1) {
+                                vec.push(LeanStr::from_str_in("stroka", &bump));
+                            }
+                            vectr.push(vec);
+                        }
+                    }
+                    core::hint::black_box(vectr.as_slice());
+                    bump.reset();
+                }
+                put_bench_bump(chunk_size, bump);
+            });
+        }
+    });
+}
+
+#[cfg_attr(coverage, coverage(off))]
+pub fn bump_scope_lean_m_light(chunk_size: usize, smt: bool) {
+    let core_ids = get_cores(smt);
+    let s = bench_scale();
+    std::thread::scope(|s2| {
+        for core_id in core_ids.iter() {
+            s2.spawn(move || {
+                core_affinity::set_for_current(*core_id);
+                let mut bump = take_bench_bump(chunk_size);
+                for _ in 0..(3 / s).max(1) {
+                    let capacity = 100 * (100 / s).max(1);
+                    let mut vectr: LeanVec<LeanVec<LeanStr>> =
+                        LeanVec::with_capacity_in(capacity, &bump);
+                    for _ in 0..(100 / s).max(1) {
+                        for _ in 0..(100 / s).max(1) {
+                            let mut vec: LeanVec<LeanStr> = LeanVec::with_capacity_in(400, &bump);
+                            for _ in 0..(100 / s).max(1) {
+                                vec.push(LeanStr::from_str_in("stroka", &bump));
+                            }
+                            vectr.push(vec);
+                        }
+                    }
+                    core::hint::black_box(vectr.as_slice());
+                    bump.reset();
+                }
+                put_bench_bump(chunk_size, bump);
+            });
+        }
+    });
+}
+
 #[cfg_attr(coverage, coverage(off))]
 pub fn bump_scope_m(chunk_size: usize, smt: bool) {
     let core_ids = get_cores(smt);

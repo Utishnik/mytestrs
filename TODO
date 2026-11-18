@@ -1,3 +1,34 @@
+[РЕШЕНО] bumpalo ускорен в 1.7-1.8x: 24-байтные контейнеры вместо generic.
+
+Причина отставания bumpalo от арены — не аллокатор, а контейнеры. В
+bumpalo::collections::RawVec лежит ссылка на Bump для роста вектора:
+struct RawVec { ptr, cap, a: &Bump }, поэтому BumpVec/BumpString = 32 байта
+против 24 у ArenaVec/std::vec::Vec. На нагрузке FULL это +33% байт на элемент
+и, по perf, 11.7 против 4.9 M cache-miss на сэмпл.
+
+Добавлены LeanVec/LeanStr (24 байта: ptr+len+cap) поверх Bump::alloc_layout
+(inline(always), тот же bump-путь) и бенчи bump_lean_m/*. Ёмкость задаётся
+заранее, рост не нужен — ссылка на аллокатор в контейнере избыточна.
+
+Результат (divan, scale=2, fastest|median, 2 прогона):
+  FULL/smt:   bumpalo stock 45.8-48.5 | 49.2-50.4  ->  lean 24.8-28.1 | 26.5-30.3
+  FULL/no-smt:bumpalo stock 25.2-27.2 | 26.0-27.9  ->  lean 15.0-15.1 | 15.7-16.7
+  LIGHT/smt:  bumpalo stock 11.0-11.9 | 12.9-13.4  ->  lean 7.1     | 8.3-8.6
+  LIGHT/no-smt: stock 6.8-6.9 | 7.5-7.7           ->  lean 4.46    | 5.5-5.9
+Для сравнения: arena FULL/smt 25.4-27.1 | 28.8-30.1, mimalloc 48.3 | 57.4;
+LIGHT/smt arena 6.5-7.3 | 8.0-8.4, mimalloc 11.0-13.1 | 13.5-14.9.
+
+Perf на сэмпл после вычета baseline:
+  bumpalo stock: 278 M инстр, 1099 M циклов, 11.7 M cache-miss, 552 k dTLB;
+  bumpalo lean:  144 M инстр,  579 M циклов,  4.9 M cache-miss, 255 k dTLB;
+  arena:         385 M инстр,  529 M циклов,  4.9 M cache-miss, 296 k dTLB.
+Т.е. lean-bumpalo догнал арену по промахам и циклам (разница в пределах шума) и
+выполняет в 1.9x меньше инструкций, чем stock. Вывод: сам bump-аллокатор у
+bumpalo не хуже арены; платили за универсальные контейнеры с поддержкой роста.
+
+Ограничение: LeanVec/LeanStr годятся только там, где ёмкость известна заранее
+и рост не нужен (как в этом бенче); общий код должен оставаться на bumpalo::Vec.
+
 [РЕШЕНО] почему bumpalo быстрее mimalloc, а арена быстрее bumpalo.
 
 Счётчики perf (user-space, полный прогон divan: 25 сэмплов, scale=2), за вычетом
