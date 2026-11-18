@@ -4876,6 +4876,9 @@ fn round_up_mb(bytes: usize) -> usize {
 
 #[cfg_attr(coverage, coverage(off))]
 pub fn profile_bump_chunk_size_full() -> usize {
+    if let Some(mb) = bump_chunk_override() {
+        return mb;
+    }
     let bump = Bump::new();
     let s = bench_scale();
     let capacity = 4 * 100 * (100 / s).max(1);
@@ -4905,6 +4908,9 @@ pub fn profile_bump_chunk_size_full() -> usize {
 
 #[cfg_attr(coverage, coverage(off))]
 pub fn profile_bump_chunk_size_light() -> usize {
+    if let Some(mb) = bump_chunk_override() {
+        return mb;
+    }
     let bump = Bump::new();
     let s = bench_scale();
     let capacity = 100 * (100 / s).max(1);
@@ -4938,6 +4944,21 @@ pub fn profile_bump_chunk_size_light() -> usize {
 /// арены/профильного замера), в hot-loop аллокаций его нет.
 fn arena_chunk_override() -> Option<usize> {
     std::env::var("R3_ARENA_CHUNK_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .map(|mb| mb * 1024 * 1024)
+}
+
+/// Override размера PGO-чанка bumpalo из `R3_BUMP_CHUNK_MB=N` (МБ).
+///
+/// Нужен для замеров памяти/скорости при заведомо достаточном чанке: PGO
+/// намеренно даёт вдвое меньше использованного объёма (см. `/2` ниже), из-за
+/// чего bumpalo выделяет второй чанк геометрического роста. Override задаёт
+/// АБСОЛЮТНЫЙ размер первого чанка (без деления на 2). Читается каждый вызов,
+/// как и `R3_ARENA_CHUNK_MB` (тюн меняет значения между конфигурациями).
+fn bump_chunk_override() -> Option<usize> {
+    std::env::var("R3_BUMP_CHUNK_MB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
